@@ -5,6 +5,7 @@
     <div class="nav-links">
       <RouterLink to="/" class="nav-link" active-class="active">发现</RouterLink>
       <RouterLink to="/search" class="nav-link" active-class="active">搜索</RouterLink>
+      <RouterLink to="/library" class="nav-link" active-class="active">音乐库</RouterLink>
       <RouterLink to="/history" class="nav-link" active-class="active">播放历史</RouterLink>
     </div>
 
@@ -19,38 +20,68 @@
           <Icon icon="mdi:chevron-down" class="bot-chevron" :class="{ rotated: dropdownOpen }" />
         </button>
         <div v-if="dropdownOpen" class="bot-dropdown">
+          <div class="bot-dropdown-header">机器人</div>
           <div
             v-for="bot in store.bots"
             :key="bot.id"
-            class="bot-dropdown-row"
+            class="bot-card"
+            :class="{ active: bot.id === store.activeBotId }"
           >
-            <button
-              class="bot-dropdown-item"
-              :class="{ active: bot.id === store.activeBotId }"
-              @click="selectBot(bot.id)"
-            >
+            <div class="bot-card-head" @click="bot.connected ? selectBot(bot.id) : undefined">
               <span class="bot-dot" :class="{ online: bot.connected }" />
-              <span class="bot-dropdown-name">{{ bot.name }}</span>
+              <span class="bot-card-name">{{ bot.name }}</span>
+              <span v-if="bot.id === store.activeBotId" class="bot-current-badge">当前</span>
               <span v-if="bot.playing && !bot.paused" class="bot-playing-badge">播放中</span>
               <span v-else-if="bot.paused" class="bot-paused-badge">已暂停</span>
               <span v-else-if="bot.connected" class="bot-idle-badge">空闲</span>
               <span v-else class="bot-offline-badge">离线</span>
-            </button>
-            <button
-              class="bot-power-btn"
-              :class="{ online: bot.connected }"
-              :title="bot.connected ? `停止 ${bot.name}` : `启动 ${bot.name}`"
-              :disabled="togglingBots[bot.id]"
-              @click.stop="togglePower(bot)"
-            >
-              <Icon :icon="bot.connected ? 'mdi:power' : 'mdi:power-off'" />
-            </button>
-            <button class="bot-link-btn" :title="`复制 ${bot.name} 的专属链接`" @click.stop="copyBotLink(bot.id)">
-              <Icon icon="mdi:link-variant" />
-            </button>
+            </div>
+            <div class="bot-card-controls">
+              <button
+                v-if="bot.connected"
+                class="bot-ctrl-btn danger"
+                :disabled="togglingBots[bot.id]"
+                @click.stop="togglePower(bot)"
+              >
+                <Icon icon="mdi:link-off" /> 断开
+              </button>
+              <button
+                v-else
+                class="bot-ctrl-btn primary"
+                :disabled="togglingBots[bot.id]"
+                @click.stop="togglePower(bot)"
+              >
+                <Icon icon="mdi:link-variant" /> 连接
+              </button>
+              <button
+                v-if="bot.playing || bot.paused"
+                class="bot-ctrl-btn"
+                :disabled="!bot.connected"
+                @click.stop="store.pause()"
+              >
+                <Icon icon="mdi:stop" /> 停止
+              </button>
+              <button
+                v-else
+                class="bot-ctrl-btn"
+                :disabled="!bot.connected"
+                @click.stop="store.resume()"
+              >
+                <Icon icon="mdi:play" /> 播放
+              </button>
+              <button
+                class="bot-ctrl-btn"
+                :disabled="!bot.connected || (!bot.playing && !bot.paused)"
+                @click.stop="store.next()"
+                title="下一首"
+              >
+                <Icon icon="mdi:skip-next" />
+              </button>
+              <button class="bot-ctrl-btn" @click.stop="copyBotLink(bot.id)" title="复制链接">
+                <Icon icon="mdi:link-variant" />
+              </button>
+            </div>
           </div>
-          <div class="bot-dropdown-divider" />
-          <div class="bot-dropdown-hint">点击切换 · 🔗 复制专属链接</div>
         </div>
       </div>
 
@@ -227,6 +258,11 @@ onUnmounted(() => {
   @media (max-width: 1336px) {
     padding: 0 5vw;
   }
+
+  @media (max-width: 768px) {
+    padding: 0 16px;
+    height: 52px;
+  }
 }
 
 .logo {
@@ -234,11 +270,20 @@ onUnmounted(() => {
   font-weight: 700;
   color: var(--color-primary);
   margin-right: 40px;
+
+  @media (max-width: 768px) {
+    font-size: 17px;
+    margin-right: 0;
+  }
 }
 
 .nav-links {
   display: flex;
   gap: 24px;
+
+  @media (max-width: 768px) {
+    display: none;
+  }
 }
 
 .nav-link {
@@ -266,7 +311,7 @@ onUnmounted(() => {
   opacity: 0.6;
 
   &.online {
-    background: rgba(51, 94, 234, 0.15);
+    background: var(--color-primary-15);
     color: var(--color-primary);
     opacity: 1;
   }
@@ -295,12 +340,25 @@ onUnmounted(() => {
     background: var(--bg-card);
     border-color: var(--color-primary);
   }
+
+  @media (max-width: 768px) {
+    padding: 6px 10px;
+    font-size: 12px;
+    font-weight: 600;
+    min-height: 32px;
+    gap: 6px;
+    border-radius: var(--radius-full);
+  }
 }
 
 .bot-state-mini {
   font-size: 14px;
-  &.playing { color: #22c55e; }
-  &.paused { color: #eab308; }
+  &.playing { color: var(--color-online); }
+  &.paused { color: var(--color-paused); }
+
+  @media (max-width: 768px) {
+    display: none;
+  }
 }
 
 .bot-chevron {
@@ -310,6 +368,10 @@ onUnmounted(() => {
 
   &.rotated {
     transform: rotate(180deg);
+  }
+
+  @media (max-width: 768px) {
+    display: none;
   }
 }
 
@@ -321,7 +383,12 @@ onUnmounted(() => {
   flex-shrink: 0;
 
   &.online {
-    background: #22c55e;
+    background: var(--color-online);
+  }
+
+  @media (max-width: 768px) {
+    width: 8px;
+    height: 8px;
   }
 }
 
@@ -330,96 +397,83 @@ onUnmounted(() => {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+
+  @media (max-width: 768px) {
+    max-width: 80px;
+  }
 }
 
 .bot-dropdown {
   position: absolute;
   top: calc(100% + 6px);
   right: 0;
-  min-width: 200px;
+  min-width: 320px;
   background: var(--bg-secondary);
   border: 1px solid var(--border-color);
   border-radius: var(--radius-md);
-  padding: 4px;
-  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.2);
+  padding: 6px;
+  box-shadow: var(--shadow-dropdown);
   z-index: 200;
+
+  @media (max-width: 768px) {
+    position: fixed;
+    top: 52px;
+    left: 8px;
+    right: 8px;
+    min-width: auto;
+  }
 }
 
-.bot-dropdown-item {
+.bot-dropdown-header {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text-tertiary);
+  padding: 6px 10px 4px;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+
+.bot-card {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 10px;
+  border-radius: var(--radius-sm);
+  margin-bottom: 4px;
+  border: 1px solid transparent;
+  transition: background var(--transition-fast);
+
+  &.active {
+    background: var(--color-primary-12);
+    border-color: rgba(99, 102, 241, 0.25);
+  }
+}
+
+.bot-card-head {
   display: flex;
   align-items: center;
   gap: 8px;
-  flex: 1;
-  min-width: 0;
-  padding: 8px 12px;
-  border-radius: var(--radius-sm);
-  font-size: 13px;
   cursor: pointer;
-  transition: background var(--transition-fast);
-
-  &:hover {
-    background: var(--hover-bg);
-  }
-
-  &.active {
-    background: rgba(51, 94, 234, 0.12);
-    color: var(--color-primary);
-  }
 }
 
-.bot-dropdown-row {
-  display: flex;
-  align-items: center;
-  gap: 2px;
-}
-
-.bot-dropdown-name {
+.bot-card-name {
   flex: 1;
+  font-size: 13px;
+  font-weight: 600;
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
-.bot-link-btn {
+.bot-current-badge {
+  font-size: 10px;
+  font-weight: 700;
+  color: var(--color-primary);
+  padding: 2px 6px;
+  border-radius: 4px;
+  background: var(--color-primary-15);
   flex-shrink: 0;
-  padding: 6px 8px;
-  border-radius: var(--radius-sm);
-  font-size: 15px;
-  opacity: 0.4;
-  transition: opacity var(--transition-fast), background var(--transition-fast);
-  cursor: pointer;
-
-  &:hover {
-    opacity: 1;
-    background: var(--hover-bg);
-  }
-}
-
-.bot-power-btn {
-  flex-shrink: 0;
-  padding: 6px 8px;
-  border-radius: var(--radius-sm);
-  font-size: 16px;
-  opacity: 0.5;
-  color: var(--text-tertiary);
-  transition: opacity var(--transition-fast), background var(--transition-fast), color var(--transition-fast);
-  cursor: pointer;
-
-  &:hover:not(:disabled) {
-    opacity: 1;
-    background: var(--hover-bg);
-  }
-
-  &:disabled {
-    opacity: 0.25;
-    cursor: wait;
-  }
-
-  &.online {
-    color: #22c55e;
-    opacity: 0.9;
-  }
 }
 
 .bot-playing-badge,
@@ -427,25 +481,25 @@ onUnmounted(() => {
 .bot-idle-badge,
 .bot-offline-badge {
   font-size: 11px;
-  padding: 1px 6px;
+  padding: 2px 6px;
   border-radius: 4px;
   font-weight: 500;
   flex-shrink: 0;
 }
 
 .bot-playing-badge {
-  background: rgba(34, 197, 94, 0.15);
-  color: #22c55e;
+  background: var(--color-online-15);
+  color: var(--color-online);
 }
 
 .bot-paused-badge {
-  background: rgba(234, 179, 8, 0.15);
-  color: #eab308;
+  background: var(--color-paused-15);
+  color: var(--color-paused);
 }
 
 .bot-idle-badge {
-  background: rgba(51, 94, 234, 0.12);
-  color: var(--color-primary);
+  background: var(--hover-bg);
+  color: var(--text-secondary);
 }
 
 .bot-offline-badge {
@@ -453,17 +507,47 @@ onUnmounted(() => {
   color: var(--text-tertiary);
 }
 
-.bot-dropdown-divider {
-  height: 1px;
-  background: var(--border-color);
-  margin: 4px 0;
+.bot-card-controls {
+  display: flex;
+  gap: 6px;
 }
 
-.bot-dropdown-hint {
-  padding: 4px 12px 6px;
+.bot-ctrl-btn {
+  flex: 1;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  padding: 6px 8px;
+  border-radius: var(--radius-sm);
+  background: var(--hover-bg);
+  border: 1px solid var(--border-color);
+  color: var(--text-primary);
   font-size: 11px;
-  color: var(--text-tertiary);
-  text-align: center;
+  font-weight: 500;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: all var(--transition-fast);
+
+  &:hover:not(:disabled) {
+    background: var(--bg-card);
+    border-color: var(--color-primary);
+  }
+
+  &:disabled {
+    opacity: 0.4;
+    cursor: not-allowed;
+  }
+
+  &.primary {
+    background: var(--color-primary);
+    color: #fff;
+    border-color: var(--color-primary);
+  }
+
+  &.danger {
+    color: #ef4444;
+  }
 }
 
 .settings-btn {
@@ -471,12 +555,16 @@ onUnmounted(() => {
   opacity: 0.6;
   transition: opacity var(--transition-fast);
   &:hover { opacity: 1; }
+
+  @media (max-width: 768px) {
+    display: none;
+  }
 }
 
 .link-dialog-backdrop {
   position: fixed;
   inset: 0;
-  background: rgba(0, 0, 0, 0.55);
+  background: var(--bg-modal-scrim);
   display: flex;
   align-items: center;
   justify-content: center;
@@ -490,7 +578,7 @@ onUnmounted(() => {
   padding: 20px;
   min-width: 360px;
   max-width: 90vw;
-  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.35);
+  box-shadow: var(--shadow-modal);
 }
 
 .link-dialog-title {

@@ -63,7 +63,7 @@ function formatDuration(seconds: number): string {
   }
 
   &.active {
-    background: rgba(51, 94, 234, 0.1);
+    background: var(--color-primary-10);
   }
 }
 
@@ -96,31 +96,31 @@ function formatDuration(seconds: number): string {
 
 .platform-badge {
   flex-shrink: 0;
-  font-size: 10px;
-  font-weight: 600;
+  font-size: var(--fs-micro);
+  font-weight: var(--fw-semi);
   padding: 1px 5px;
-  border-radius: 3px;
+  border-radius: var(--radius-xs);
   line-height: 1.4;
 }
 
 .badge-netease {
-  background: rgba(232, 17, 35, 0.15);
-  color: #e81123;
+  background: var(--brand-netease-15);
+  color: var(--brand-netease);
 }
 
 .badge-qq {
-  background: rgba(18, 183, 106, 0.15);
-  color: #12b76a;
+  background: var(--brand-qq-15);
+  color: var(--brand-qq);
 }
 
 .badge-bilibili {
-  background: rgba(0, 161, 214, 0.15);
-  color: #00a1d6;
+  background: var(--brand-bilibili-15);
+  color: var(--brand-bilibili);
 }
 
 .badge-youtube {
-  background: rgba(255, 0, 0, 0.12);
-  color: #ff0000;
+  background: var(--brand-youtube-12);
+  color: var(--brand-youtube);
 }
 
 .song-artist {

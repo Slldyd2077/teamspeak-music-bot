@@ -820,16 +820,16 @@ onUnmounted(() => {
   background: var(--border-color);
   color: var(--text-tertiary);
   &.online {
-    background: rgba(51, 94, 234, 0.15);
+    background: var(--color-primary-15);
     color: var(--color-primary);
   }
   &.playing {
-    background: rgba(76, 175, 80, 0.15);
-    color: #4caf50;
+    background: var(--color-online-15);
+    color: var(--color-online);
   }
   &.paused {
-    background: rgba(255, 152, 0, 0.15);
-    color: #ff9800;
+    background: var(--color-paused-15);
+    color: var(--color-paused);
   }
 }
 
@@ -853,7 +853,7 @@ onUnmounted(() => {
   color: var(--color-primary);
 
   &.bilibili-icon {
-    color: #00a1d6;
+    color: var(--brand-bilibili);
   }
 }
 
@@ -865,7 +865,7 @@ onUnmounted(() => {
 .account-status {
   font-size: 12px;
   color: var(--text-tertiary);
-  &.logged { color: #4caf50; }
+  &.logged { color: var(--color-online); }
 }
 
 .login-methods {
@@ -888,7 +888,7 @@ onUnmounted(() => {
 
   &:hover { border-color: var(--color-primary); color: var(--color-primary); }
   &.active {
-    background: rgba(51, 94, 234, 0.1);
+    background: var(--color-primary-10);
     border-color: var(--color-primary);
     color: var(--color-primary);
   }
@@ -1012,7 +1012,7 @@ onUnmounted(() => {
   &:hover { border-color: var(--border-color); }
   &.active {
     border-color: var(--color-primary);
-    background: rgba(51, 94, 234, 0.1);
+    background: var(--color-primary-10);
   }
 }
 

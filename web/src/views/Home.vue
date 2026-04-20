@@ -179,6 +179,10 @@ onMounted(() => {
 
 .section {
   margin-bottom: 36px;
+
+  @media (max-width: 768px) {
+    margin-bottom: 28px;
+  }
 }
 
 .section-title {
@@ -188,6 +192,11 @@ onMounted(() => {
   display: flex;
   align-items: center;
   gap: 8px;
+
+  @media (max-width: 768px) {
+    font-size: 18px;
+    margin-bottom: 12px;
+  }
 }
 
 .section-count {
@@ -223,7 +232,7 @@ onMounted(() => {
   justify-content: center;
   width: 24px;
   height: 24px;
-  background: #00a1d6;
+  background: var(--brand-bilibili);
   color: white;
   border-radius: 4px;
   font-size: 14px;
@@ -317,6 +326,7 @@ onMounted(() => {
 
   @media (max-width: 1200px) { grid-template-columns: repeat(4, 1fr); }
   @media (max-width: 900px) { grid-template-columns: repeat(3, 1fr); }
+  @media (max-width: 768px) { grid-template-columns: repeat(3, 1fr); gap: 14px; }
 }
 
 .daily-card {
@@ -348,6 +358,7 @@ onMounted(() => {
 
   @media (max-width: 1200px) { grid-template-columns: repeat(4, 1fr); }
   @media (max-width: 900px) { grid-template-columns: repeat(3, 1fr); }
+  @media (max-width: 768px) { grid-template-columns: repeat(3, 1fr); gap: 14px; }
 }
 
 .playlist-card {

@@ -206,6 +206,10 @@ function cycleMode() {
   left: 0;
   right: 0;
   z-index: 100;
+
+  @media (max-width: 768px) {
+    display: none;
+  }
 }
 
 .player-bar {
@@ -326,12 +330,12 @@ function cycleMode() {
 
 .bot-badge {
   display: inline-block;
-  font-size: 10px;
-  font-weight: 600;
+  font-size: var(--fs-micro);
+  font-weight: var(--fw-semi);
   padding: 0 5px;
-  background: rgba(51, 94, 234, 0.15);
+  background: var(--color-primary-15);
   color: var(--color-primary);
-  border-radius: 3px;
+  border-radius: var(--radius-xs);
   line-height: 16px;
   white-space: nowrap;
   flex-shrink: 0;
