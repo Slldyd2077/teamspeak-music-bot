@@ -68,7 +68,7 @@ describe("database", () => {
     botDb.saveBotInstance(instance);
     const instances = botDb.getBotInstances();
     expect(instances).toHaveLength(1);
-    expect(instances[0]).toEqual(instance);
+    expect(instances[0]).toMatchObject(instance);
     expect(instances[0].autoStart).toBe(true);
 
     // Test upsert

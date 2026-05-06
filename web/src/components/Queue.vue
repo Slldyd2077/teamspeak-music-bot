@@ -171,7 +171,7 @@ async function clearAndStop() {
   }
 
   &.active {
-    background: rgba(51, 94, 234, 0.1);
+    background: var(--color-primary-10);
   }
 }
 

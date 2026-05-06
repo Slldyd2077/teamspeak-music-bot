@@ -168,32 +168,16 @@ export function createMusicRouter(
   router.get("/playlist/:id/detail", async (req, res) => {
     try {
       const provider = getProvider(req.query.platform as string);
-      // Use the playlist songs endpoint to get basic info,
-      // but we also need detail info (name, cover, description).
-      // For netease, we access the underlying API directly.
-      const nProvider = provider as any;
-      if (nProvider.api) {
-        const cookieParams = nProvider.cookie
-          ? { cookie: nProvider.cookie }
-          : {};
-        const detailRes = await nProvider.api.get("/playlist/detail", {
-          params: { id: req.params.id, ...cookieParams },
-        });
-        const p = detailRes.data?.playlist;
-        if (p) {
-          res.json({
-            playlist: {
-              id: String(p.id),
-              name: p.name,
-              description: p.description ?? "",
-              coverUrl: p.coverImgUrl ?? "",
-              songCount: p.trackCount ?? 0,
-            },
-          });
-          return;
-        }
+      if (!provider.getPlaylistDetail) {
+        res.status(501).json({ error: "Not supported by this provider" });
+        return;
       }
-      res.status(404).json({ error: "Playlist not found" });
+      const detail = await provider.getPlaylistDetail(req.params.id);
+      if (!detail) {
+        res.status(404).json({ error: "Playlist not found" });
+        return;
+      }
+      res.json({ playlist: detail });
     } catch (err) {
       logger.error({ err }, "Get playlist detail failed");
       res.status(500).json({ error: (err as Error).message });

@@ -28,6 +28,7 @@
         :index="i + 1"
         :active="store.currentSong?.id === song.id"
         @play="store.playSong(song)"
+        @playNext="store.playNextSong(song)"
         @add="store.addSong(song)"
       />
     </div>

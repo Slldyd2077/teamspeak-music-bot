@@ -261,4 +261,227 @@ describe("PlayQueue", () => {
     queue.playAt(2);
     expect(queue.current()?.id).toBe("3");
   });
+
+  describe("history-aware prev", () => {
+    it("walks back through played indices in random mode", () => {
+      queue.setMode(PlayMode.Random);
+      queue.add(makeSong("a"));
+      queue.add(makeSong("b"));
+      queue.add(makeSong("c"));
+      queue.add(makeSong("d"));
+      queue.add(makeSong("e"));
+
+      // Force a deterministic random sequence: a → c → e
+      queue.playAt(0);
+      queue.playAt(2);
+      queue.playAt(4);
+      expect(queue.current()?.id).toBe("e");
+
+      // prev pops back through history: e → c → a
+      expect(queue.prev()?.id).toBe("c");
+      expect(queue.prev()?.id).toBe("a");
+    });
+
+    it("returns null when history is empty in random mode", () => {
+      queue.setMode(PlayMode.Random);
+      queue.add(makeSong("a"));
+      queue.add(makeSong("b"));
+      queue.playAt(0);
+      // No further moves → history is empty (only 'a' is current, never pushed)
+      expect(queue.prev()).toBeNull();
+    });
+
+    it("preserves sequential prev when history is empty", () => {
+      queue.setMode(PlayMode.Sequential);
+      queue.add(makeSong("a"));
+      queue.add(makeSong("b"));
+      queue.add(makeSong("c"));
+      queue.play();
+      queue.next(); // currentIndex = 1
+      // Sequential next() pushed 0 to history → prev pops back to 0
+      expect(queue.prev()?.id).toBe("a");
+    });
+
+    it("clears history on play()", () => {
+      queue.setMode(PlayMode.Random);
+      queue.add(makeSong("a"));
+      queue.add(makeSong("b"));
+      queue.playAt(0);
+      queue.playAt(1);
+      queue.play(); // resets to index 0 and clears history
+      expect(queue.prev()).toBeNull();
+    });
+
+    it("clears history on clear()", () => {
+      queue.add(makeSong("a"));
+      queue.add(makeSong("b"));
+      queue.play();
+      queue.next();
+      queue.clear();
+      queue.add(makeSong("c"));
+      queue.play();
+      // History was wiped — no prev path available beyond index 0
+      expect(queue.prev()).toBeNull();
+    });
+
+    it("clears history on setMode()", () => {
+      queue.setMode(PlayMode.Sequential);
+      queue.add(makeSong("a"));
+      queue.add(makeSong("b"));
+      queue.play();
+      queue.next();
+      // Mode change resets context
+      queue.setMode(PlayMode.Random);
+      expect(queue.prev()).toBeNull();
+    });
+
+    it("drops history entries pointing at a removed song", () => {
+      queue.setMode(PlayMode.Random);
+      queue.add(makeSong("a"));
+      queue.add(makeSong("b"));
+      queue.add(makeSong("c"));
+      queue.playAt(0);
+      queue.playAt(1); // history: [0]
+      queue.playAt(2); // history: [0, 1]
+      // Remove song at index 1 → history entry 1 dropped
+      queue.remove(1);
+      // queue is now [a, c], history should be [0]
+      // current was at 2 → after remove shifts to 1 → song "c"
+      expect(queue.current()?.id).toBe("c");
+      expect(queue.prev()?.id).toBe("a");
+    });
+
+    it("does not push to history on prev itself", () => {
+      queue.setMode(PlayMode.Random);
+      queue.add(makeSong("a"));
+      queue.add(makeSong("b"));
+      queue.add(makeSong("c"));
+      queue.playAt(0);
+      queue.playAt(1);
+      queue.playAt(2); // history: [0, 1]
+      queue.prev();    // pops 1, history: [0]
+      queue.prev();    // pops 0, history: []
+      expect(queue.prev()).toBeNull(); // no fallback target in random mode
+    });
+
+    it("caps history at HISTORY_LIMIT (50) entries, dropping oldest", () => {
+      queue.setMode(PlayMode.Random);
+      // Build a queue large enough to overflow HISTORY_LIMIT
+      for (let i = 0; i < 60; i++) queue.add(makeSong(`s${i}`));
+      // Walk through 60 explicit picks → 59 pushes to history
+      // (playAt pushes the previous currentIndex; first call has -1
+      // which pushHistory rejects). After 60 playAts, history holds
+      // the last 50 of those 59 entries.
+      for (let i = 0; i < 60; i++) queue.playAt(i);
+
+      // Walk back through history. The first prev returns whatever the
+      // 50th-most-recent push was (= index 9, since pushes 0..58 happened
+      // and the oldest 9 fell off). We can verify by counting prevs that
+      // succeed before history exhausts and prev returns null in random.
+      let count = 0;
+      while (queue.prev() !== null) {
+        count++;
+        if (count > 100) break; // safety
+      }
+      expect(count).toBe(50);
+    });
+  });
+
+  describe("addNext", () => {
+    it("appends when queue is empty (no current)", () => {
+      queue.addNext(makeSong("a"));
+      expect(queue.size()).toBe(1);
+      expect(queue.list()[0].id).toBe("a");
+    });
+
+    it("appends when nothing is currently playing (currentIndex < 0)", () => {
+      queue.add(makeSong("a"));
+      queue.add(makeSong("b"));
+      // No play() yet → currentIndex still -1
+      queue.addNext(makeSong("c"));
+      expect(queue.list().map((s) => s.id)).toEqual(["a", "b", "c"]);
+    });
+
+    it("inserts at currentIndex+1 mid-queue", () => {
+      queue.add(makeSong("a"));
+      queue.add(makeSong("b"));
+      queue.add(makeSong("c"));
+      queue.add(makeSong("d"));
+      queue.play();      // current = 0 (a)
+      queue.next();      // current = 1 (b)
+      queue.addNext(makeSong("x"));
+      expect(queue.list().map((s) => s.id)).toEqual(["a", "b", "x", "c", "d"]);
+      expect(queue.current()?.id).toBe("b"); // current unchanged
+    });
+
+    it("makes the inserted song play next when next() is called", () => {
+      queue.setMode(PlayMode.Sequential);
+      queue.add(makeSong("a"));
+      queue.add(makeSong("b"));
+      queue.play();      // current = 0 (a)
+      queue.addNext(makeSong("x"));
+      expect(queue.next()?.id).toBe("x");
+    });
+
+    it("shifts playedIndices entries > currentIndex by +1", () => {
+      queue.setMode(PlayMode.Random);
+      queue.add(makeSong("a"));
+      queue.add(makeSong("b"));
+      queue.add(makeSong("c"));
+      queue.add(makeSong("d"));
+      queue.playAt(2); // current = 2 (c), played = {2}
+      queue.playAt(3); // current = 3 (d), played = {2, 3}
+      queue.playAt(2); // current = 2 (c), played = {2, 3}
+      // Now insert after c — d's index 3 should become 4
+      queue.addNext(makeSong("x"));
+      expect(queue.list().map((s) => s.id)).toEqual(["a", "b", "c", "x", "d"]);
+      // After addNext: currentIndex still 2; played should be {2, 4}
+      // (the previously-played 'd' is now at index 4)
+      // Verify by removing 'x' (index 3) — d should remain played at index 3
+      queue.remove(3);
+      expect(queue.list().map((s) => s.id)).toEqual(["a", "b", "c", "d"]);
+    });
+
+    it("shifts history entries > currentIndex by +1", () => {
+      queue.setMode(PlayMode.Random);
+      queue.add(makeSong("a"));
+      queue.add(makeSong("b"));
+      queue.add(makeSong("c"));
+      queue.add(makeSong("d"));
+      queue.playAt(0); // current = 0
+      queue.playAt(3); // current = 3 (d), history = [0]
+      queue.playAt(1); // current = 1 (b), history = [0, 3]
+      queue.addNext(makeSong("x"));
+      // Insert at index 2 → entries > 1 shift +1 → history becomes [0, 4]
+      // queue: [a, b, x, c, d]; d is now at index 4
+      // prev → pop 4 → song at index 4 = d
+      expect(queue.prev()?.id).toBe("d");
+      // prev again → pop 0 → song at index 0 = a
+      expect(queue.prev()?.id).toBe("a");
+    });
+
+    it("idle player + stale currentIndex: insertion target is currentIndex+1, not size-1", () => {
+      // Reproduces the scenario where the player has gone idle but the
+      // queue still has a non-negative currentIndex (e.g., after natural
+      // track end without queue.clear()).
+      queue.add(makeSong("a"));
+      queue.add(makeSong("b"));
+      queue.add(makeSong("c"));
+      queue.add(makeSong("d"));
+      queue.play();      // current = 0 (a)
+      queue.next();      // current = 1 (b)
+      // Simulate idle-with-stale-currentIndex: the player has gone idle
+      // but queue still points at b.
+      // Caller pre-captures insertedAt:
+      const insertedAt = queue.getCurrentIndex() + 1; // = 2
+      queue.addNext(makeSong("x"));
+      // queue is now [a, b, x, c, d]
+      // size-1 would be 4 (d) — WRONG.
+      // insertedAt is 2 (x) — RIGHT.
+      expect(queue.list().map((s) => s.id)).toEqual(["a", "b", "x", "c", "d"]);
+      expect(queue.size() - 1).toBe(4); // proves size-1 strategy would pick d
+      const promoted = queue.playAt(insertedAt);
+      expect(promoted?.id).toBe("x");
+    });
+  });
 });

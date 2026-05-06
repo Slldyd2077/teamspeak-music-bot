@@ -3,6 +3,7 @@ import type {
   MusicProvider,
   Song,
   Playlist,
+  PlaylistDetail,
   LyricLine,
   SearchResult,
   QrCodeResult,
@@ -17,6 +18,22 @@ const qqDirectApi = axios.create({
   timeout: 10000,
   headers: { referer: "https://y.qq.com" },
 });
+
+// Direct client for c.y.qq.com endpoints (collected playlists / favorites).
+// The bundled qq-music-api wrapper doesn't expose these endpoints.
+const qqFavApi = axios.create({
+  baseURL: "https://c.y.qq.com",
+  timeout: 10000,
+  headers: { referer: "https://y.qq.com/" },
+});
+
+function computeGtk(pSkey: string): number {
+  let hash = 5381;
+  for (let i = 0; i < pSkey.length; i++) {
+    hash = (hash + (hash << 5) + pSkey.charCodeAt(i)) | 0;
+  }
+  return hash & 0x7fffffff;
+}
 
 export class QQMusicProvider implements MusicProvider {
   readonly platform = "qq" as const;
@@ -98,6 +115,50 @@ export class QQMusicProvider implements MusicProvider {
     return null;
   }
 
+  /**
+   * Batch-check which song mids are actually streamable. QQ playlists
+   * (especially collected ones) frequently contain a majority of songs
+   * that return result=104003 ("no copyright/region restricted") for the
+   * current user — a sequential retry loop wastes time guessing.
+   *
+   * The wrapper's /getMusicPlay accepts a comma-separated songmid list
+   * and resolves all of them in a single upstream call. We chunk to keep
+   * the URL well under typical 8KB query-string limits and to keep per-
+   * request latency bounded (~2-3s per 100 mids).
+   *
+   * Returns:
+   *   - non-null Set: authoritative result. Empty Set means all songs are
+   *     unplayable; non-empty means filter to those mids.
+   *   - null: every chunk failed. Caller should fall back to sequential
+   *     retry rather than treating as "all unplayable".
+   */
+  async getPlayableSongIds(songIds: string[]): Promise<Set<string> | null> {
+    if (songIds.length === 0) return new Set();
+
+    const CHUNK = 100;          // ~14 chars/mid * 100 + commas ≈ 1.5KB
+    const playable = new Set<string>();
+    let allChunksFailed = true;
+    for (let i = 0; i < songIds.length; i += CHUNK) {
+      const slice = songIds.slice(i, i + CHUNK);
+      try {
+        const res = await this.api.get("/getMusicPlay", {
+          params: { songmid: slice.join(","), quality: this.quality, ...this.cookieParams },
+        });
+        const playUrlMap: Record<string, { url?: string }> | undefined =
+          res.data?.data?.playUrl;
+        if (!playUrlMap) continue; // chunk-level failure, try next
+        allChunksFailed = false;
+        for (const [mid, info] of Object.entries(playUrlMap)) {
+          if (info?.url) playable.add(mid);
+        }
+      } catch {
+        // chunk-level failure — keep going so a transient error on one
+        // chunk doesn't poison the whole batch.
+      }
+    }
+    return allChunksFailed ? null : playable;
+  }
+
   async getSongDetail(songId: string): Promise<Song | null> {
     // Try /getSongInfo for full metadata, but fall through to a minimal
     // stub if the library endpoint fails (current @sansenjian/qq-music-api
@@ -160,6 +221,21 @@ export class QQMusicProvider implements MusicProvider {
         : "",
       platform: "qq",
     }));
+  }
+
+  async getPlaylistDetail(playlistId: string): Promise<PlaylistDetail | null> {
+    const res = await this.api.get("/getSongListDetail", {
+      params: { disstid: playlistId, ...this.cookieParams },
+    });
+    const cd = res.data?.response?.cdlist?.[0];
+    if (!cd) return null;
+    return {
+      id: String(cd.disstid ?? cd.dissid ?? ""),
+      name: cd.dissname ?? "",
+      description: cd.desc ?? "",
+      coverUrl: cd.logo ?? "",
+      songCount: cd.songnum ?? cd.total_song_num ?? 0,
+    };
   }
 
   async getRecommendPlaylists(): Promise<Playlist[]> {
@@ -291,25 +367,116 @@ export class QQMusicProvider implements MusicProvider {
     }
   }
 
-  async getUserPlaylists(): Promise<Playlist[]> {
-    if (!this.cookie) return [];
-    const uinMatch = /(?:^|; )uin=o?0?(\d+)/.exec(this.cookie);
-    const uin = uinMatch ? uinMatch[1] : "";
-    if (!uin) return [];
+  async getDailyRecommendSongs(): Promise<Song[]> {
+    // QQ has no per-user daily list; use newsong.NewSongServer (新歌速递)
+    // as the closest analogue. Returns ~20 newly-released songs.
     try {
-      const res = await this.api.get("/user/getUserPlaylists", {
-        params: { uin, ...this.cookieParams },
+      const res = await this.api.get("/getNewSongs", {
+        params: { ...this.cookieParams },
       });
-      if (res.data?.response?.code !== 0) return [];
-      return (res.data?.response?.data?.playlists ?? []).map((p: any) => ({
-        id: String(p.dissid ?? p.id ?? ""),
-        name: p.dissname ?? p.name ?? "",
-        coverUrl: p.imgurl ?? p.coverUrl ?? "",
-        songCount: p.song_count ?? p.listennum ?? 0,
+      const list: any[] = res.data?.response?.new_song?.data?.songlist ?? [];
+      return list.map((s: any) => ({
+        id: String(s.mid ?? s.id),
+        name: s.title ?? s.name ?? "",
+        artist: (s.singer ?? []).map((a: any) => a.name).join(" / "),
+        album: s.album?.name ?? s.album?.title ?? "",
+        duration: s.interval ?? 0,
+        coverUrl: s.album?.mid
+          ? `https://y.gtimg.cn/music/photo_new/T002R300x300M000${s.album.mid}.jpg`
+          : "",
         platform: "qq",
       }));
     } catch {
       return [];
     }
+  }
+
+  async getUserPlaylists(): Promise<Playlist[]> {
+    if (!this.cookie) return [];
+    const uinMatch = /(?:^|; )uin=o?0?(\d+)/.exec(this.cookie);
+    const uin = uinMatch ? uinMatch[1] : "";
+    if (!uin) return [];
+
+    // Created and collected playlists come from two separate QQ endpoints.
+    // Run them in parallel and concatenate (created first, then collected),
+    // matching the order shown in the QQ Music desktop app.
+    const [created, collected] = await Promise.all([
+      this.fetchCreatedPlaylists(uin),
+      this.fetchCollectedPlaylists(uin),
+    ]);
+    return [...created, ...collected];
+  }
+
+  private async fetchCreatedPlaylists(uin: string): Promise<Playlist[]> {
+    try {
+      const res = await this.api.get("/user/getUserPlaylists", {
+        params: { uin, ...this.cookieParams },
+      });
+      if (res.data?.response?.code !== 0) return [];
+      return (res.data?.response?.data?.playlists ?? []).map((p: any) => {
+        // fcg_get_profile_homepage returns title/picurl/subtitle ("X首  Y次播放").
+        const subtitle: string = p.subtitle ?? "";
+        const songCountFromSubtitle = parseInt(subtitle.match(/(\d+)\s*首/)?.[1] ?? "0", 10);
+        return {
+          id: String(p.dissid ?? p.id ?? ""),
+          name: p.title ?? p.dissname ?? p.name ?? "",
+          coverUrl: p.picurl ?? p.imgurl ?? p.coverUrl ?? "",
+          songCount: p.song_count ?? p.listennum ?? songCountFromSubtitle,
+          platform: "qq",
+        };
+      });
+    } catch {
+      return [];
+    }
+  }
+
+  private async fetchCollectedPlaylists(uin: string): Promise<Playlist[]> {
+    // c.y.qq.com fav endpoint: reqtype=3 returns collected playlists (cdlist).
+    // Requires g_tk derived from the p_skey cookie.
+    const pSkeyMatch = /(?:^|; )p_skey=([^;]+)/.exec(this.cookie);
+    if (!pSkeyMatch) return [];
+    const gtk = computeGtk(pSkeyMatch[1]);
+
+    const PAGE_SIZE = 30;
+    const MAX_PAGES = 10;       // 300-playlist hard cap; should cover any sane user
+    const all: Playlist[] = [];
+    try {
+      for (let page = 0; page < MAX_PAGES; page++) {
+        const sin = page * PAGE_SIZE;
+        const ein = sin + PAGE_SIZE - 1;
+        const res = await qqFavApi.get("/fav/fcgi-bin/fcg_get_profile_order_asset.fcg", {
+          params: {
+            ct: 20,
+            cid: 205360956,
+            userid: uin,
+            reqtype: 3,
+            sin,
+            ein,
+            g_tk: gtk,
+            format: "json",
+          },
+          headers: { Cookie: this.cookie },
+        });
+        if (res.data?.code !== 0) break;
+        const list: any[] = res.data?.data?.cdlist ?? [];
+        for (const p of list) {
+          all.push({
+            id: String(p.dissid ?? ""),
+            name: p.dissname ?? "",
+            coverUrl: p.logo ?? "",
+            songCount: p.songnum ?? 0,
+            platform: "qq",
+          });
+        }
+        // Stop when upstream signals no more pages, or when this page is
+        // short (also indicates end). has_more is the canonical signal.
+        const hasMore = res.data?.data?.has_more === 1 || res.data?.data?.has_more === true;
+        if (!hasMore || list.length < PAGE_SIZE) break;
+      }
+    } catch {
+      // Return whatever we got so far on partial failure rather than dropping
+      // earlier pages.
+    }
+    return all;
   }
 }

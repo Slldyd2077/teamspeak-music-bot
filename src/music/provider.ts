@@ -20,6 +20,14 @@ export interface Playlist {
   platform: "netease" | "qq" | "bilibili" | "youtube";
 }
 
+export interface PlaylistDetail {
+  id: string;
+  name: string;
+  description: string;
+  coverUrl: string;
+  songCount: number;
+}
+
 export interface Album {
   id: string;
   name: string;
@@ -77,4 +85,5 @@ export interface MusicProvider {
   getPersonalFm?(): Promise<Song[]>;
   getDailyRecommendSongs?(): Promise<Song[]>;
   getUserPlaylists?(): Promise<Playlist[]>;
+  getPlaylistDetail?(playlistId: string): Promise<PlaylistDetail | null>;
 }

@@ -254,6 +254,8 @@ export class BotInstance extends EventEmitter {
     const AUDIO_COMMANDS = new Set([
       "play",
       "add",
+      "playnext",
+      "pn",
       "next",
       "skip",
       "prev",
@@ -270,6 +272,9 @@ export class BotInstance extends EventEmitter {
         return this.cmdPlay(cmd);
       case "add":
         return this.cmdAdd(cmd);
+      case "playnext":
+      case "pn":
+        return this.cmdPlayNext(cmd);
       case "pause":
         return this.cmdPause();
       case "resume":
@@ -428,6 +433,39 @@ export class BotInstance extends EventEmitter {
     return `Added to queue: ${song.name} - ${song.artist} (position ${this.queue.size()})`;
   }
 
+  private async cmdPlayNext(cmd: ParsedCommand): Promise<string> {
+    if (!cmd.args) return "Usage: !playnext <song name>";
+    const provider = this.getProvider(cmd.flags);
+    const result = await provider.search(cmd.args, 1);
+    if (result.songs.length === 0)
+      return `No results found for: ${cmd.args}`;
+
+    const song = result.songs[0];
+    const wasIdle = this.player.getState() === "idle";
+    // Capture the slot addNext WILL insert at, before mutating the queue.
+    // addNext pushes when currentIndex<0 (slot = size); otherwise splices
+    // at currentIndex+1. Using size-1 after addNext was wrong when the
+    // queue had stale currentIndex>=0 while the player was idle (e.g.,
+    // after natural track end without queue.clear()).
+    const insertedAt =
+      this.queue.getCurrentIndex() < 0
+        ? this.queue.size()
+        : this.queue.getCurrentIndex() + 1;
+    this.queue.addNext({ ...song, platform: provider.platform });
+
+    if (wasIdle) {
+      this.queue.playAt(insertedAt);
+      this.player.resetFailures();
+      const ok = await this.resolveAndPlay(this.queue.current()!);
+      this.emit("stateChange");
+      if (!ok) return `Cannot play: ${song.name}`;
+      return `Now playing: ${song.name} - ${song.artist}`;
+    }
+
+    this.emit("stateChange");
+    return `Up next: ${song.name} - ${song.artist}`;
+  }
+
   private cmdPause(): string {
     this.player.pause();
     this.emit("stateChange");
@@ -460,13 +498,17 @@ export class BotInstance extends EventEmitter {
   }
 
   private async cmdPrev(): Promise<string> {
-    const prev = this.queue.prev();
-    if (prev) {
+    // Retry-skip up to 4 attempts: history can include failed songs
+    // that playNext's auto-advance retry-skipped past, so a single
+    // prev would otherwise land on an unplayable song and leave the
+    // queue's currentIndex stuck mid-failure.
+    for (let i = 0; i < 4; i++) {
+      const prev = this.queue.prev();
+      if (!prev) return "No previous song";
       const ok = await this.resolveAndPlay(prev);
-      if (!ok) return "Cannot play previous song";
-      return `Now playing: ${prev.name} - ${prev.artist}`;
+      if (ok) return `Now playing: ${prev.name} - ${prev.artist}`;
     }
-    return "No previous song";
+    return "Cannot play any previous songs (all failed to resolve)";
   }
 
   private cmdVol(cmd: ParsedCommand): string {
@@ -715,6 +757,7 @@ export class BotInstance extends EventEmitter {
       `${p}play -b <song> — Search from BiliBili`,
       `${p}play -y <song> — Search from YouTube (yt-dlp)`,
       `${p}add <song>   — Add to queue`,
+      `${p}playnext <song> — Insert as next song (alias: ${p}pn)`,
       `${p}pause/resume — Pause/resume`,
       `${p}next/prev    — Next/previous`,
       `${p}stop         — Stop and clear queue`,
@@ -734,17 +777,25 @@ export class BotInstance extends EventEmitter {
     ].join("\n");
   }
 
-  private async playNext(): Promise<void> {
-    if (this.isAdvancing || !this.connected) return;
+  /**
+   * Advance the queue and play the next song. If the resolved URL fails
+   * (e.g., copyright/region restrictions for QQ), skips up to `maxRetries`
+   * more songs looking for a playable one. Public so REST endpoints that
+   * seed the queue can fall back to this retry-skip behavior.
+   *
+   * Returns true if a song actually started playing, false otherwise.
+   */
+  async playNext(maxRetries = 3): Promise<boolean> {
+    if (this.isAdvancing || !this.connected) return false;
     this.isAdvancing = true;
     try {
       this.voteSkipUsers.clear();
       const next = this.queue.next();
+      let started = false;
       if (next) {
-        let started = await this.resolveAndPlay(next);
+        started = await this.resolveAndPlay(next);
         if (!started) {
-          // Skip to next if URL resolve fails (up to 3 retries)
-          for (let i = 0; i < 3 && this.connected; i++) {
+          for (let i = 0; i < maxRetries && this.connected; i++) {
             const retry = this.queue.next();
             if (!retry) break;
             if (await this.resolveAndPlay(retry)) {
@@ -766,8 +817,9 @@ export class BotInstance extends EventEmitter {
           await this.refillFm();
           const refillNext = this.queue.next();
           if (refillNext) {
-            await this.resolveAndPlay(refillNext);
-          } else {
+            started = await this.resolveAndPlay(refillNext);
+          }
+          if (!started) {
             this.player.stop();
             this.profileManager.onSongChange(null).catch(() => {});
           }
@@ -777,6 +829,7 @@ export class BotInstance extends EventEmitter {
         }
       }
       this.emit("stateChange");
+      return started;
     } finally {
       this.isAdvancing = false;
     }

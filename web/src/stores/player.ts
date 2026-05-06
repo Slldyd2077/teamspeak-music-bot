@@ -11,6 +11,8 @@ export interface Song {
   platform: 'netease' | 'qq' | 'bilibili' | 'youtube';
 }
 
+export type Source = 'netease' | 'qq';
+
 export interface BotStatus {
   id: string;
   name: string;
@@ -54,12 +56,17 @@ export const usePlayerStore = defineStore('player', {
     timings: {} as Record<string, TimingState>,
     theme: 'dark' as 'dark' | 'light',
 
-    // Home page cache
-    recommendPlaylists: [] as PlaylistItem[],
-    dailySongs: [] as Song[],
-    userPlaylists: [] as PlaylistItem[],
+    // Home page cache, split by source
+    recommendPlaylists: { netease: [] as PlaylistItem[], qq: [] as PlaylistItem[] },
+    dailySongs:         { netease: [] as Song[],         qq: [] as Song[] },
+    userPlaylists:      { netease: [] as PlaylistItem[], qq: [] as PlaylistItem[] },
     bilibiliPopular: [] as Song[],
+    authStatus: { netease: false, qq: false },
     lastFetchTime: 0,
+
+    // Transient notification for surfacing failures (e.g., "song not playable")
+    // to a global Toast. Bumped `id` triggers re-render of the same message.
+    notification: null as { id: number; message: string; type: 'error' | 'info' } | null,
   }),
 
   getters: {
@@ -90,6 +97,13 @@ export const usePlayerStore = defineStore('player', {
       if (!timing.wasPlaying || timing.serverSyncTime === 0) return Math.min(timing.serverElapsed, maxDuration);
       if (this.isPaused) return Math.min(timing.serverElapsed, maxDuration);
       return Math.min(timing.serverElapsed + (Date.now() - timing.serverSyncTime) / 1000, maxDuration);
+    },
+    /** Sources that are currently logged in. Order: netease before qq. */
+    availableSources(): Source[] {
+      const s: Source[] = [];
+      if (this.authStatus.netease) s.push('netease');
+      if (this.authStatus.qq) s.push('qq');
+      return s;
     },
   },
 
@@ -259,11 +273,28 @@ export const usePlayerStore = defineStore('player', {
       this._syncAfterAction();
     },
 
+    notify(message: string, type: 'error' | 'info' = 'info') {
+      this.notification = { id: Date.now(), message, type };
+    },
+
     async playSong(song: Song) {
       if (!this.activeBotId) return;
-      await axios.post(`/api/player/${this.activeBotId}/play-song`, { song });
+      const res = await axios.post(`/api/player/${this.activeBotId}/play-song`, { song });
+      if (res.data?.ok === false && res.data?.message) {
+        this.notify(res.data.message, 'error');
+      }
       this._setTiming(this.activeBotId, { serverElapsed: 0 });
       this._syncAfterAction();
+    },
+
+    async playNextSong(song: Song) {
+      if (!this.activeBotId) return;
+      const res = await axios.post(`/api/player/${this.activeBotId}/play-next-song`, { song });
+      if (res.data?.message) {
+        this.notify(res.data.message, res.data.ok === false ? 'error' : 'info');
+      }
+      // Refresh queue so the inserted item shows up in the side panel
+      this.fetchQueue();
     },
 
     async addToQueue(query: string, platform = 'netease') {
@@ -283,7 +314,10 @@ export const usePlayerStore = defineStore('player', {
 
     async playPlaylist(playlistId: string, platform = 'netease') {
       if (!this.activeBotId) return;
-      await axios.post(`/api/player/${this.activeBotId}/play-playlist`, { playlistId, platform });
+      const res = await axios.post(`/api/player/${this.activeBotId}/play-playlist`, { playlistId, platform });
+      if (res.data?.message) {
+        this.notify(res.data.message, res.data.ok === false ? 'error' : 'info');
+      }
       this._setTiming(this.activeBotId, { serverElapsed: 0 });
       this._syncAfterAction();
     },
@@ -350,31 +384,92 @@ export const usePlayerStore = defineStore('player', {
     },
 
     async fetchHomeData() {
-      if (this.lastFetchTime > 0 && Date.now() - this.lastFetchTime < HOME_CACHE_TTL) {
+      // Always check auth status first — if it changed since the cached
+      // fetch (e.g., user logged in/out as a different account), the
+      // cached playlists belong to a different user and we MUST refetch.
+      const [neAuthRes, qqAuthRes] = await Promise.allSettled([
+        axios.get('/api/auth/status', { params: { platform: 'netease' } }),
+        axios.get('/api/auth/status', { params: { platform: 'qq' } }),
+      ]);
+      const newAuth = {
+        netease: neAuthRes.status === 'fulfilled' && !!neAuthRes.value.data?.loggedIn,
+        qq:      qqAuthRes.status === 'fulfilled' && !!qqAuthRes.value.data?.loggedIn,
+      };
+      const authChanged =
+        newAuth.netease !== this.authStatus.netease || newAuth.qq !== this.authStatus.qq;
+      this.authStatus.netease = newAuth.netease;
+      this.authStatus.qq = newAuth.qq;
+
+      // Cache hit only if auth is unchanged AND within TTL.
+      if (
+        !authChanged &&
+        this.lastFetchTime > 0 &&
+        Date.now() - this.lastFetchTime < HOME_CACHE_TTL
+      ) {
         return;
       }
 
-      const [playlistRes, dailyRes, userRes, biliRes] = await Promise.allSettled([
-        axios.get('/api/music/recommend/playlists'),
-        axios.get('/api/music/recommend/songs'),
-        axios.get('/api/music/user/playlists'),
-        axios.get('/api/music/bilibili/popular?limit=12'),
+      // 2. NetEase data: recommend playlists work anonymously; daily/user
+      // playlists need login but Promise.allSettled isolates failures.
+      const neteasePromises = [
+        axios.get('/api/music/recommend/playlists', { params: { platform: 'netease' } }),
+        axios.get('/api/music/recommend/songs',     { params: { platform: 'netease' } }),
+        axios.get('/api/music/user/playlists',      { params: { platform: 'netease' } }),
+      ];
+
+      // 3. QQ data: only fetch when QQ is logged in. When not logged in,
+      // resolve to empty payloads so the same indexed handling works.
+      const emptyPlaylists = { data: { playlists: [] } };
+      const emptySongs     = { data: { songs: [] } };
+      const qqPromises = this.authStatus.qq
+        ? [
+            axios.get('/api/music/recommend/playlists', { params: { platform: 'qq' } }),
+            axios.get('/api/music/recommend/songs',     { params: { platform: 'qq' } }),
+            axios.get('/api/music/user/playlists',      { params: { platform: 'qq' } }),
+          ]
+        : [
+            Promise.resolve(emptyPlaylists),
+            Promise.resolve(emptySongs),
+            Promise.resolve(emptyPlaylists),
+          ];
+
+      const biliPromise = axios.get('/api/music/bilibili/popular?limit=12');
+
+      const results = await Promise.allSettled([
+        ...neteasePromises,
+        ...qqPromises,
+        biliPromise,
       ]);
 
-      if (playlistRes.status === 'fulfilled') {
-        this.recommendPlaylists = playlistRes.value.data.playlists;
-      }
-      if (dailyRes.status === 'fulfilled') {
-        this.dailySongs = dailyRes.value.data.songs;
-      }
-      if (userRes.status === 'fulfilled') {
-        this.userPlaylists = userRes.value.data.playlists;
-      }
-      if (biliRes.status === 'fulfilled') {
-        this.bilibiliPopular = biliRes.value.data.songs;
+      const [neRecPL, neDaily, neUserPL, qqRecPL, qqDaily, qqUserPL, bili] = results;
+
+      this.recommendPlaylists.netease =
+        neRecPL.status === 'fulfilled' ? (neRecPL.value.data.playlists ?? []) : [];
+      this.dailySongs.netease =
+        neDaily.status === 'fulfilled' ? (neDaily.value.data.songs ?? []) : [];
+      this.userPlaylists.netease =
+        neUserPL.status === 'fulfilled' ? (neUserPL.value.data.playlists ?? []) : [];
+      this.recommendPlaylists.qq =
+        qqRecPL.status === 'fulfilled' ? (qqRecPL.value.data.playlists ?? []) : [];
+      this.dailySongs.qq =
+        qqDaily.status === 'fulfilled' ? (qqDaily.value.data.songs ?? []) : [];
+      this.userPlaylists.qq =
+        qqUserPL.status === 'fulfilled' ? (qqUserPL.value.data.playlists ?? []) : [];
+      // bilibili popular: keep previous value on failure (it's an anonymous endpoint
+      // unrelated to user auth state, and stale popular results are harmless)
+      if (bili.status === 'fulfilled') {
+        this.bilibiliPopular = bili.value.data.songs ?? [];
       }
 
-      this.lastFetchTime = Date.now();
+      // Only mark as fetched if at least the auth-status calls succeeded —
+      // a fully failed fetch (network blip / server down) should NOT be
+      // cached for 5 minutes, otherwise the user has to hard-reload to
+      // recover when connectivity returns.
+      const authOk =
+        neAuthRes.status === 'fulfilled' || qqAuthRes.status === 'fulfilled';
+      if (authOk) {
+        this.lastFetchTime = Date.now();
+      }
     },
   },
 });

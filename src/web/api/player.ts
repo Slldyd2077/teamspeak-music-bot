@@ -249,9 +249,32 @@ export function createPlayerRouter(
         return;
       }
 
+      // QQ-specific optimization: many users' QQ playlists contain a
+      // large fraction of songs that return result=104003 (region/copyright
+      // restricted). Batch-resolve URLs once and only queue the playable
+      // ones, otherwise the playback retry loop wastes time guessing.
+      let queueable: { id: string }[] = songs;
+      const totalCount = songs.length;
+      const qqLike = provider as { getPlayableSongIds?: (ids: string[]) => Promise<Set<string> | null> };
+      if (typeof qqLike.getPlayableSongIds === "function") {
+        const playable = await qqLike.getPlayableSongIds(songs.map((s: { id: string }) => s.id));
+        if (playable !== null) {
+          // Authoritative answer from upstream — even an empty set means
+          // "we know none are playable", short-circuit immediately rather
+          // than wasting 20+ retries.
+          queueable = songs.filter((s: { id: string }) => playable.has(s.id));
+        }
+        // If null, the batch endpoint itself errored — fall through to
+        // the sequential retry path, which still has a chance.
+      }
+      if (queueable.length === 0) {
+        res.json({ ok: false, message: `歌单 ${totalCount} 首歌曲均无版权可播放（区域/版权限制）` });
+        return;
+      }
+
       const queue = bot.getQueueManager();
       queue.clear();
-      for (const song of songs) {
+      for (const song of queueable) {
         queue.add({ ...song, platform: provider.platform });
       }
 
@@ -265,11 +288,25 @@ export function createPlayerRouter(
         first = queue.play();
       }
 
-      if (first) {
-        await bot.resolveAndPlay(first);
+      // If the first picked song can't resolve (e.g., QQ song with no
+      // streaming entitlement → result 104003), fall back to playNext's
+      // retry-skip behavior. Use a higher retry budget than the default
+      // trackEnd auto-advance because user-initiated playlist plays
+      // commonly have long contiguous runs of unplayable songs.
+      let started = first ? await bot.resolveAndPlay(first) : false;
+      if (first && !started) {
+        started = await bot.playNext(20);
       }
 
-      res.json({ message: `Loaded ${songs.length} songs. Now playing: ${first?.name ?? "unknown"}` });
+      const playing = queue.current();
+      const loadedMsg = queueable.length < totalCount
+        ? `已加载 ${queueable.length}/${totalCount} 首（其余区域/版权限制）`
+        : `已加载 ${queueable.length} 首`;
+      if (started && playing) {
+        res.json({ ok: true, message: `${loadedMsg}，正在播放：${playing.name}` });
+      } else {
+        res.json({ ok: false, message: `${loadedMsg}，但无法开始播放。` });
+      }
     } catch (err) {
       logger.error({ err }, "Play playlist failed");
       res.status(500).json({ error: (err as Error).message });
@@ -293,11 +330,51 @@ export function createPlayerRouter(
       bot.getPlayer().resetFailures();
       const ok = await bot.resolveAndPlay(queue.current()!);
       if (!ok) {
-        res.json({ message: `Cannot play: ${song.name || song.id}` });
+        res.json({ ok: false, message: `无法播放「${song.name || song.id}」（区域/版权限制）` });
         return;
       }
 
-      res.json({ message: `Now playing: ${song.name || 'Unknown'} - ${song.artist || 'Unknown'}` });
+      res.json({ ok: true, message: `正在播放：${song.name || 'Unknown'} - ${song.artist || 'Unknown'}` });
+    } catch (err) {
+      res.status(500).json({ error: (err as Error).message });
+    }
+  });
+
+  // Insert a single song to play right after the current one.
+  // If nothing is playing, behaves like /play-song (start immediately).
+  router.post("/:botId/play-next-song", async (req, res) => {
+    try {
+      const bot = (req as any).bot;
+      const { song } = req.body;
+      if (!song || !song.id || !song.platform) {
+        res.status(400).json({ error: "song object with id and platform is required" });
+        return;
+      }
+      const queue = bot.getQueueManager();
+      const wasIdle = bot.getPlayer().getState() === "idle";
+      // Capture the slot addNext WILL insert at, before mutating the queue.
+      // addNext pushes when currentIndex<0 (slot = size); otherwise splices
+      // at currentIndex+1. Using size-1 after addNext was wrong when the
+      // queue had stale currentIndex>=0 while the player was idle (e.g.,
+      // after natural track end without queue.clear()).
+      const insertedAt =
+        queue.getCurrentIndex() < 0 ? queue.size() : queue.getCurrentIndex() + 1;
+      queue.addNext(song);
+
+      if (wasIdle) {
+        // Promote the just-added song to current and start it.
+        queue.playAt(insertedAt);
+        bot.getPlayer().resetFailures();
+        const ok = await bot.resolveAndPlay(queue.current()!);
+        if (!ok) {
+          res.json({ ok: false, message: `无法播放「${song.name || song.id}」（区域/版权限制）` });
+          return;
+        }
+        res.json({ ok: true, message: `正在播放：${song.name || 'Unknown'} - ${song.artist || 'Unknown'}` });
+        return;
+      }
+
+      res.json({ ok: true, message: `已加入下一首：${song.name || 'Unknown'} - ${song.artist || 'Unknown'}` });
     } catch (err) {
       res.status(500).json({ error: (err as Error).message });
     }
