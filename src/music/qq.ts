@@ -18,6 +18,22 @@ const qqDirectApi = axios.create({
   headers: { referer: "https://y.qq.com" },
 });
 
+// Direct client for c.y.qq.com endpoints (collected playlists / favorites).
+// The bundled qq-music-api wrapper doesn't expose these endpoints.
+const qqFavApi = axios.create({
+  baseURL: "https://c.y.qq.com",
+  timeout: 10000,
+  headers: { referer: "https://y.qq.com/" },
+});
+
+function computeGtk(pSkey: string): number {
+  let hash = 5381;
+  for (let i = 0; i < pSkey.length; i++) {
+    hash = (hash + (hash << 5) + pSkey.charCodeAt(i)) | 0;
+  }
+  return hash & 0x7fffffff;
+}
+
 export class QQMusicProvider implements MusicProvider {
   readonly platform = "qq" as const;
   private api: AxiosInstance;
@@ -291,22 +307,96 @@ export class QQMusicProvider implements MusicProvider {
     }
   }
 
+  async getDailyRecommendSongs(): Promise<Song[]> {
+    // QQ has no per-user daily list; use newsong.NewSongServer (新歌速递)
+    // as the closest analogue. Returns ~20 newly-released songs.
+    try {
+      const res = await this.api.get("/getNewSongs", {
+        params: { ...this.cookieParams },
+      });
+      const list: any[] = res.data?.response?.new_song?.data?.songlist ?? [];
+      return list.map((s: any) => ({
+        id: String(s.mid ?? s.id),
+        name: s.title ?? s.name ?? "",
+        artist: (s.singer ?? []).map((a: any) => a.name).join(" / "),
+        album: s.album?.name ?? s.album?.title ?? "",
+        duration: s.interval ?? 0,
+        coverUrl: s.album?.mid
+          ? `https://y.gtimg.cn/music/photo_new/T002R300x300M000${s.album.mid}.jpg`
+          : "",
+        platform: "qq",
+      }));
+    } catch {
+      return [];
+    }
+  }
+
   async getUserPlaylists(): Promise<Playlist[]> {
     if (!this.cookie) return [];
     const uinMatch = /(?:^|; )uin=o?0?(\d+)/.exec(this.cookie);
     const uin = uinMatch ? uinMatch[1] : "";
     if (!uin) return [];
+
+    // Created and collected playlists come from two separate QQ endpoints.
+    // Run them in parallel and concatenate (created first, then collected),
+    // matching the order shown in the QQ Music desktop app.
+    const [created, collected] = await Promise.all([
+      this.fetchCreatedPlaylists(uin),
+      this.fetchCollectedPlaylists(uin),
+    ]);
+    return [...created, ...collected];
+  }
+
+  private async fetchCreatedPlaylists(uin: string): Promise<Playlist[]> {
     try {
       const res = await this.api.get("/user/getUserPlaylists", {
         params: { uin, ...this.cookieParams },
       });
       if (res.data?.response?.code !== 0) return [];
-      return (res.data?.response?.data?.playlists ?? []).map((p: any) => ({
-        id: String(p.dissid ?? p.id ?? ""),
-        name: p.dissname ?? p.name ?? "",
-        coverUrl: p.imgurl ?? p.coverUrl ?? "",
-        songCount: p.song_count ?? p.listennum ?? 0,
-        platform: "qq",
+      return (res.data?.response?.data?.playlists ?? []).map((p: any) => {
+        // fcg_get_profile_homepage returns title/picurl/subtitle ("X首  Y次播放").
+        const subtitle: string = p.subtitle ?? "";
+        const songCountFromSubtitle = parseInt(subtitle.match(/(\d+)\s*首/)?.[1] ?? "0", 10);
+        return {
+          id: String(p.dissid ?? p.id ?? ""),
+          name: p.title ?? p.dissname ?? p.name ?? "",
+          coverUrl: p.picurl ?? p.imgurl ?? p.coverUrl ?? "",
+          songCount: p.song_count ?? p.listennum ?? songCountFromSubtitle,
+          platform: "qq",
+        };
+      });
+    } catch {
+      return [];
+    }
+  }
+
+  private async fetchCollectedPlaylists(uin: string): Promise<Playlist[]> {
+    // c.y.qq.com fav endpoint: reqtype=3 returns collected playlists (cdlist).
+    // Requires g_tk derived from the p_skey cookie.
+    const pSkeyMatch = /(?:^|; )p_skey=([^;]+)/.exec(this.cookie);
+    if (!pSkeyMatch) return [];
+    const gtk = computeGtk(pSkeyMatch[1]);
+    try {
+      const res = await qqFavApi.get("/fav/fcgi-bin/fcg_get_profile_order_asset.fcg", {
+        params: {
+          ct: 20,
+          cid: 205360956,
+          userid: uin,
+          reqtype: 3,
+          sin: 0,
+          ein: 29,
+          g_tk: gtk,
+          format: "json",
+        },
+        headers: { Cookie: this.cookie },
+      });
+      if (res.data?.code !== 0) return [];
+      return (res.data?.data?.cdlist ?? []).map((p: any) => ({
+        id: String(p.dissid ?? ""),
+        name: p.dissname ?? "",
+        coverUrl: p.logo ?? "",
+        songCount: p.songnum ?? 0,
+        platform: "qq" as const,
       }));
     } catch {
       return [];
