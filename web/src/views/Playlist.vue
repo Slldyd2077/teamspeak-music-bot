@@ -77,20 +77,37 @@ onMounted(async () => {
   const id = route.params.id as string;
   const platform = (route.query.platform as string) || 'netease';
 
-  try {
-    const [detailRes, songsRes] = await Promise.all([
-      axios.get(`/api/music/playlist/${id}/detail`, { params: { platform } }),
-      axios.get(`/api/music/playlist/${id}`, { params: { platform } }),
-    ]);
-    playlist.value = detailRes.data.playlist;
-    songs.value = songsRes.data.songs;
-  } catch (err: any) {
-    console.error('Failed to load playlist:', err?.response?.status, err?.message);
+  // allSettled, not Promise.all — if detail 404s but songs is fine
+  // (e.g., a QQ playlist whose detail endpoint flaked but the song
+  // list resolved), we still want to show the songs rather than
+  // the "歌单不存在" empty state.
+  const [detailRes, songsRes] = await Promise.allSettled([
+    axios.get(`/api/music/playlist/${id}/detail`, { params: { platform } }),
+    axios.get(`/api/music/playlist/${id}`, { params: { platform } }),
+  ]);
+
+  const detail = detailRes.status === 'fulfilled' ? detailRes.value.data?.playlist : null;
+  const songList = songsRes.status === 'fulfilled' ? (songsRes.value.data?.songs ?? []) : [];
+
+  if (detail) {
+    playlist.value = detail;
+  } else if (songList.length > 0) {
+    // Fall back to a stub built from the route + first song's cover.
+    playlist.value = {
+      id,
+      name: '歌单',
+      description: '',
+      coverUrl: songList[0]?.coverUrl ?? '',
+      songCount: songList.length,
+    };
+  } else {
     playlist.value = null;
-    songs.value = [];
-  } finally {
-    loading.value = false;
+    if (detailRes.status === 'rejected') {
+      console.error('Failed to load playlist detail:', (detailRes.reason as any)?.response?.status, (detailRes.reason as any)?.message);
+    }
   }
+  songs.value = songList;
+  loading.value = false;
 });
 </script>
 

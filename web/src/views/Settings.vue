@@ -782,6 +782,13 @@ async function loadProfileConfig(botId: string) {
   profileLoadError[botId] = null;
   try {
     const res = await axios.get(`/api/player/${botId}/profile`);
+    // Defensive: a 200 response with non-object body (empty / proxy
+    // injection / etc.) would otherwise leave the row stuck on
+    // "加载中..." because profileConfigs[botId] would be falsy.
+    if (!res.data || typeof res.data !== 'object' || typeof res.data.avatarEnabled !== 'boolean') {
+      profileLoadError[botId] = '响应格式异常';
+      return;
+    }
     profileConfigs[botId] = res.data;
   } catch (err: any) {
     profileLoadError[botId] = err?.response?.status === 404

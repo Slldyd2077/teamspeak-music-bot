@@ -13,7 +13,13 @@ function readAll(): Partial<Record<TabKey, Source>> {
     const raw = localStorage.getItem(STORAGE_KEY);
     if (!raw) return {};
     const parsed = JSON.parse(raw);
-    return typeof parsed === 'object' && parsed !== null ? parsed : {};
+    // typeof null === 'object' and typeof [] === 'object' — both pass a
+    // naive check but neither is a valid record. Reject explicitly so a
+    // corrupted / manipulated value can't smuggle wrong shapes through.
+    if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      return {};
+    }
+    return parsed as Partial<Record<TabKey, Source>>;
   } catch {
     return {};
   }
