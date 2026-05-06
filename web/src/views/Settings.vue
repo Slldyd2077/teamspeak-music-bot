@@ -397,6 +397,48 @@
         </div>
       </div>
     </section>
+
+    <!-- Bot Profile (TeamSpeak Behavior) -->
+    <section class="settings-section">
+      <h2 class="section-title">机器人 Profile（TeamSpeak 行为）</h2>
+      <p class="profile-section-hint">控制 bot 在 TeamSpeak 上自动同步歌曲信息的方式。⚠️ 标记的项会触发频道里所有人的提示音。</p>
+      <div v-if="store.bots.length === 0" class="empty-hint">还没有机器人，先在上面创建一个。</div>
+      <div v-else class="profile-bot-list">
+        <div v-for="bot in store.bots" :key="bot.id" class="profile-bot">
+          <button
+            class="profile-bot-header"
+            :class="{ expanded: profileExpanded[bot.id] }"
+            @click="toggleProfileExpanded(bot.id)"
+          >
+            <Icon :icon="profileExpanded[bot.id] ? 'mdi:chevron-down' : 'mdi:chevron-right'" />
+            <span class="profile-bot-name">{{ bot.name }}</span>
+          </button>
+          <div v-if="profileExpanded[bot.id]" class="profile-toggles">
+            <div v-if="!profileConfigs[bot.id]" class="profile-loading">加载中...</div>
+            <label
+              v-else
+              v-for="t in PROFILE_TOGGLES"
+              :key="t.key"
+              class="profile-toggle"
+            >
+              <div class="profile-toggle-text">
+                <div class="profile-toggle-label">
+                  {{ t.label }}
+                  <span v-if="t.warning" class="profile-warn-tag">⚠️ {{ t.warning }}</span>
+                </div>
+                <div class="profile-toggle-hint">{{ t.hint }}</div>
+              </div>
+              <input
+                type="checkbox"
+                class="profile-toggle-switch"
+                :checked="profileConfigs[bot.id][t.key]"
+                @change="updateProfile(bot.id, t.key, ($event.target as HTMLInputElement).checked)"
+              />
+            </label>
+          </div>
+        </div>
+      </div>
+    </section>
   </div>
 </template>
 
@@ -701,6 +743,61 @@ async function saveIdleTimeout() {
   try {
     await axios.post('/api/bot/settings', { idleTimeoutMinutes: idleTimeout.value });
   } catch { /* ignore */ }
+}
+
+// --- Bot Profile config ---
+interface ProfileConfig {
+  avatarEnabled: boolean;
+  descriptionEnabled: boolean;
+  nicknameEnabled: boolean;
+  awayStatusEnabled: boolean;
+  channelDescEnabled: boolean;
+  nowPlayingMsgEnabled: boolean;
+}
+
+const PROFILE_TOGGLES: ReadonlyArray<{
+  key: keyof ProfileConfig;
+  label: string;
+  hint: string;
+  warning: string | null;
+}> = [
+  { key: 'avatarEnabled',       label: '同步头像',           hint: '使用专辑封面作为 bot 头像',                  warning: null },
+  { key: 'descriptionEnabled',  label: '同步个人描述',       hint: '在 bot 简介里显示当前播放的歌曲',            warning: null },
+  { key: 'nicknameEnabled',     label: '同步昵称',           hint: 'bot 昵称跟着歌名变化',                       warning: null },
+  { key: 'awayStatusEnabled',   label: '走开状态',           hint: '停止播放时把 bot 设为"走开"',               warning: null },
+  { key: 'channelDescEnabled',  label: '更新频道描述',       hint: '把"正在播放"信息写入频道描述',             warning: '频道编辑提示音' },
+  { key: 'nowPlayingMsgEnabled',label: '推送"正在播放"消息', hint: '切歌时在频道里发一条文字消息',               warning: '新消息提示音' },
+];
+
+const profileConfigs = reactive<Record<string, ProfileConfig>>({});
+const profileExpanded = reactive<Record<string, boolean>>({});
+
+async function loadProfileConfig(botId: string) {
+  if (profileConfigs[botId]) return;
+  try {
+    const res = await axios.get(`/api/player/${botId}/profile`);
+    profileConfigs[botId] = res.data;
+  } catch {
+    // bot not loaded or no profile manager yet
+  }
+}
+
+function toggleProfileExpanded(botId: string) {
+  profileExpanded[botId] = !profileExpanded[botId];
+  if (profileExpanded[botId]) loadProfileConfig(botId);
+}
+
+async function updateProfile(botId: string, key: keyof ProfileConfig, value: boolean) {
+  const cfg = profileConfigs[botId];
+  if (!cfg) return;
+  const prev = cfg[key];
+  cfg[key] = value; // optimistic
+  try {
+    const res = await axios.put(`/api/player/${botId}/profile`, { [key]: value });
+    profileConfigs[botId] = res.data;
+  } catch {
+    cfg[key] = prev; // revert
+  }
 }
 
 onMounted(() => {
@@ -1138,5 +1235,177 @@ onUnmounted(() => {
 @keyframes spin {
   from { transform: rotate(0deg); }
   to { transform: rotate(360deg); }
+}
+
+// --- Bot Profile section ---
+.profile-section-hint {
+  font-size: 13px;
+  color: var(--text-secondary);
+  margin: -8px 0 16px;
+  line-height: 1.5;
+}
+
+.empty-hint {
+  font-size: 13px;
+  color: var(--text-tertiary);
+  padding: 12px;
+}
+
+.profile-bot-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.profile-bot {
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-md);
+  overflow: hidden;
+}
+
+.profile-bot-header {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 12px 16px;
+  background: transparent;
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text-primary);
+  cursor: pointer;
+  transition: background var(--transition-fast);
+
+  &:hover { background: var(--hover-bg); }
+  &.expanded { background: var(--hover-bg); }
+}
+
+.profile-bot-name {
+  flex: 1;
+  text-align: left;
+}
+
+.profile-toggles {
+  display: flex;
+  flex-direction: column;
+  padding: 0 16px 8px;
+  border-top: 1px solid var(--border-color);
+}
+
+.profile-loading {
+  padding: 16px 0;
+  font-size: 13px;
+  color: var(--text-tertiary);
+  text-align: center;
+}
+
+.profile-toggle {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  padding: 14px 0;
+  border-bottom: 1px solid var(--border-color);
+  cursor: pointer;
+
+  &:last-child { border-bottom: none; }
+}
+
+.profile-toggle-text {
+  flex: 1;
+  min-width: 0;
+}
+
+.profile-toggle-label {
+  font-size: 14px;
+  font-weight: 500;
+  color: var(--text-primary);
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  line-height: 1.3;
+}
+
+.profile-warn-tag {
+  font-size: 11px;
+  font-weight: 500;
+  padding: 2px 6px;
+  background: var(--color-paused-15);
+  color: var(--color-paused);
+  border-radius: var(--radius-xs);
+  white-space: nowrap;
+}
+
+.profile-toggle-hint {
+  font-size: 12px;
+  color: var(--text-tertiary);
+  margin-top: 4px;
+  line-height: 1.4;
+}
+
+.profile-toggle-switch {
+  flex-shrink: 0;
+  appearance: none;
+  -webkit-appearance: none;
+  width: 40px;
+  height: 22px;
+  border-radius: 999px;
+  background: var(--bg-secondary);
+  border: 1px solid var(--border-color);
+  position: relative;
+  cursor: pointer;
+  transition: background var(--transition-fast), border-color var(--transition-fast);
+  margin: 0;
+
+  &::before {
+    content: '';
+    position: absolute;
+    top: 2px;
+    left: 2px;
+    width: 16px;
+    height: 16px;
+    border-radius: 50%;
+    background: var(--text-secondary);
+    transition: transform var(--transition-fast), background var(--transition-fast);
+  }
+
+  &:checked {
+    background: var(--color-primary);
+    border-color: var(--color-primary);
+
+    &::before {
+      transform: translateX(18px);
+      background: white;
+    }
+  }
+}
+
+@media (max-width: 768px) {
+  .profile-bot-header {
+    padding: 14px 12px;
+    font-size: 15px;
+  }
+
+  .profile-toggles {
+    padding: 0 12px 6px;
+  }
+
+  .profile-toggle {
+    gap: 12px;
+    padding: 14px 0;
+  }
+
+  .profile-toggle-switch {
+    width: 44px;
+    height: 24px;
+
+    &::before {
+      width: 18px;
+      height: 18px;
+    }
+    &:checked::before {
+      transform: translateX(20px);
+    }
+  }
 }
 </style>
