@@ -266,13 +266,13 @@ export function createPlayerRouter(
       }
 
       // If the first picked song can't resolve (e.g., QQ song with no
-      // streaming entitlement → result 104003), fall back to the same
-      // retry-skip behavior playNext uses for trackEnd auto-advance.
-      // Otherwise the bot would sit silently on a dead song.
+      // streaming entitlement → result 104003), fall back to playNext's
+      // retry-skip behavior. Use a higher retry budget than the default
+      // trackEnd auto-advance because user-initiated playlist plays
+      // commonly have long contiguous runs of unplayable songs.
       let started = first ? await bot.resolveAndPlay(first) : false;
       if (first && !started) {
-        await bot.playNext();
-        started = !!queue.current();
+        started = await bot.playNext(20);
       }
 
       const playing = queue.current();

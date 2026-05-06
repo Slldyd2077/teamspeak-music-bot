@@ -736,21 +736,23 @@ export class BotInstance extends EventEmitter {
 
   /**
    * Advance the queue and play the next song. If the resolved URL fails
-   * (e.g., copyright/region restrictions for QQ), skips up to 3 more
-   * songs looking for a playable one. Public so REST endpoints that
+   * (e.g., copyright/region restrictions for QQ), skips up to `maxRetries`
+   * more songs looking for a playable one. Public so REST endpoints that
    * seed the queue can fall back to this retry-skip behavior.
+   *
+   * Returns true if a song actually started playing, false otherwise.
    */
-  async playNext(): Promise<void> {
-    if (this.isAdvancing || !this.connected) return;
+  async playNext(maxRetries = 3): Promise<boolean> {
+    if (this.isAdvancing || !this.connected) return false;
     this.isAdvancing = true;
     try {
       this.voteSkipUsers.clear();
       const next = this.queue.next();
+      let started = false;
       if (next) {
-        let started = await this.resolveAndPlay(next);
+        started = await this.resolveAndPlay(next);
         if (!started) {
-          // Skip to next if URL resolve fails (up to 3 retries)
-          for (let i = 0; i < 3 && this.connected; i++) {
+          for (let i = 0; i < maxRetries && this.connected; i++) {
             const retry = this.queue.next();
             if (!retry) break;
             if (await this.resolveAndPlay(retry)) {
@@ -772,8 +774,9 @@ export class BotInstance extends EventEmitter {
           await this.refillFm();
           const refillNext = this.queue.next();
           if (refillNext) {
-            await this.resolveAndPlay(refillNext);
-          } else {
+            started = await this.resolveAndPlay(refillNext);
+          }
+          if (!started) {
             this.player.stop();
             this.profileManager.onSongChange(null).catch(() => {});
           }
@@ -783,6 +786,7 @@ export class BotInstance extends EventEmitter {
         }
       }
       this.emit("stateChange");
+      return started;
     } finally {
       this.isAdvancing = false;
     }
