@@ -49,6 +49,37 @@ function getFfmpegCommand(): string {
   return resolvedFfmpeg;
 }
 
+const BROWSER_UA =
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
+
+export function buildFfmpegArgs(url: string, seekSeconds: number): string[] {
+  const args: string[] = [];
+
+  if (url.includes("bilivideo") || url.includes("bilibili")) {
+    args.push(
+      "-headers",
+      `Referer: https://www.bilibili.com\r\nUser-Agent: ${BROWSER_UA}\r\n`,
+    );
+  } else if (url.includes("music.126.net") || url.includes("music.163.com")) {
+    args.push(
+      "-headers",
+      `Referer: https://music.163.com/\r\nUser-Agent: ${BROWSER_UA}\r\n`,
+    );
+  }
+
+  args.push(
+    "-reconnect", "1",
+    "-reconnect_streamed", "1",
+    "-reconnect_delay_max", "30",
+    "-reconnect_on_network_error", "1",
+    "-reconnect_on_http_error", "4xx,5xx",
+  );
+  if (seekSeconds > 0) args.push("-ss", String(seekSeconds));
+  args.push("-i", url, "-f", "s16le", "-ar", "48000", "-ac", "2", "-acodec", "pcm_s16le", "-");
+
+  return args;
+}
+
 export interface PlayerEvents {
   frame: (opusFrame: Buffer) => void;
   trackEnd: () => void;
@@ -106,13 +137,7 @@ export class AudioPlayer extends EventEmitter {
       return;
     }
 
-    const args: string[] = [];
-    if (url.includes("bilivideo") || url.includes("bilibili")) {
-      args.push("-headers", "Referer: https://www.bilibili.com\r\nUser-Agent: Mozilla/5.0...\r\n");
-    }
-    args.push("-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "5");
-    if (seekSeconds > 0) args.push("-ss", String(seekSeconds));
-    args.push("-i", url, "-f", "s16le", "-ar", "48000", "-ac", "2", "-acodec", "pcm_s16le", "-");
+    const args = buildFfmpegArgs(url, seekSeconds);
 
     const ffmpegBin = getFfmpegCommand();
     this.ffmpeg = spawn(ffmpegBin, args, { stdio: ["ignore", "pipe", "pipe"] });
