@@ -8,6 +8,7 @@ import type {
   SearchResult,
   QrCodeResult,
   AuthStatus,
+  Album,
 } from "./provider.js";
 import { parseLyrics } from "./netease.js";
 
@@ -26,6 +27,26 @@ const qqFavApi = axios.create({
   timeout: 10000,
   headers: { referer: "https://y.qq.com/" },
 });
+
+export function mapQqAlbums(raw: any[] | null | undefined): Album[] {
+  if (!Array.isArray(raw)) return [];
+  return raw.map((a) => {
+    const id = String(a.albumMID ?? a.mid ?? a.albumID ?? "");
+    const artist = a.singerName
+      ?? (Array.isArray(a.singer) ? a.singer.map((s: any) => s.name).join(" / ") : "");
+    const coverUrl = id
+      ? `https://y.gtimg.cn/music/photo_new/T002R300x300M000${id}.jpg`
+      : (a.albumPic ?? "");
+    return {
+      id,
+      name: a.albumName ?? a.title ?? "",
+      artist,
+      coverUrl,
+      songCount: a.song_count ?? a.songCount ?? 0,
+      platform: "qq" as const,
+    };
+  });
+}
 
 function computeGtk(pSkey: string): number {
   let hash = 5381;
@@ -65,11 +86,12 @@ export class QQMusicProvider implements MusicProvider {
       req_0: {
         module: "music.search.SearchCgiService",
         method: "DoSearchForQQMusicDesktop",
-        param: {
-          searchid: "1",
-          query,
-          num_per_page: Math.min(limit, 50),
-        },
+        param: { searchid: "1", query, num_per_page: Math.min(limit, 50), search_type: 0 },
+      },
+      req_album: {
+        module: "music.search.SearchCgiService",
+        method: "DoSearchForQQMusicDesktop",
+        param: { searchid: "1", query, num_per_page: 5, search_type: 8 },
       },
     });
     const res = await qqDirectApi.get("/cgi-bin/musicu.fcg", {
@@ -90,7 +112,10 @@ export class QQMusicProvider implements MusicProvider {
       platform: "qq",
     }));
 
-    return { songs, playlists: [], albums: [] };
+    const albumList: any[] = res.data?.req_album?.data?.body?.album?.list ?? [];
+    const albums = mapQqAlbums(albumList);
+
+    return { songs, playlists: [], albums };
   }
 
   async getSongUrl(songId: string, quality?: string): Promise<string | null> {
