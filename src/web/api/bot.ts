@@ -3,12 +3,16 @@ import type { BotManager } from "../../bot/manager.js";
 import type { BotConfig } from "../../data/config.js";
 import { saveConfig } from "../../data/config.js";
 import type { Logger } from "../../logger.js";
+import type { BotDatabase } from "../../data/database.js";
+import type { AvatarStore } from "../../data/avatars.js";
 
 export function createBotRouter(
   botManager: BotManager,
   config: BotConfig,
   configPath: string,
-  logger: Logger
+  logger: Logger,
+  botDb: BotDatabase,
+  avatarStore: AvatarStore,
 ): Router {
   const router = Router();
 
@@ -34,6 +38,70 @@ export function createBotRouter(
       return;
     }
     res.json(saved);
+  });
+
+  router.get("/:id/avatar", (req, res) => {
+    const path = botDb.getCustomAvatarPath(req.params.id);
+    if (!path) {
+      res.status(404).end();
+      return;
+    }
+    const buf = avatarStore.read(path);
+    if (!buf) {
+      res.status(404).end();
+      return;
+    }
+    const ext = path.split(".").pop() ?? "";
+    const mime = ext === "png"
+      ? "image/png"
+      : ext === "webp"
+        ? "image/webp"
+        : "image/jpeg";
+    res.set("Content-Type", mime);
+    res.set("Cache-Control", "no-cache");
+    res.send(buf);
+  });
+
+  router.put("/:id/avatar", (req, res) => {
+    const exists =
+      botManager.getBot(req.params.id) ||
+      botDb.getBotInstances().some((b) => b.id === req.params.id);
+    if (!exists) {
+      res.status(404).json({ error: "Bot not found" });
+      return;
+    }
+    const { dataUrl } = req.body as { dataUrl?: string };
+    if (typeof dataUrl !== "string") {
+      res.status(400).json({ error: "dataUrl required" });
+      return;
+    }
+    const m = /^data:(image\/(?:png|jpeg|webp));base64,(.+)$/.exec(dataUrl);
+    if (!m) {
+      res.status(400).json({ error: "dataUrl must be image/png|jpeg|webp base64" });
+      return;
+    }
+    const mime = m[1] as string;
+    const buf = Buffer.from(m[2] ?? "", "base64");
+    if (buf.length === 0) {
+      res.status(400).json({ error: "empty image" });
+      return;
+    }
+    if (buf.length > 200 * 1024) {
+      res.status(413).json({ error: "avatar exceeds 200KB limit" });
+      return;
+    }
+    const rel = avatarStore.write(req.params.id, mime, buf);
+    botDb.setCustomAvatarPath(req.params.id, rel);
+    botManager.getBot(req.params.id)?.getProfileManager().setCustomAvatar(buf);
+    res.json({ path: rel });
+  });
+
+  router.delete("/:id/avatar", (req, res) => {
+    const path = botDb.getCustomAvatarPath(req.params.id);
+    if (path) avatarStore.remove(path);
+    botDb.setCustomAvatarPath(req.params.id, null);
+    botManager.getBot(req.params.id)?.getProfileManager().setCustomAvatar(null);
+    res.status(204).end();
   });
 
   router.post("/", async (req, res) => {

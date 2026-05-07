@@ -11,6 +11,7 @@ import type { BotConfig } from "../data/config.js";
 import type { Logger } from "../logger.js";
 
 import type { ServerProtocol } from "../ts-protocol/client.js";
+import type { AvatarStore } from "../data/avatars.js";
 
 /**
  * Run bot.connect() with a hard deadline. If the handshake hangs (e.g. the
@@ -74,6 +75,7 @@ export class BotManager extends EventEmitter {
   private database: BotDatabase;
   private config: BotConfig;
   private logger: Logger;
+  private avatarStore: AvatarStore;
 
   constructor(
     neteaseProvider: MusicProvider,
@@ -81,7 +83,8 @@ export class BotManager extends EventEmitter {
     bilibiliProvider: MusicProvider,
     database: BotDatabase,
     config: BotConfig,
-    logger: Logger
+    logger: Logger,
+    avatarStore: AvatarStore
   ) {
     super();
     this.neteaseProvider = neteaseProvider;
@@ -91,6 +94,7 @@ export class BotManager extends EventEmitter {
     this.database = database;
     this.config = config;
     this.logger = logger;
+    this.avatarStore = avatarStore;
   }
 
   async createBot(params: CreateBotParams): Promise<BotInstance> {
@@ -117,6 +121,7 @@ export class BotManager extends EventEmitter {
       database: this.database,
       config: this.config,
       logger: this.logger,
+      avatarStore: this.avatarStore,
     });
 
     this.bots.set(id, bot);
@@ -229,10 +234,11 @@ export class BotManager extends EventEmitter {
         neteaseProvider: this.neteaseProvider,
         qqProvider: this.qqProvider,
         bilibiliProvider: this.bilibiliProvider,
-      youtubeProvider: this.youtubeProvider,
+        youtubeProvider: this.youtubeProvider,
         database: this.database,
         config: this.config,
         logger: this.logger,
+        avatarStore: this.avatarStore,
       });
       this.bots.set(id, bot);
       this.emit("botInstance", bot);
@@ -279,10 +285,11 @@ export class BotManager extends EventEmitter {
         neteaseProvider: this.neteaseProvider,
         qqProvider: this.qqProvider,
         bilibiliProvider: this.bilibiliProvider,
-      youtubeProvider: this.youtubeProvider,
+        youtubeProvider: this.youtubeProvider,
         database: this.database,
         config: this.config,
         logger: this.logger,
+        avatarStore: this.avatarStore,
       });
 
       this.bots.set(saved.id, bot);

@@ -116,6 +116,10 @@
           <label>服务器密码（可选）</label>
           <input v-model="newBotServerPassword" class="input" type="password" placeholder="服务器有密码时填写" />
         </div>
+        <div class="form-group">
+          <label>自定义头像（可选）</label>
+          <AvatarUpload v-model="newBotAvatar" />
+        </div>
         <button class="btn-primary" @click="createBot">创建</button>
       </div>
     </section>
@@ -439,6 +443,13 @@
                 @change="updateProfile(bot.id, t.key, ($event.target as HTMLInputElement).checked)"
               />
             </label>
+            <div v-if="profileConfigs[bot.id]" class="profile-toggle profile-toggle-static">
+              <div class="profile-toggle-text">
+                <div class="profile-toggle-label">自定义头像</div>
+                <div class="profile-toggle-hint">无论封面同步是否开启，停播时都会回到这张图</div>
+              </div>
+              <CustomAvatarRow :bot-id="bot.id" />
+            </div>
           </div>
         </div>
       </div>
@@ -450,6 +461,8 @@
 import { ref, reactive, onMounted, onUnmounted } from 'vue';
 import { Icon } from '@iconify/vue';
 import axios from 'axios';
+import AvatarUpload from '../components/AvatarUpload.vue';
+import CustomAvatarRow from '../components/CustomAvatarRow.vue';
 import QRCode from 'qrcode';
 import { usePlayerStore } from '../stores/player.js';
 
@@ -475,6 +488,7 @@ const newBotPort = ref(9987);
 const newBotNickname = ref('MusicBot');
 const newBotChannel = ref('');
 const newBotServerPassword = ref('');
+const newBotAvatar = ref<string | null>(null);
 
 // Edit bot
 const editingBot = ref<string | null>(null);
@@ -635,7 +649,7 @@ async function pollQrStatus(platform: string) {
 async function createBot() {
   if (!newBotName.value || !newBotServer.value) return;
   try {
-    await axios.post('/api/bot', {
+    const res = await axios.post('/api/bot', {
       name: newBotName.value,
       serverAddress: newBotServer.value,
       serverPort: newBotPort.value || 9987,
@@ -644,12 +658,20 @@ async function createBot() {
       serverPassword: newBotServerPassword.value || undefined,
       autoStart: false,
     });
+    if (newBotAvatar.value && res.data?.id) {
+      try {
+        await axios.put(`/api/bot/${res.data.id}/avatar`, { dataUrl: newBotAvatar.value });
+      } catch (err) {
+        console.warn('failed to set avatar on new bot', err);
+      }
+    }
     newBotName.value = '';
     newBotServer.value = '';
     newBotPort.value = 9987;
     newBotNickname.value = 'MusicBot';
     newBotChannel.value = '';
     newBotServerPassword.value = '';
+    newBotAvatar.value = null;
     await store.fetchBots();
   } catch {
     // Ignore
@@ -1406,6 +1428,11 @@ onUnmounted(() => {
       background: white;
     }
   }
+}
+
+.profile-toggle-static {
+  cursor: default;
+  align-items: flex-start;
 }
 
 @media (max-width: 768px) {

@@ -16,6 +16,7 @@ import type { Logger } from "../logger.js";
 import type { BotDatabase, ProfileConfig } from "../data/database.js";
 import type { BotConfig } from "../data/config.js";
 import { BotProfileManager } from "./profile.js";
+import type { AvatarStore } from "../data/avatars.js";
 
 export interface BotInstanceOptions {
   id: string;
@@ -28,6 +29,7 @@ export interface BotInstanceOptions {
   database: BotDatabase;
   config: BotConfig;
   logger: Logger;
+  avatarStore: AvatarStore;
 }
 
 export interface BotStatus {
@@ -57,6 +59,7 @@ export class BotInstance extends EventEmitter {
   private database: BotDatabase;
   private config: BotConfig;
   private logger: Logger;
+  private avatarStore: AvatarStore;
   private connected = false;
   private disconnectEmitted = false;
   private voteSkipUsers = new Set<string>();
@@ -77,6 +80,7 @@ export class BotInstance extends EventEmitter {
     this.database = options.database;
     this.config = options.config;
     this.logger = options.logger.child({ botId: this.id });
+    this.avatarStore = options.avatarStore;
 
     this.tsClient = new TS3Client(options.tsOptions, this.logger);
     this.player = new AudioPlayer(this.logger);
@@ -89,6 +93,17 @@ export class BotInstance extends EventEmitter {
       profileConfig,
       options.tsOptions.nickname,
     );
+
+    // Best-effort: a corrupted/locked avatar file must not block bot startup.
+    try {
+      const relPath = this.database.getCustomAvatarPath(this.id);
+      if (relPath) {
+        const buf = this.avatarStore.read(relPath);
+        if (buf) this.profileManager.setCustomAvatar(buf);
+      }
+    } catch (err) {
+      this.logger.warn({ err }, "Failed to load custom avatar — skipping");
+    }
 
     this.setupPlayerEvents();
     this.setupTsEvents();

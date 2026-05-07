@@ -98,4 +98,26 @@ describe("database", () => {
     expect(botDb.getBotInstances()).toHaveLength(0);
     expect(botDb.deleteBotInstance("nonexistent")).toBe(false);
   });
+
+  it("persists and clears customAvatarPath on a bot instance", () => {
+    const inst = {
+      id: "bot-1",
+      name: "B",
+      serverAddress: "x",
+      serverPort: 9987,
+      nickname: "n",
+      defaultChannel: "",
+      channelPassword: "",
+      autoStart: false,
+      serverProtocol: "",
+      ts6ApiKey: "",
+      serverPassword: "",
+    };
+    botDb.saveBotInstance(inst);
+    expect(botDb.getCustomAvatarPath("bot-1")).toBeNull();
+    botDb.setCustomAvatarPath("bot-1", "avatars/bot-1.png");
+    expect(botDb.getCustomAvatarPath("bot-1")).toBe("avatars/bot-1.png");
+    botDb.setCustomAvatarPath("bot-1", null);
+    expect(botDb.getCustomAvatarPath("bot-1")).toBeNull();
+  });
 });

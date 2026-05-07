@@ -8,6 +8,7 @@ import { NeteaseProvider } from "./music/netease.js";
 import { QQMusicProvider } from "./music/qq.js";
 import { BiliBiliProvider } from "./music/bilibili.js";
 import { createCookieStore } from "./music/auth.js";
+import { createAvatarStore } from "./data/avatars.js";
 import { BotManager } from "./bot/manager.js";
 import { createWebServer } from "./web/server.js";
 
@@ -18,6 +19,7 @@ const CONFIG_PATH = path.join(ROOT_DIR, "config.json");
 const DB_PATH = path.join(DATA_DIR, "tsmusicbot.db");
 const LOG_DIR = path.join(DATA_DIR, "logs");
 const COOKIE_DIR = path.join(DATA_DIR, "cookies");
+const AVATAR_DIR = path.join(DATA_DIR, "avatars");
 const STATIC_DIR = path.join(ROOT_DIR, "web", "dist");
 
 async function main() {
@@ -46,6 +48,7 @@ async function main() {
   const bilibiliProvider = new BiliBiliProvider();
 
   const cookieStore = createCookieStore(COOKIE_DIR);
+  const avatarStore = createAvatarStore(AVATAR_DIR);
   const neteaseCookie = cookieStore.load("netease");
   if (neteaseCookie) neteaseProvider.setCookie(neteaseCookie);
   const qqCookie = cookieStore.load("qq");
@@ -59,7 +62,8 @@ async function main() {
     bilibiliProvider,
     db,
     config,
-    logger
+    logger,
+    avatarStore
   );
   await botManager.loadSavedBots();
 
@@ -70,6 +74,7 @@ async function main() {
     qqProvider,
     bilibiliProvider,
     database: db,
+    avatarStore,
     config,
     configPath: CONFIG_PATH,
     logger,

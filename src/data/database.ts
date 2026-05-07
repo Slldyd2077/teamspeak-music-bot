@@ -60,6 +60,8 @@ export interface BotDatabase {
   deleteBotInstance(id: string): boolean;
   getProfileConfig(botId: string): ProfileConfig;
   saveProfileConfig(botId: string, config: ProfileConfig): void;
+  getCustomAvatarPath(botId: string): string | null;
+  setCustomAvatarPath(botId: string, path: string | null): void;
   close(): void;
 }
 
@@ -91,6 +93,9 @@ function migrateSchema(db: Database.Database): void {
     if (!names.includes(col)) {
       db.exec(`ALTER TABLE bot_instances ADD COLUMN ${col} INTEGER NOT NULL DEFAULT 1`);
     }
+  }
+  if (!names.includes("custom_avatar_path")) {
+    db.exec("ALTER TABLE bot_instances ADD COLUMN custom_avatar_path TEXT");
   }
 }
 
@@ -179,6 +184,9 @@ export function createDatabase(dbPath: string): BotDatabase {
     WHERE id = @id
   `);
 
+  const selectCustomAvatar = db.prepare(`SELECT custom_avatar_path FROM bot_instances WHERE id = ?`);
+  const updateCustomAvatar = db.prepare(`UPDATE bot_instances SET custom_avatar_path = ? WHERE id = ?`);
+
   return {
     db,
 
@@ -240,6 +248,14 @@ export function createDatabase(dbPath: string): BotDatabase {
         channelDesc: config.channelDescEnabled ? 1 : 0,
         nowPlaying: config.nowPlayingMsgEnabled ? 1 : 0,
       });
+    },
+
+    getCustomAvatarPath(botId) {
+      const row = selectCustomAvatar.get(botId) as { custom_avatar_path: string | null } | undefined;
+      return row?.custom_avatar_path ?? null;
+    },
+    setCustomAvatarPath(botId, path) {
+      updateCustomAvatar.run(path, botId);
     },
 
     close() {

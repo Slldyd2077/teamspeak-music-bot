@@ -8,6 +8,7 @@ import type { BotDatabase } from "../data/database.js";
 import type { BotConfig } from "../data/config.js";
 import type { Logger } from "../logger.js";
 import type { CookieStore } from "../music/auth.js";
+import type { AvatarStore } from "../data/avatars.js";
 import { createBotRouter } from "./api/bot.js";
 import { createMusicRouter } from "./api/music.js";
 import { createPlayerRouter } from "./api/player.js";
@@ -25,6 +26,7 @@ export interface WebServerOptions {
   configPath: string;
   logger: Logger;
   cookieStore?: CookieStore;
+  avatarStore: AvatarStore;
   staticDir?: string;
 }
 
@@ -43,7 +45,7 @@ export function createWebServer(options: WebServerOptions): WebServer {
     app.set("trust proxy", true);
   }
 
-  app.use(express.json());
+  app.use(express.json({ limit: "400kb" }));
 
   app.get("/api/config/public-url", (_req, res) => {
     const raw = (options.config.publicUrl ?? "").trim();
@@ -52,7 +54,14 @@ export function createWebServer(options: WebServerOptions): WebServer {
 
   app.use(
     "/api/bot",
-    createBotRouter(options.botManager, options.config, options.configPath, logger)
+    createBotRouter(
+      options.botManager,
+      options.config,
+      options.configPath,
+      logger,
+      options.database,
+      options.avatarStore,
+    )
   );
   app.use(
     "/api/music",
