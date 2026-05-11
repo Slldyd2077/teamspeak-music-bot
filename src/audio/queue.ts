@@ -22,6 +22,7 @@ export class PlayQueue {
   private mode: PlayMode = PlayMode.Sequential;
   private playedIndices = new Set<number>();
   private history: number[] = [];
+  private forwardStack: number[] = [];
   private static readonly HISTORY_LIMIT = 50;
 
   private pushHistory(idx: number): void {
@@ -100,12 +101,14 @@ export class PlayQueue {
     this.currentIndex = -1;
     this.playedIndices.clear();
     this.history = [];
+    this.forwardStack = [];
   }
 
   play(): QueuedSong | null {
     if (this.songs.length === 0) return null;
     this.playedIndices.clear();
     this.history = [];
+    this.forwardStack = [];
     this.currentIndex = 0;
     this.playedIndices.add(0);
     return this.songs[0];
@@ -118,6 +121,7 @@ export class PlayQueue {
     // shuffle from this point. History tracking is independent and
     // unaffected by this clear.
     this.playedIndices.clear();
+    this.forwardStack = [];
     this.currentIndex = index;
     this.playedIndices.add(index);
     return this.songs[index];
@@ -139,32 +143,45 @@ export class PlayQueue {
         this.currentIndex = (this.currentIndex + 1) % this.songs.length;
         return this.songs[this.currentIndex];
       }
-      case PlayMode.Random: {
-        const unplayed: number[] = [];
-        for (let i = 0; i < this.songs.length; i++) {
-          if (!this.playedIndices.has(i)) unplayed.push(i);
-        }
-        if (unplayed.length === 0) return null;
-        const nextIndex =
-          unplayed[Math.floor(Math.random() * unplayed.length)];
-        this.pushHistory(this.currentIndex);
-        this.currentIndex = nextIndex;
-        this.playedIndices.add(nextIndex);
-        return this.songs[nextIndex];
-      }
+      case PlayMode.Random:
       case PlayMode.RandomLoop: {
-        if (this.songs.length === 1) {
-          this.pushHistory(this.currentIndex);
-          this.currentIndex = 0;
-          return this.songs[0];
+        // 优先回到前进栈记录的位置（prev 退回的歌）
+        if (this.forwardStack.length > 0) {
+          const target = this.forwardStack.pop()!;
+          if (target !== this.currentIndex) {
+            this.pushHistory(this.currentIndex);
+            this.currentIndex = target;
+            this.playedIndices.add(target);
+            return this.songs[target];
+          }
         }
-        let idx: number;
-        do {
-          idx = Math.floor(Math.random() * this.songs.length);
-        } while (idx === this.currentIndex);
-        this.pushHistory(this.currentIndex);
-        this.currentIndex = idx;
-        return this.songs[idx];
+        // 前进栈为空，走纯随机逻辑
+        if (this.mode === PlayMode.Random) {
+          const unplayed: number[] = [];
+          for (let i = 0; i < this.songs.length; i++) {
+            if (!this.playedIndices.has(i)) unplayed.push(i);
+          }
+          if (unplayed.length === 0) return null;
+          const nextIndex =
+            unplayed[Math.floor(Math.random() * unplayed.length)];
+          this.pushHistory(this.currentIndex);
+          this.currentIndex = nextIndex;
+          this.playedIndices.add(nextIndex);
+          return this.songs[nextIndex];
+        } else {
+          if (this.songs.length === 1) {
+            this.pushHistory(this.currentIndex);
+            this.currentIndex = 0;
+            return this.songs[0];
+          }
+          let idx: number;
+          do {
+            idx = Math.floor(Math.random() * this.songs.length);
+          } while (idx === this.currentIndex);
+          this.pushHistory(this.currentIndex);
+          this.currentIndex = idx;
+          return this.songs[idx];
+        }
       }
     }
   }
@@ -172,13 +189,18 @@ export class PlayQueue {
   prev(): QueuedSong | null {
     if (this.songs.length === 0) return null;
 
+    // 记录当前位置到前进栈，供 next 优先返回
+    if (this.currentIndex >= 0 && this.forwardStack.length < PlayQueue.HISTORY_LIMIT) {
+      this.forwardStack.push(this.currentIndex);
+    }
+
     // Preferred: pop from the back-stack so prev means "the song I
     // actually played before this one," not "the previous array slot."
     while (this.history.length > 0) {
       const idx = this.history.pop()!;
       if (idx >= 0 && idx < this.songs.length) {
         this.currentIndex = idx;
-        this.playedIndices.add(idx);
+        this.playedIndices = new Set([...this.history, this.currentIndex]);
         return this.songs[idx];
       }
       // Stale entry (song removed) — keep popping.
@@ -227,6 +249,7 @@ export class PlayQueue {
     this.mode = mode;
     this.playedIndices.clear();
     this.history = [];
+    this.forwardStack = [];
     if (this.currentIndex >= 0) {
       this.playedIndices.add(this.currentIndex);
     }
