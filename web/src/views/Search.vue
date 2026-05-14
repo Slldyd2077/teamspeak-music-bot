@@ -31,7 +31,10 @@
             class="card hover-scale"
           >
             <CoverArt :url="al.coverUrl" :size="160" :radius="10" :show-shadow="true" />
-            <div class="card-name">{{ al.name }}</div>
+            <div class="card-name">
+              {{ al.name }}
+              <span class="platform-badge" :class="badgeClass(al.platform)">{{ badgeLabel(al.platform) }}</span>
+            </div>
             <div class="card-sub">{{ al.artist }}</div>
           </router-link>
         </div>
@@ -47,7 +50,10 @@
             class="card hover-scale"
           >
             <CoverArt :url="pl.coverUrl" :size="160" :radius="10" :show-shadow="true" />
-            <div class="card-name">{{ pl.name }}</div>
+            <div class="card-name">
+              {{ pl.name }}
+              <span class="platform-badge" :class="badgeClass(pl.platform)">{{ badgeLabel(pl.platform) }}</span>
+            </div>
           </router-link>
         </div>
       </section>
@@ -109,6 +115,20 @@ async function doSearch() {
   } finally {
     loading.value = false;
   }
+}
+
+function badgeLabel(platform: string): string {
+  if (platform === 'qq') return 'QQ';
+  if (platform === 'bilibili') return 'B站';
+  if (platform === 'youtube') return 'YouTube';
+  return '网易云';
+}
+
+function badgeClass(platform: string): string {
+  if (platform === 'qq') return 'badge-qq';
+  if (platform === 'bilibili') return 'badge-bilibili';
+  if (platform === 'youtube') return 'badge-youtube';
+  return 'badge-netease';
 }
 
 onMounted(() => {
@@ -197,5 +217,35 @@ onMounted(() => {
   color: inherit;
   .card-name { font-size: 14px; line-height: 1.3; max-height: 2.6em; overflow: hidden; }
   .card-sub  { font-size: 12px; opacity: 0.6; }
+}
+
+.platform-badge {
+  vertical-align: middle;
+  flex-shrink: 0;
+  font-size: var(--fs-micro);
+  font-weight: var(--fw-semi);
+  padding: 1px 5px;
+  border-radius: var(--radius-xs);
+  line-height: 1.4;
+}
+
+.badge-netease {
+  background: var(--brand-netease-15);
+  color: var(--brand-netease);
+}
+
+.badge-qq {
+  background: var(--brand-qq-15);
+  color: var(--brand-qq);
+}
+
+.badge-bilibili {
+  background: var(--brand-bilibili-15);
+  color: var(--brand-bilibili);
+}
+
+.badge-youtube {
+  background: var(--brand-youtube-12);
+  color: var(--brand-youtube);
 }
 </style>
