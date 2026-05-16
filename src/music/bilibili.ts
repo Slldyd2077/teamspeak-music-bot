@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import axios, { type AxiosInstance } from "axios";
 import type {
   MusicProvider,
@@ -15,6 +16,16 @@ const BILIBILI_HEADERS = {
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
 };
 
+// Permutation used by B站 to derive the wbi mixin key from img_key+sub_key.
+const WBI_MIXIN_KEY_ENC_TAB = [
+  46, 47, 18, 2, 53, 8, 23, 32, 15, 50, 10, 31, 58, 3, 45, 35, 27, 43, 5, 49,
+  33, 9, 42, 19, 29, 28, 14, 39, 12, 38, 41, 13, 37, 48, 7, 16, 24, 55, 40, 61,
+  26, 17, 0, 1, 60, 51, 30, 4, 22, 25, 54, 21, 56, 59, 6, 63, 57, 62, 11, 36,
+  20, 34, 44, 52,
+];
+
+const WBI_KEY_TTL_MS = 6 * 60 * 60 * 1000; // wbi keys rotate ~daily; refresh every 6h
+
 export class BiliBiliProvider implements MusicProvider {
   readonly platform = "bilibili" as const;
   private api: AxiosInstance;
@@ -24,6 +35,8 @@ export class BiliBiliProvider implements MusicProvider {
   private cidCache = new Map<string, number>();
   private buvidCookie = ""; // anonymous session cookie (buvid3) for anti-412
   private buvidInitialized = false;
+  private wbiMixinKey = "";
+  private wbiKeyFetchedAt = 0;
 
   constructor() {
     this.api = axios.create({
@@ -62,6 +75,50 @@ export class BiliBiliProvider implements MusicProvider {
     return combined ? { Cookie: combined } : {};
   }
 
+  /**
+   * Fetch wbi img_key/sub_key from /x/web-interface/nav and derive the
+   * mixin key used to sign search params. Required since B站 moved the
+   * search endpoint behind wbi signing — unsigned /search/type now
+   * returns an anti-bot HTML page.
+   */
+  private async ensureWbiKeys(): Promise<void> {
+    if (this.wbiMixinKey && Date.now() - this.wbiKeyFetchedAt < WBI_KEY_TTL_MS) {
+      return;
+    }
+    const res = await this.api.get("/x/web-interface/nav", {
+      headers: this.cookieHeaders,
+      validateStatus: () => true, // nav returns -101 when not logged in but still includes wbi_img
+    });
+    const wbi = res.data?.data?.wbi_img;
+    const imgUrl: string = wbi?.img_url ?? "";
+    const subUrl: string = wbi?.sub_url ?? "";
+    const imgKey = imgUrl.split("/").pop()?.split(".")[0] ?? "";
+    const subKey = subUrl.split("/").pop()?.split(".")[0] ?? "";
+    if (!imgKey || !subKey) {
+      throw new Error("Bilibili wbi keys unavailable");
+    }
+    const raw = imgKey + subKey;
+    this.wbiMixinKey = WBI_MIXIN_KEY_ENC_TAB.map((i) => raw[i] ?? "")
+      .join("")
+      .slice(0, 32);
+    this.wbiKeyFetchedAt = Date.now();
+  }
+
+  /** Sign params for wbi-protected endpoints. Returns a new params object including wts and w_rid. */
+  private signWbi(params: Record<string, string | number>): Record<string, string> {
+    const withTs: Record<string, string> = {};
+    for (const [k, v] of Object.entries(params)) withTs[k] = String(v);
+    withTs.wts = String(Math.floor(Date.now() / 1000));
+    const sorted = Object.keys(withTs)
+      .sort()
+      .map((k) => `${encodeURIComponent(k)}=${encodeURIComponent(withTs[k])}`)
+      .join("&");
+    withTs.w_rid = createHash("md5")
+      .update(sorted + this.wbiMixinKey)
+      .digest("hex");
+    return withTs;
+  }
+
   setQuality(quality: string): void {
     this.quality = quality;
   }
@@ -91,12 +148,14 @@ export class BiliBiliProvider implements MusicProvider {
 
   async search(query: string, limit = 20): Promise<SearchResult> {
     await this.ensureBuvidCookie();
-    const res = await this.api.get("/x/web-interface/search/type", {
-      params: {
-        search_type: "video",
-        keyword: query,
-        page_size: limit,
-      },
+    await this.ensureWbiKeys();
+    const signed = this.signWbi({
+      search_type: "video",
+      keyword: query,
+      page_size: limit,
+    });
+    const res = await this.api.get("/x/web-interface/wbi/search/type", {
+      params: signed,
       headers: this.cookieHeaders,
     });
 
