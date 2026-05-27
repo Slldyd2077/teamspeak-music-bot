@@ -88,6 +88,13 @@
       <RouterLink to="/settings" class="settings-btn">
         <Icon icon="mdi:cog" />
       </RouterLink>
+
+      <div v-if="session.currentUser.value" class="nav-user">
+        <span class="nav-user-name">{{ session.currentUser.value.username }}</span>
+        <button class="nav-user-logout" @click="onLogout" title="退出">
+          <Icon icon="mdi:logout" />
+        </button>
+      </div>
     </div>
   </nav>
 
@@ -114,10 +121,19 @@
 
 <script setup lang="ts">
 import { computed, ref, onMounted, onUnmounted, nextTick, reactive } from 'vue';
+import { useRouter } from 'vue-router';
 import { Icon } from '@iconify/vue';
 import { usePlayerStore } from '../stores/player.js';
+import { useSession } from '../composables/useSession.js';
 
 const store = usePlayerStore();
+const session = useSession();
+const navRouter = useRouter();
+
+async function onLogout() {
+  await session.logout();
+  navRouter.replace({ name: 'login' });
+}
 const activeBot = computed(() => store.activeBot);
 const dropdownOpen = ref(false);
 const selectorRef = ref<HTMLElement | null>(null);
@@ -642,5 +658,16 @@ onUnmounted(() => {
       filter: brightness(1.08);
     }
   }
+}
+
+.nav-user {
+  display: flex; align-items: center; gap: 8px; margin-left: 12px;
+  color: var(--text-secondary); font-size: 13px;
+}
+.nav-user-logout {
+  height: 28px; width: 28px; display: grid; place-items: center;
+  border: 0; background: transparent; color: var(--text-secondary); cursor: pointer;
+  border-radius: var(--radius-sm);
+  &:hover { background: var(--bg-secondary); color: var(--text-primary); }
 }
 </style>
