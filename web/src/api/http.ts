@@ -15,7 +15,7 @@ export function apiFetch(input: RequestInfo | URL, init: RequestInit = {}): Prom
     headers: { ...(init.headers ?? {}) },
   };
   return fetch(input, merged).then(async (res) => {
-    if (res.status === 401 && isApiPath(input)) {
+    if (res.status === 401 && shouldTriggerRefresh(input)) {
       const session = useSession();
       await session.refresh();
       const current = router.currentRoute.value;
@@ -27,9 +27,9 @@ export function apiFetch(input: RequestInfo | URL, init: RequestInit = {}): Prom
   });
 }
 
-function isApiPath(input: RequestInfo | URL): boolean {
+function shouldTriggerRefresh(input: RequestInfo | URL): boolean {
   const url = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
-  return url.startsWith('/api/');
+  return url.startsWith('/api/') && !url.startsWith('/api/session/');
 }
 
 /**
