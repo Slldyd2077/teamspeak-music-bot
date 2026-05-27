@@ -458,6 +458,65 @@
         </div>
       </div>
     </section>
+
+    <!-- User Management -->
+    <section class="settings-section">
+      <h2 class="section-title">用户管理</h2>
+      <div class="user-list">
+        <div v-for="u in userList" :key="u.id" class="user-item">
+          <div class="user-info">
+            <div class="user-name">
+              {{ u.username }}
+              <span v-if="session.currentUser.value && u.id === session.currentUser.value.id" class="user-self-badge">本人</span>
+            </div>
+            <div class="user-created">创建于 {{ formatDate(u.createdAt) }}</div>
+          </div>
+          <div class="user-actions">
+            <button class="btn-sm" @click="openResetPassword(u)">
+              <Icon icon="mdi:lock-reset" /> 重置密码
+            </button>
+            <button
+              class="btn-sm btn-delete"
+              :disabled="!!(session.currentUser.value && u.id === session.currentUser.value.id)"
+              :title="session.currentUser.value && u.id === session.currentUser.value.id ? '不能删除自己' : ''"
+              @click="onDeleteUser(u)"
+            >
+              <Icon icon="mdi:delete" />
+            </button>
+          </div>
+        </div>
+        <div v-if="userList.length === 0 && !userLoadError" class="user-empty">加载中…</div>
+        <div v-if="userLoadError" class="user-error">{{ userLoadError }}</div>
+      </div>
+
+      <form class="user-add-form" @submit.prevent="onCreateUser">
+        <input v-model="newUser.username" class="input" placeholder="新用户名 (3-32 字符)" required />
+        <input v-model="newUser.password" type="password" class="input" placeholder="密码 (≥8 位)" minlength="8" required />
+        <button class="btn-sm btn-primary" type="submit" :disabled="creatingUser">
+          {{ creatingUser ? '创建中…' : '添加用户' }}
+        </button>
+      </form>
+      <p v-if="userMutationError" class="user-error">{{ userMutationError }}</p>
+
+      <!-- Reset password modal -->
+      <div v-if="resetTarget" class="edit-modal-overlay" @click.self="resetTarget = null">
+        <div class="edit-modal">
+          <h3 class="modal-title">重置 {{ resetTarget.username }} 的密码</h3>
+          <p class="modal-hint">该用户的所有会话将被强制下线。</p>
+          <div class="form-group">
+            <label>新密码 (≥8 位)</label>
+            <input v-model="resetPassword" type="password" class="input" minlength="8" />
+          </div>
+          <p v-if="resetError" class="user-error">{{ resetError }}</p>
+          <div class="form-actions">
+            <button class="btn-sm" @click="resetTarget = null">取消</button>
+            <button class="btn-sm btn-primary" :disabled="resettingPw" @click="onConfirmReset">
+              {{ resettingPw ? '保存中…' : '确认重置' }}
+            </button>
+          </div>
+        </div>
+      </div>
+    </section>
   </div>
 </template>
 
@@ -469,6 +528,7 @@ import AvatarUpload from '../components/AvatarUpload.vue';
 import CustomAvatarRow from '../components/CustomAvatarRow.vue';
 import QRCode from 'qrcode';
 import { usePlayerStore } from '../stores/player.js';
+import { useSession } from '../composables/useSession.js';
 
 const store = usePlayerStore();
 
@@ -841,11 +901,113 @@ async function updateProfile(botId: string, key: keyof ProfileConfig, value: boo
   }
 }
 
+// --- User Management ---
+const session = useSession();
+
+interface UserListEntry { id: string; username: string; createdAt: number }
+const userList = ref<UserListEntry[]>([]);
+const userLoadError = ref('');
+const userMutationError = ref('');
+const newUser = reactive({ username: '', password: '' });
+const creatingUser = ref(false);
+const resetTarget = ref<UserListEntry | null>(null);
+const resetPassword = ref('');
+const resetError = ref('');
+const resettingPw = ref(false);
+
+async function loadUsers() {
+  userLoadError.value = '';
+  try {
+    const res = await fetch('/api/users');
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const body = await res.json();
+    userList.value = body.users ?? [];
+  } catch (e) {
+    userLoadError.value = (e as Error).message;
+  }
+}
+
+async function onCreateUser() {
+  userMutationError.value = '';
+  creatingUser.value = true;
+  try {
+    const res = await fetch('/api/users', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: newUser.username, password: newUser.password }),
+    });
+    if (!res.ok) {
+      const b = await res.json().catch(() => ({}));
+      throw new Error(b.error ?? `HTTP ${res.status}`);
+    }
+    newUser.username = '';
+    newUser.password = '';
+    await loadUsers();
+  } catch (e) {
+    userMutationError.value = (e as Error).message;
+  } finally {
+    creatingUser.value = false;
+  }
+}
+
+async function onDeleteUser(u: UserListEntry) {
+  if (!confirm(`确认删除用户 ${u.username}？`)) return;
+  userMutationError.value = '';
+  try {
+    const res = await fetch(`/api/users/${u.id}`, { method: 'DELETE' });
+    if (!res.ok && res.status !== 204) {
+      const b = await res.json().catch(() => ({}));
+      throw new Error(b.error ?? `HTTP ${res.status}`);
+    }
+    await loadUsers();
+  } catch (e) {
+    userMutationError.value = (e as Error).message;
+  }
+}
+
+function openResetPassword(u: UserListEntry) {
+  resetTarget.value = u;
+  resetPassword.value = '';
+  resetError.value = '';
+}
+
+async function onConfirmReset() {
+  if (!resetTarget.value) return;
+  if (resetPassword.value.length < 8) {
+    resetError.value = '密码至少 8 位';
+    return;
+  }
+  resettingPw.value = true;
+  resetError.value = '';
+  try {
+    const res = await fetch(`/api/users/${resetTarget.value.id}/reset-password`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ newPassword: resetPassword.value }),
+    });
+    if (!res.ok && res.status !== 204) {
+      const b = await res.json().catch(() => ({}));
+      throw new Error(b.error ?? `HTTP ${res.status}`);
+    }
+    resetTarget.value = null;
+  } catch (e) {
+    resetError.value = (e as Error).message;
+  } finally {
+    resettingPw.value = false;
+  }
+}
+
+function formatDate(ms: number): string {
+  const d = new Date(ms);
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+}
+
 onMounted(() => {
   store.fetchBots(); // Refresh bot status on page visit
   checkAuthStatus();
   loadQuality();
   loadIdleTimeout();
+  loadUsers();
 });
 
 onUnmounted(() => {
@@ -1467,4 +1629,27 @@ onUnmounted(() => {
     }
   }
 }
+
+// --- User Management ---
+.user-list { display: flex; flex-direction: column; gap: 8px; }
+.user-item {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 12px; background: var(--bg-secondary); border-radius: var(--radius-sm);
+}
+.user-info { display: flex; flex-direction: column; gap: 4px; }
+.user-name { font-weight: 500; color: var(--text-primary); display: flex; align-items: center; gap: 8px; }
+.user-self-badge {
+  font-size: 11px; padding: 2px 6px; border-radius: 4px;
+  background: var(--color-primary); color: #fff;
+}
+.user-created { font-size: 12px; color: var(--text-secondary); }
+.user-actions { display: flex; gap: 8px; }
+.user-add-form {
+  display: flex; gap: 8px; margin-top: 12px; flex-wrap: wrap;
+}
+.user-add-form .input { flex: 1; min-width: 140px; }
+.user-empty, .user-error { font-size: 12px; color: var(--text-secondary); padding: 8px 0; }
+.user-error { color: #e26a6a; }
+.modal-hint { color: var(--text-secondary); font-size: 12px; margin: 0 0 8px; }
+.form-actions { display: flex; gap: 8px; justify-content: flex-end; margin-top: 8px; }
 </style>
