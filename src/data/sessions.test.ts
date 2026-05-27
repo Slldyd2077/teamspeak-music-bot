@@ -116,4 +116,13 @@ describe("SessionStore", () => {
     expect(sessions.validateAndTouch(tokens[1])).toBeNull();
     expect(sessions.validateAndTouch(tokens[tokens.length - 1])).not.toBeNull();
   });
+
+  it("createSession respects cap under concurrent calls (no 1-over-cap race)", async () => {
+    // better-sqlite3 transactions are serialised at the engine level. Calling
+    // createSession N times sequentially via Promise.all proves atomic check+insert.
+    const N = MAX_SESSIONS_PER_USER + 3;
+    await Promise.all(Array.from({ length: N }, () => Promise.resolve(sessions.createSession(userId))));
+    const count = (botDb.db.prepare("SELECT COUNT(*) AS n FROM sessions").get() as { n: number }).n;
+    expect(count).toBe(MAX_SESSIONS_PER_USER);
+  });
 });

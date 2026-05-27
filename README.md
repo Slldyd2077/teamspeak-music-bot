@@ -426,6 +426,16 @@ pip install -U yt-dlp
 }
 ```
 
+### 反向代理部署注意事项
+
+当 WebUI 部署在反向代理（nginx / Caddy / Cloudflare 等）之后时，请务必在 `config.json` 中设置 `"trustProxy": true`：
+
+- **Cookie Secure 标志**：未启用 `trustProxy` 时，Express 无法从 `X-Forwarded-Proto` 正确判断请求实际是否为 HTTPS，会话 cookie 不会被标记为 `Secure`。
+- **登录限流**：登录限流以 `req.ip` 为键，未启用 `trustProxy` 时所有请求都会被识别为代理本身的 IP，单个攻击者会拖累所有合法用户共用同一个限流桶。
+- **审计日志的客户端 IP**（如果未来添加该字段）也需要 `trustProxy` 才能正确记录。
+
+直接暴露端口（无代理）时无需启用该选项。
+
 ## 常见问题
 
 **Q：支持 TeamSpeak 6 Server 吗？**

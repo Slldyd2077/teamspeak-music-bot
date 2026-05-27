@@ -21,6 +21,35 @@
       </div>
     </section>
 
+    <!-- Account: own password change -->
+    <section class="settings-section">
+      <h2 class="section-title">账户</h2>
+      <div class="account-info-card">
+        <div class="account-row">
+          <span class="account-label">用户名</span>
+          <span class="account-value">{{ session.currentUser.value?.username ?? '—' }}</span>
+        </div>
+        <div class="account-row">
+          <span class="account-label">角色</span>
+          <span class="account-value">
+            <span class="user-role-badge" :class="`role-${session.currentUser.value?.role}`">
+              {{ session.currentUser.value?.role === 'admin' ? '管理员' : '成员' }}
+            </span>
+          </span>
+        </div>
+      </div>
+      <form class="change-pw-form" @submit.prevent="onChangeOwnPassword">
+        <input v-model="ownPw.old" type="password" autocomplete="current-password" class="input" placeholder="当前密码" required />
+        <input v-model="ownPw.new" type="password" autocomplete="new-password" minlength="8" class="input" placeholder="新密码 (≥8 位)" required />
+        <input v-model="ownPw.confirm" type="password" autocomplete="new-password" minlength="8" class="input" placeholder="再次输入新密码" required />
+        <button class="btn-sm btn-primary" type="submit" :disabled="changingOwnPw">
+          {{ changingOwnPw ? '更新中…' : '修改密码' }}
+        </button>
+      </form>
+      <p v-if="ownPwError" class="user-error">{{ ownPwError }}</p>
+      <p v-if="ownPwSuccess" class="user-success">{{ ownPwSuccess }}</p>
+    </section>
+
     <!-- Bot Management -->
     <section class="settings-section">
       <h2 class="section-title">机器人管理</h2>
@@ -939,6 +968,46 @@ async function updateProfile(botId: string, key: keyof ProfileConfig, value: boo
 // --- User Management ---
 const session = useSession();
 
+// --- Own password change (available to all authenticated users) ---
+const ownPw = reactive({ old: '', new: '', confirm: '' });
+const ownPwError = ref('');
+const ownPwSuccess = ref('');
+const changingOwnPw = ref(false);
+
+async function onChangeOwnPassword() {
+  ownPwError.value = '';
+  ownPwSuccess.value = '';
+  if (ownPw.new !== ownPw.confirm) {
+    ownPwError.value = '两次输入的新密码不一致';
+    return;
+  }
+  if (ownPw.new.length < 8) {
+    ownPwError.value = '新密码至少 8 位';
+    return;
+  }
+  changingOwnPw.value = true;
+  try {
+    const res = await fetch('/api/session/change-password', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ oldPassword: ownPw.old, newPassword: ownPw.new }),
+    });
+    if (!res.ok && res.status !== 204) {
+      const b = await res.json().catch(() => ({}));
+      throw new Error(b.error ?? `HTTP ${res.status}`);
+    }
+    ownPw.old = '';
+    ownPw.new = '';
+    ownPw.confirm = '';
+    ownPwSuccess.value = '密码已更新';
+    // The server kills other sessions but keeps the current one. No reload needed.
+  } catch (e) {
+    ownPwError.value = (e as Error).message;
+  } finally {
+    changingOwnPw.value = false;
+  }
+}
+
 interface UserListEntry { id: string; username: string; createdAt: number; role: 'admin' | 'member' }
 const userList = ref<UserListEntry[]>([]);
 const userLoadError = ref('');
@@ -1834,4 +1903,24 @@ onUnmounted(() => {
 .role-admin { background: rgba(99, 145, 226, 0.18); color: #6391e2; }
 .role-member { background: rgba(150, 150, 150, 0.18); color: var(--text-secondary); }
 .user-role-select { flex: 0 0 110px; }
+
+// --- Account section (own password change) ---
+.account-info-card {
+  display: flex; flex-direction: column; gap: 8px;
+  padding: 12px; background: var(--bg-secondary); border-radius: var(--radius-sm);
+  margin-bottom: 12px;
+}
+.account-row {
+  display: flex; justify-content: space-between; align-items: center;
+  font-size: 13px;
+}
+.account-label { color: var(--text-secondary); }
+.account-value { color: var(--text-primary); font-weight: 500; }
+.change-pw-form {
+  display: flex; flex-direction: column; gap: 8px;
+  max-width: 360px;
+}
+.change-pw-form .input { width: 100%; }
+.change-pw-form button { align-self: flex-start; }
+.user-success { color: #4caf7a; font-size: 13px; margin: 4px 0 0; }
 </style>

@@ -49,15 +49,21 @@ export function createSessionStore(db: Database.Database): SessionStore {
   return {
     createSession(userId) {
       // Cap concurrent sessions per user — oldest gets evicted on overflow.
-      const existing = (countForUserStmt.get(userId) as { n: number }).n;
-      if (existing >= MAX_SESSIONS_PER_USER) {
-        deleteOldestForUserStmt.run(userId, existing - MAX_SESSIONS_PER_USER + 1);
-      }
+      // Wrap the count → delete → insert in a transaction so concurrent logins
+      // for the same user can't both pass the cap check and both insert,
+      // ending up 1 over cap (race window between count and insert).
       const token = randomBytes(32).toString("base64url");
       const id = hashToken(token);
       const now = Date.now();
       const expiresAt = now + SESSION_TTL_MS;
-      insertStmt.run(id, userId, now, expiresAt, now);
+      const tx = db.transaction(() => {
+        const existing = (countForUserStmt.get(userId) as { n: number }).n;
+        if (existing >= MAX_SESSIONS_PER_USER) {
+          deleteOldestForUserStmt.run(userId, existing - MAX_SESSIONS_PER_USER + 1);
+        }
+        insertStmt.run(id, userId, now, expiresAt, now);
+      });
+      tx();
       return { token, expiresAt };
     },
 
