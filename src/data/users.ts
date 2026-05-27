@@ -19,6 +19,8 @@ export interface UserStore {
   findById(id: string): UserRow | null;
   verifyPassword(plain: string, hash: string): Promise<boolean>;
   changePassword(userId: string, newPassword: string): Promise<void>;
+  listUsers(): Array<{ id: string; username: string; createdAt: number }>;
+  deleteUser(id: string): boolean;
 }
 
 export class UsernameTakenError extends Error {
@@ -42,6 +44,10 @@ export function createUserStore(db: Database.Database): UserStore {
   const updatePasswordStmt = db.prepare(
     "UPDATE users SET passwordHash = ?, updatedAt = ? WHERE id = ?"
   );
+  const listUsersStmt = db.prepare(
+    "SELECT id, username, createdAt FROM users ORDER BY createdAt ASC"
+  );
+  const deleteUserStmt = db.prepare("DELETE FROM users WHERE id = ?");
 
   return {
     countUsers() {
@@ -78,6 +84,15 @@ export function createUserStore(db: Database.Database): UserStore {
     async changePassword(userId, newPassword) {
       const hash = await bcrypt.hash(newPassword, BCRYPT_ROUNDS);
       updatePasswordStmt.run(hash, Date.now(), userId);
+    },
+
+    listUsers() {
+      return listUsersStmt.all() as Array<{ id: string; username: string; createdAt: number }>;
+    },
+
+    deleteUser(id) {
+      const result = deleteUserStmt.run(id);
+      return result.changes > 0;
     },
   };
 }

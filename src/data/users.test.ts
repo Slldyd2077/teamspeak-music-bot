@@ -53,4 +53,23 @@ describe("UserStore", () => {
     expect(await users.verifyPassword("old", row!.passwordHash)).toBe(false);
     expect(await users.verifyPassword("new", row!.passwordHash)).toBe(true);
   });
+
+  it("listUsers returns id+username+createdAt ascending, no password hash", async () => {
+    await users.createUser("alice", "pw-alice");
+    await users.createUser("bob", "pw-bob");
+    const list = users.listUsers();
+    expect(list).toHaveLength(2);
+    expect(list[0].username).toBe("alice");
+    expect(list[1].username).toBe("bob");
+    expect(list[0]).not.toHaveProperty("passwordHash");
+    expect(list[0].id).toMatch(/^[0-9a-f-]{36}$/);
+    expect(typeof list[0].createdAt).toBe("number");
+  });
+
+  it("deleteUser removes the row and returns true; returns false for unknown id", async () => {
+    const u = await users.createUser("alice", "pw-alice");
+    expect(users.deleteUser(u.id)).toBe(true);
+    expect(users.countUsers()).toBe(0);
+    expect(users.deleteUser("not-a-real-id")).toBe(false);
+  });
 });

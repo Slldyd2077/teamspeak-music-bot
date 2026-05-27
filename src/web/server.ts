@@ -15,6 +15,7 @@ import { createMusicRouter } from "./api/music.js";
 import { createPlayerRouter } from "./api/player.js";
 import { createAuthRouter } from "./api/auth.js";
 import { createSessionRouter } from "./api/session.js";
+import { createUsersRouter } from "./api/users.js";
 import { setupWebSocket } from "./websocket.js";
 import { createUserStore } from "../data/users.js";
 import { createSessionStore } from "../data/sessions.js";
@@ -100,6 +101,7 @@ export function createWebServer(options: WebServerOptions): WebServer {
     "/api/auth",
     createAuthRouter(options.neteaseProvider, options.qqProvider, options.bilibiliProvider, logger, options.cookieStore)
   );
+  app.use("/api/users", createUsersRouter(users, sessions, logger));
 
   // ─── Static SPA (public) ────────────────────────────────────────────────
   if (options.staticDir) {
