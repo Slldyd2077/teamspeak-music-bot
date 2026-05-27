@@ -23,6 +23,30 @@ describe("database", () => {
     expect(names).toContain("bot_instances");
   });
 
+  it("creates users and sessions tables on init", () => {
+    const tables = botDb.db
+      .prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
+      .all() as Array<{ name: string }>;
+    const names = tables.map((t) => t.name);
+    expect(names).toContain("users");
+    expect(names).toContain("sessions");
+
+    const userCols = botDb.db.prepare("PRAGMA table_info(users)").all() as Array<{ name: string }>;
+    const userColNames = userCols.map((c) => c.name).sort();
+    expect(userColNames).toEqual(["createdAt", "id", "passwordHash", "role", "updatedAt", "username"]);
+
+    const sessionCols = botDb.db.prepare("PRAGMA table_info(sessions)").all() as Array<{ name: string }>;
+    const sessionColNames = sessionCols.map((c) => c.name).sort();
+    expect(sessionColNames).toEqual(["createdAt", "expiresAt", "id", "lastSeenAt", "userId"]);
+  });
+
+  it("creates user_audit table on init", () => {
+    const tables = botDb.db
+      .prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
+      .all() as Array<{ name: string }>;
+    expect(tables.map((t) => t.name)).toContain("user_audit");
+  });
+
   it("records and retrieves play history", () => {
     botDb.addPlayHistory({
       botId: "bot1",

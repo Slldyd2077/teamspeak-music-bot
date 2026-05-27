@@ -23,6 +23,7 @@
 
 ## 功能特性
 
+- **WebUI 鉴权（必选）** — 用户名 + 密码登录，多用户、两种角色（管理员 / 成员），bcrypt 加密、HttpOnly 会话 Cookie，CSRF 防护，WebSocket 同样鉴权。首次访问引导创建管理员。从无鉴权旧版本升级时请参阅 [更新升级](#更新升级) 章节
 - **多平台音源** — 网易云音乐 + QQ 音乐 + 哔哩哔哩（默认内置），YouTube 可选启用（通过 yt-dlp），统一搜索，结果标注来源
 - **真实客户端协议 (TS3/TS6 双协议)** — 机器人在 TeamSpeak 中可见（非 ServerQuery 隐身模式），自动检测并适配 TS3 和 TS6 服务器，支持 TS6 HTTP Query API
 - **YesPlayMusic 风格 WebUI** — 精美界面，支持深色/浅色主题切换
@@ -155,6 +156,49 @@ sudo ./scripts/install.sh
 >
 > **如何判断是否需要迁移**：如果你是全新安装，或者你的机器人数据库中 `identity` 字段已经是空的，则**无需任何操作**。完成上述步骤后，按下面对应的系统升级步骤执行即可。
 
+### 从 WebUI 无鉴权版本升级（重要）
+
+本次更新引入了**强制 WebUI 鉴权**。从无鉴权旧版本升级后，**WebUI 必须先创建管理员账号才能使用**。所有 `/api/*` 端点（除少量公共白名单）和 `/ws` 现在都需要登录。
+
+**升级行为**：
+
+- 启动时数据库自动迁移：新增 `users`、`sessions`、`user_audit` 三张表；旧的 `bot_instances`、`play_history` 数据**完全保留**。
+- 第一次打开 WebUI 自动跳转到 `/first-run` 引导创建首位管理员（角色固定为 `admin`）。
+- 之后访问任何页面都会校验登录态，未登录跳转 `/login`。
+
+**会话与 Cookie**：
+
+- 登录态保存 7 天，每次请求滚动续期（活跃用户不会被踢出）。
+- 同一账号最多保持 10 个并发会话（超过自动剔除最旧的）。
+- Cookie 设置为 `HttpOnly; SameSite=Lax`，HTTPS 部署需配合 `trustProxy: true`（详见 [反向代理部署注意事项](#反向代理部署注意事项)）。
+
+**多用户与角色**：
+
+- 角色 `admin`：完整权限（用户管理、审计、机器人、音乐平台、播放控制）。
+- 角色 `member`：除"用户管理"和"操作审计"外的所有功能（适合给团队成员开通播放权）。
+- 在 **设置 → 用户管理**（仅管理员）中添加 / 删除 / 重置密码 / 切换角色。
+- 至少保留一个管理员：系统会阻止删除或降级最后一位管理员。
+
+**如何重置忘记的管理员密码**：
+
+如果你忘记了管理员密码，可以直接编辑 SQLite 数据库 `data/tsmusicbot.db`：
+
+```bash
+# 方案 1：清空所有用户，重新进入 first-run 流程
+sqlite3 data/tsmusicbot.db "DELETE FROM users; DELETE FROM sessions;"
+# 然后重启机器人，浏览器再次访问会自动进入 /first-run
+
+# 方案 2：把指定用户重置为已知密码（密码 'changeme-now' 的 bcrypt 哈希示例如下）
+# 先用 node 生成哈希：
+node -e "console.log(require('bcryptjs').hashSync('changeme-now', 12))"
+# 把输出贴到 SQL 里：
+sqlite3 data/tsmusicbot.db "UPDATE users SET passwordHash='<paste-hash-here>' WHERE username='你的用户名';"
+```
+
+**反向代理用户特别注意**：如果通过 nginx / Caddy / Cloudflare 暴露 WebUI，**必须**在 `config.json` 中设置 `"trustProxy": true`，否则 Cookie 不会带 `Secure` 标志，且登录限流会把所有用户合并到同一个桶。详见下方 [反向代理部署注意事项](#反向代理部署注意事项)。
+
+**旧版 `config.adminPassword` / `adminGroups`**：这两个配置项在旧版本中预留但从未实际启用（TS-side admin 命令权限的占位字段）。保留以避免破坏旧 `config.json`，但不再影响任何行为。可以放心忽略。
+
 ### Windows 用户
 
 ```
@@ -221,10 +265,16 @@ sudo systemctl start tsmusicbot
 
 ### 首次配置
 
-1. 打开 **http://localhost:3000/setup** 进入设置向导
-2. 填写 TeamSpeak 服务器地址（默认端口：9987）
-3. 设置机器人昵称
-4. （可选）扫码登录网易云/QQ音乐账号以播放 VIP 歌曲
+1. 启动机器人后打开 **http://localhost:3000/**
+   - 全新部署：自动跳转 `/first-run`，填写用户名（3-32 字符）和密码（≥8 位）创建首位**管理员**账号
+   - 之后所有 WebUI 操作都需要登录，登录态保持 7 天（活动会滚动续期）
+2. 在 **设置 → 机器人管理** 中点击"创建新实例"，填写：
+   - TeamSpeak 服务器地址（无端口，仅主机名，例如 `ts.example.com`）
+   - 端口（默认 9987，自托管或非标准端口请填写实际值）
+   - 机器人昵称
+   - 可选：服务器密码、默认频道
+3. 在 **设置 → 音乐账号** 扫码登录网易云 / QQ 音乐 / B 站账号（可选，登录后可播放 VIP 歌曲）
+4. 在 **设置 → 用户管理**（仅管理员可见）按需添加成员，成员账号可以控制播放但无法管理其他用户
 
 ### WebUI 页面说明
 
@@ -235,7 +285,7 @@ sudo systemctl start tsmusicbot
 | **歌单** | 查看歌单详情，播放全部（根据当前播放模式选择首歌） |
 | **歌词** | 全屏歌词页，实时同步滚动，模糊专辑封面背景 |
 | **历史** | 播放历史记录 |
-| **设置** | 主题切换、机器人管理、三平台账号登录、音质选择、命令前缀 |
+| **设置** | 账户（修改自己密码） / 主题切换 / 机器人管理 / 三平台账号登录 / 音质选择 / 命令前缀 / 用户管理（仅管理员）/ 操作审计（仅管理员） |
 
 ### TeamSpeak 文字命令
 
@@ -426,6 +476,18 @@ pip install -U yt-dlp
 }
 ```
 
+> **关于 `adminPassword` 和 `adminGroups`**：这两个字段保留是为了兼容旧 `config.json`，但当前版本未使用。WebUI 鉴权改为基于数据库的用户账号系统（见 [首次配置](#首次配置)），无需在 `config.json` 中设置密码。
+
+### 反向代理部署注意事项
+
+当 WebUI 部署在反向代理（nginx / Caddy / Cloudflare 等）之后时，请务必在 `config.json` 中设置 `"trustProxy": true`：
+
+- **Cookie Secure 标志**：未启用 `trustProxy` 时，Express 无法从 `X-Forwarded-Proto` 正确判断请求实际是否为 HTTPS，会话 cookie 不会被标记为 `Secure`。
+- **登录限流**：登录限流以 `req.ip` 为键，未启用 `trustProxy` 时所有请求都会被识别为代理本身的 IP，单个攻击者会拖累所有合法用户共用同一个限流桶。
+- **审计日志的客户端 IP**（如果未来添加该字段）也需要 `trustProxy` 才能正确记录。
+
+直接暴露端口（无代理）时无需启用该选项。
+
 ## 常见问题
 
 **Q：支持 TeamSpeak 6 Server 吗？**
@@ -465,6 +527,21 @@ A：YouTube 是可选音源，需要手动安装 `yt-dlp`。详见 [可选：You
 **Q：如何更新到新版本？**
 A：`git pull` 拉取最新代码，然后 `npm install && npm run build && npm start` 重新构建启动。Docker 用户执行 `docker-compose up -d --build`。
 
+**Q：忘记管理员密码怎么办？**
+A：直接操作 SQLite 数据库。最简单的办法是清空 `users` 表然后重新进入 first-run 流程：`sqlite3 data/tsmusicbot.db "DELETE FROM users; DELETE FROM sessions;"`，重启后浏览器会自动跳转 `/first-run` 让你重新创建管理员。详细方法见 [从 WebUI 无鉴权版本升级](#从-webui-无鉴权版本升级重要)。
+
+**Q：成员（member）能做什么？不能做什么？**
+A：成员可以：管理机器人（启动/停止/创建/编辑）、控制播放（搜索/播放/队列）、登录音乐平台账号、修改自己的密码。成员**不能**：管理其他用户、查看操作审计日志、降级或删除管理员。
+
+**Q：如何把某个用户从成员升级为管理员？**
+A：管理员登录后进入 **设置 → 用户管理**，点击对应用户的"提升管理员"按钮即可。降级同理（"降为成员"按钮）。系统会阻止降级最后一位管理员。
+
+**Q：登录之后多久会自动退出？**
+A：登录态有效期 7 天，活跃使用会滚动续期（每次受保护请求都会刷新过期时间）。同一账号最多保持 10 个并发会话（多设备登录时超过的会自动剔除最旧的会话）。
+
+**Q：部署到公网后如何防止暴力登录？**
+A：本项目内置 `/login` 限流（每 IP 每分钟 5 次），但生产部署建议同时在反向代理（nginx `limit_req` / Caddy 等）层加一层限流，并启用 HTTPS。反向代理部署务必设置 `"trustProxy": true`（详见 [反向代理部署注意事项](#反向代理部署注意事项)）。
+
 ## 参与贡献
 
 1. Fork 本仓库
@@ -478,6 +555,20 @@ A：`git pull` 拉取最新代码，然后 `npm install && npm run build && npm 
 > 完整历史请查看 [git log](https://github.com/ZHANGTIANYAO1/teamspeak-music-bot/commits/main) 或 [Releases](https://github.com/ZHANGTIANYAO1/teamspeak-music-bot/releases)。这里只列出重要变更和面向用户的破坏性改动。
 
 ### 最新版本
+
+**WebUI 鉴权与权限系统**
+
+- **首次运行强制创建管理员账号**：浏览器打开 WebUI 自动跳转 `/first-run`；之后所有 `/api/*`（除少量公共白名单：`/api/health`、`/api/config/public-url`、`/api/session/*`）和 `/ws` 都需要登录。详见 [更新升级 → 从 WebUI 无鉴权版本升级](#从-webui-无鉴权版本升级重要)。
+- **两种角色：admin / member**。`member` 可以管理机器人、控制播放、登录音乐平台账号、修改自己密码，但不能管理其他用户或查看审计日志。`admin` 拥有全部权限。
+- **用户管理 UI**：管理员在 设置 → 用户管理 可以增删用户、切换角色、重置密码。系统强制保留至少一位管理员。
+- **操作审计日志**：管理员在 设置 → 操作审计 可以查看用户管理相关事件（创建、删除、密码重置、角色变更、首位管理员创建、自助修改密码）。
+- **自助修改密码**：所有用户都可在 设置 → 账户 修改自己密码。
+- **会话存储**：服务端 SQLite 表 `sessions`，存储 sha256(token)；浏览器只持有原始 token cookie。7 天 TTL，每小时滚动续期。同账号最多 10 个并发会话（超出剔除最旧）。
+- **登录限流**：每 IP 每分钟 5 次 `/login` + 3 次 `/setup`，命中返回 429 + `Retry-After`。
+- **CSRF & 安全头**：所有 mutating 请求强制 `Origin`/`Referer` 同源；响应携带 `X-Frame-Options: DENY` 和 `Content-Security-Policy: frame-ancestors 'none'`（防点击劫持）。
+- **配置变更**：反向代理部署务必 `"trustProxy": true`（详见 [反向代理部署注意事项](#反向代理部署注意事项)）。`config.adminPassword` / `adminGroups` 字段保留以兼容旧 `config.json`，但不再影响任何行为。
+
+### v0.x — Bot Profile 自动更新与协议层升级
 
 **机器人形象自动更新（Bot Profile）**
 

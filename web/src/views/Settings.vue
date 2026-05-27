@@ -21,6 +21,35 @@
       </div>
     </section>
 
+    <!-- Account: own password change -->
+    <section class="settings-section">
+      <h2 class="section-title">账户</h2>
+      <div class="account-info-card">
+        <div class="account-row">
+          <span class="account-label">用户名</span>
+          <span class="account-value">{{ session.currentUser.value?.username ?? '—' }}</span>
+        </div>
+        <div class="account-row">
+          <span class="account-label">角色</span>
+          <span class="account-value">
+            <span class="user-role-badge" :class="`role-${session.currentUser.value?.role}`">
+              {{ session.currentUser.value?.role === 'admin' ? '管理员' : '成员' }}
+            </span>
+          </span>
+        </div>
+      </div>
+      <form class="change-pw-form" @submit.prevent="onChangeOwnPassword">
+        <input v-model="ownPw.old" type="password" autocomplete="current-password" class="input" placeholder="当前密码" required />
+        <input v-model="ownPw.new" type="password" autocomplete="new-password" minlength="8" class="input" placeholder="新密码 (≥8 位)" required />
+        <input v-model="ownPw.confirm" type="password" autocomplete="new-password" minlength="8" class="input" placeholder="再次输入新密码" required />
+        <button class="btn-sm btn-primary" type="submit" :disabled="changingOwnPw">
+          {{ changingOwnPw ? '更新中…' : '修改密码' }}
+        </button>
+      </form>
+      <p v-if="ownPwError" class="user-error">{{ ownPwError }}</p>
+      <p v-if="ownPwSuccess" class="user-success">{{ ownPwSuccess }}</p>
+    </section>
+
     <!-- Bot Management -->
     <section class="settings-section">
       <h2 class="section-title">机器人管理</h2>
@@ -458,6 +487,100 @@
         </div>
       </div>
     </section>
+
+    <!-- User Management -->
+    <section v-if="session.isAdmin.value" class="settings-section">
+      <h2 class="section-title">用户管理</h2>
+      <div class="user-list">
+        <div v-for="u in userList" :key="u.id" class="user-item">
+          <div class="user-info">
+            <div class="user-name">
+              {{ u.username }}
+              <span class="user-role-badge" :class="`role-${u.role}`">
+                {{ u.role === 'admin' ? '管理员' : '成员' }}
+              </span>
+              <span v-if="session.currentUser.value && u.id === session.currentUser.value.id" class="user-self-badge">本人</span>
+            </div>
+            <div class="user-created">创建于 {{ formatDate(u.createdAt) }}</div>
+          </div>
+          <div class="user-actions">
+            <button class="btn-sm" @click="openResetPassword(u)">
+              <Icon icon="mdi:lock-reset" /> 重置密码
+            </button>
+            <button
+              class="btn-sm"
+              :disabled="changingRoleId === u.id || isLastAdmin(u)"
+              :title="isLastAdmin(u) ? '不能降级唯一的管理员' : (u.role === 'admin' ? '降级为成员' : '提升为管理员')"
+              @click="onToggleRole(u)"
+            >
+              <Icon icon="mdi:account-cog" />
+              {{ u.role === 'admin' ? '降为成员' : '提升管理员' }}
+            </button>
+            <button
+              class="btn-sm btn-delete"
+              :disabled="!!(session.currentUser.value && u.id === session.currentUser.value.id) || isLastAdmin(u)"
+              :title="session.currentUser.value && u.id === session.currentUser.value.id ? '不能删除自己' : (isLastAdmin(u) ? '不能删除唯一的管理员' : '')"
+              @click="onDeleteUser(u)"
+            >
+              <Icon icon="mdi:delete" />
+            </button>
+          </div>
+        </div>
+        <div v-if="userList.length === 0 && !userLoadError" class="user-empty">加载中…</div>
+        <div v-if="userLoadError" class="user-error">{{ userLoadError }}</div>
+      </div>
+
+      <form class="user-add-form" @submit.prevent="onCreateUser">
+        <input v-model="newUser.username" class="input" placeholder="新用户名 (3-32 字符)" required />
+        <input v-model="newUser.password" type="password" class="input" placeholder="密码 (≥8 位)" minlength="8" required />
+        <select v-model="newUser.role" class="input user-role-select">
+          <option value="member">成员</option>
+          <option value="admin">管理员</option>
+        </select>
+        <button class="btn-sm btn-primary" type="submit" :disabled="creatingUser">
+          {{ creatingUser ? '创建中…' : '添加用户' }}
+        </button>
+      </form>
+      <p v-if="userMutationError" class="user-error">{{ userMutationError }}</p>
+
+      <!-- Reset password modal -->
+      <div v-if="resetTarget" class="edit-modal-overlay" @click.self="resetTarget = null">
+        <div class="edit-modal">
+          <h3 class="modal-title">重置 {{ resetTarget.username }} 的密码</h3>
+          <p class="modal-hint">该用户的所有会话将被强制下线。</p>
+          <div class="form-group">
+            <label>新密码 (≥8 位)</label>
+            <input v-model="resetPassword" type="password" class="input" minlength="8" />
+          </div>
+          <p v-if="resetError" class="user-error">{{ resetError }}</p>
+          <div class="form-actions">
+            <button class="btn-sm" @click="resetTarget = null">取消</button>
+            <button class="btn-sm btn-primary" :disabled="resettingPw" @click="onConfirmReset">
+              {{ resettingPw ? '保存中…' : '确认重置' }}
+            </button>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- Audit Log -->
+    <section v-if="session.isAdmin.value" class="settings-section">
+      <h2 class="section-title">
+        操作审计
+        <button class="audit-refresh-btn" @click="loadAudit" :disabled="auditLoading" title="刷新">
+          <Icon icon="mdi:refresh" :class="{ spinning: auditLoading }" />
+        </button>
+      </h2>
+      <div v-if="auditLoadError" class="user-error">{{ auditLoadError }}</div>
+      <div v-else-if="auditEntries.length === 0 && !auditLoading" class="user-empty">暂无操作记录</div>
+      <div v-else class="audit-list">
+        <div v-for="e in auditEntries" :key="e.id" class="audit-row">
+          <div class="audit-time">{{ formatDateTime(e.timestamp) }}</div>
+          <div class="audit-actor">{{ e.actorUsername ?? '—' }}</div>
+          <div class="audit-action" :class="auditActionClass(e.action)">{{ describeAction(e) }}</div>
+        </div>
+      </div>
+    </section>
   </div>
 </template>
 
@@ -469,6 +592,7 @@ import AvatarUpload from '../components/AvatarUpload.vue';
 import CustomAvatarRow from '../components/CustomAvatarRow.vue';
 import QRCode from 'qrcode';
 import { usePlayerStore } from '../stores/player.js';
+import { useSession } from '../composables/useSession.js';
 
 const store = usePlayerStore();
 
@@ -841,11 +965,242 @@ async function updateProfile(botId: string, key: keyof ProfileConfig, value: boo
   }
 }
 
+// --- User Management ---
+const session = useSession();
+
+// --- Own password change (available to all authenticated users) ---
+const ownPw = reactive({ old: '', new: '', confirm: '' });
+const ownPwError = ref('');
+const ownPwSuccess = ref('');
+const changingOwnPw = ref(false);
+
+async function onChangeOwnPassword() {
+  ownPwError.value = '';
+  ownPwSuccess.value = '';
+  if (ownPw.new !== ownPw.confirm) {
+    ownPwError.value = '两次输入的新密码不一致';
+    return;
+  }
+  if (ownPw.new.length < 8) {
+    ownPwError.value = '新密码至少 8 位';
+    return;
+  }
+  changingOwnPw.value = true;
+  try {
+    const res = await fetch('/api/session/change-password', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ oldPassword: ownPw.old, newPassword: ownPw.new }),
+    });
+    if (!res.ok && res.status !== 204) {
+      const b = await res.json().catch(() => ({}));
+      throw new Error(b.error ?? `HTTP ${res.status}`);
+    }
+    ownPw.old = '';
+    ownPw.new = '';
+    ownPw.confirm = '';
+    ownPwSuccess.value = '密码已更新';
+    // The server kills other sessions but keeps the current one. No reload needed.
+  } catch (e) {
+    ownPwError.value = (e as Error).message;
+  } finally {
+    changingOwnPw.value = false;
+  }
+}
+
+interface UserListEntry { id: string; username: string; createdAt: number; role: 'admin' | 'member' }
+const userList = ref<UserListEntry[]>([]);
+const userLoadError = ref('');
+const userMutationError = ref('');
+const newUser = reactive({ username: '', password: '', role: 'member' as 'admin' | 'member' });
+const creatingUser = ref(false);
+const resetTarget = ref<UserListEntry | null>(null);
+const resetPassword = ref('');
+const resetError = ref('');
+const resettingPw = ref(false);
+const changingRoleId = ref<string | null>(null);
+
+function isLastAdmin(u: UserListEntry): boolean {
+  if (u.role !== 'admin') return false;
+  const adminCount = userList.value.filter((x) => x.role === 'admin').length;
+  return adminCount <= 1;
+}
+
+async function onToggleRole(u: UserListEntry) {
+  const newRole = u.role === 'admin' ? 'member' : 'admin';
+  if (!confirm(`确认将 ${u.username} 切换为${newRole === 'admin' ? '管理员' : '成员'}？`)) return;
+  userMutationError.value = '';
+  changingRoleId.value = u.id;
+  try {
+    const res = await fetch(`/api/users/${u.id}/role`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ role: newRole }),
+    });
+    if (!res.ok && res.status !== 204) {
+      const b = await res.json().catch(() => ({}));
+      throw new Error(b.error ?? `HTTP ${res.status}`);
+    }
+    await loadUsers();
+  } catch (e) {
+    userMutationError.value = (e as Error).message;
+  } finally {
+    changingRoleId.value = null;
+  }
+}
+
+async function loadUsers() {
+  userLoadError.value = '';
+  try {
+    const res = await fetch('/api/users');
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const body = await res.json();
+    userList.value = body.users ?? [];
+  } catch (e) {
+    userLoadError.value = (e as Error).message;
+  }
+}
+
+async function onCreateUser() {
+  userMutationError.value = '';
+  creatingUser.value = true;
+  try {
+    const res = await fetch('/api/users', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: newUser.username, password: newUser.password, role: newUser.role }),
+    });
+    if (!res.ok) {
+      const b = await res.json().catch(() => ({}));
+      throw new Error(b.error ?? `HTTP ${res.status}`);
+    }
+    newUser.username = '';
+    newUser.password = '';
+    newUser.role = 'member';
+    await loadUsers();
+  } catch (e) {
+    userMutationError.value = (e as Error).message;
+  } finally {
+    creatingUser.value = false;
+  }
+}
+
+async function onDeleteUser(u: UserListEntry) {
+  if (!confirm(`确认删除用户 ${u.username}？`)) return;
+  userMutationError.value = '';
+  try {
+    const res = await fetch(`/api/users/${u.id}`, { method: 'DELETE' });
+    if (!res.ok && res.status !== 204) {
+      const b = await res.json().catch(() => ({}));
+      throw new Error(b.error ?? `HTTP ${res.status}`);
+    }
+    await loadUsers();
+  } catch (e) {
+    userMutationError.value = (e as Error).message;
+  }
+}
+
+function openResetPassword(u: UserListEntry) {
+  resetTarget.value = u;
+  resetPassword.value = '';
+  resetError.value = '';
+}
+
+async function onConfirmReset() {
+  if (!resetTarget.value) return;
+  if (resetPassword.value.length < 8) {
+    resetError.value = '密码至少 8 位';
+    return;
+  }
+  resettingPw.value = true;
+  resetError.value = '';
+  try {
+    const res = await fetch(`/api/users/${resetTarget.value.id}/reset-password`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ newPassword: resetPassword.value }),
+    });
+    if (!res.ok && res.status !== 204) {
+      const b = await res.json().catch(() => ({}));
+      throw new Error(b.error ?? `HTTP ${res.status}`);
+    }
+    resetTarget.value = null;
+  } catch (e) {
+    resetError.value = (e as Error).message;
+  } finally {
+    resettingPw.value = false;
+  }
+}
+
+function formatDate(ms: number): string {
+  const d = new Date(ms);
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+}
+
+// --- Audit Log ---
+interface AuditEntry {
+  id: number;
+  timestamp: number;
+  actorId: string | null;
+  actorUsername: string | null;
+  targetUserId: string | null;
+  targetUsername: string | null;
+  action: string;
+}
+
+const auditEntries = ref<AuditEntry[]>([]);
+const auditLoadError = ref('');
+const auditLoading = ref(false);
+
+async function loadAudit() {
+  auditLoadError.value = '';
+  auditLoading.value = true;
+  try {
+    const res = await fetch('/api/audit?limit=100');
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const body = await res.json();
+    auditEntries.value = body.entries ?? [];
+  } catch (e) {
+    auditLoadError.value = (e as Error).message;
+  } finally {
+    auditLoading.value = false;
+  }
+}
+
+function formatDateTime(ms: number): string {
+  const d = new Date(ms);
+  const pad = (n: number) => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+}
+
+function describeAction(e: AuditEntry): string {
+  const target = e.targetUsername ?? e.targetUserId ?? '—';
+  switch (e.action) {
+    case 'admin.first_created':     return `创建首位管理员 ${target}`;
+    case 'user.created':            return `创建用户 ${target}`;
+    case 'user.deleted':            return `删除用户 ${target}`;
+    case 'user.password_reset':     return `重置 ${target} 的密码`;
+    case 'user.password_changed':   return `修改自己的密码`;
+    case 'user.role_changed':       return `变更 ${target} 的角色`;
+    default:                        return `${e.action} → ${target}`;
+  }
+}
+
+function auditActionClass(action: string): string {
+  if (action === 'user.deleted') return 'audit-action-danger';
+  if (action === 'user.password_reset' || action === 'user.password_changed') return 'audit-action-warn';
+  return 'audit-action-ok';
+}
+
 onMounted(() => {
   store.fetchBots(); // Refresh bot status on page visit
   checkAuthStatus();
   loadQuality();
   loadIdleTimeout();
+  if (session.isAdmin.value) {
+    loadUsers();
+    loadAudit();
+  }
 });
 
 onUnmounted(() => {
@@ -1467,4 +1822,105 @@ onUnmounted(() => {
     }
   }
 }
+
+// --- User Management ---
+.user-list { display: flex; flex-direction: column; gap: 8px; }
+.user-item {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 12px; background: var(--bg-secondary); border-radius: var(--radius-sm);
+}
+.user-info { display: flex; flex-direction: column; gap: 4px; }
+.user-name { font-weight: 500; color: var(--text-primary); display: flex; align-items: center; gap: 8px; }
+.user-self-badge {
+  font-size: 11px; padding: 2px 6px; border-radius: 4px;
+  background: var(--color-primary); color: #fff;
+}
+.user-created { font-size: 12px; color: var(--text-secondary); }
+.user-actions { display: flex; gap: 8px; }
+.user-add-form {
+  display: flex; gap: 8px; margin-top: 12px; flex-wrap: wrap;
+}
+.user-add-form .input { flex: 1; min-width: 140px; }
+.user-empty, .user-error { font-size: 12px; color: var(--text-secondary); padding: 8px 0; }
+.user-error { color: #e26a6a; }
+.modal-hint { color: var(--text-secondary); font-size: 12px; margin: 0 0 8px; }
+.form-actions { display: flex; gap: 8px; justify-content: flex-end; margin-top: 8px; }
+
+.audit-refresh-btn {
+  margin-left: 10px;
+  border: 0; background: transparent;
+  color: var(--text-secondary); cursor: pointer;
+  display: inline-flex; align-items: center;
+  font-size: 16px;
+  &:hover { color: var(--text-primary); }
+  &:disabled { opacity: 0.5; cursor: progress; }
+}
+.spinning { animation: spin 1s linear infinite; }
+@keyframes spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
+
+.audit-list {
+  display: flex; flex-direction: column;
+  border-radius: var(--radius-sm);
+  background: var(--bg-secondary);
+  max-height: 480px;
+  overflow-y: auto;
+}
+.audit-row {
+  display: grid;
+  grid-template-columns: 170px 120px 1fr;
+  gap: 12px;
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--border-color);
+  font-size: 13px;
+  &:last-child { border-bottom: 0; }
+}
+.audit-time {
+  color: var(--text-secondary);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, monospace;
+  font-size: 12px;
+  white-space: nowrap;
+}
+.audit-actor {
+  color: var(--text-primary);
+  font-weight: 500;
+}
+.audit-action { color: var(--text-primary); }
+.audit-action-ok      { color: var(--text-primary); }
+.audit-action-warn    { color: #d3a44b; }
+.audit-action-danger  { color: #e26a6a; }
+
+@media (max-width: 640px) {
+  .audit-row {
+    grid-template-columns: 1fr;
+    gap: 4px;
+  }
+}
+
+.user-role-badge {
+  font-size: 11px; padding: 2px 6px; border-radius: 4px; margin-left: 6px;
+  font-weight: 500;
+}
+.role-admin { background: rgba(99, 145, 226, 0.18); color: #6391e2; }
+.role-member { background: rgba(150, 150, 150, 0.18); color: var(--text-secondary); }
+.user-role-select { flex: 0 0 110px; }
+
+// --- Account section (own password change) ---
+.account-info-card {
+  display: flex; flex-direction: column; gap: 8px;
+  padding: 12px; background: var(--bg-secondary); border-radius: var(--radius-sm);
+  margin-bottom: 12px;
+}
+.account-row {
+  display: flex; justify-content: space-between; align-items: center;
+  font-size: 13px;
+}
+.account-label { color: var(--text-secondary); }
+.account-value { color: var(--text-primary); font-weight: 500; }
+.change-pw-form {
+  display: flex; flex-direction: column; gap: 8px;
+  max-width: 360px;
+}
+.change-pw-form .input { width: 100%; }
+.change-pw-form button { align-self: flex-start; }
+.user-success { color: #4caf7a; font-size: 13px; margin: 4px 0 0; }
 </style>
