@@ -58,6 +58,15 @@ export function createWebServer(options: WebServerOptions): WebServer {
     app.set("trust proxy", true);
   }
 
+  // Security headers: prevent the WebUI from being embedded in a third-party
+  // iframe (clickjacking defence). CSP frame-ancestors is the modern equivalent
+  // of X-Frame-Options; both are set for compatibility across browsers.
+  app.use((_req, res, next) => {
+    res.setHeader("X-Frame-Options", "DENY");
+    res.setHeader("Content-Security-Policy", "frame-ancestors 'none'");
+    next();
+  });
+
   app.use(express.json({ limit: "400kb" }));
   app.use(cookieParser());
 
