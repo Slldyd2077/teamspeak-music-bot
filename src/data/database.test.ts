@@ -40,6 +40,13 @@ describe("database", () => {
     expect(sessionColNames).toEqual(["createdAt", "expiresAt", "id", "lastSeenAt", "userId"]);
   });
 
+  it("creates user_audit table on init", () => {
+    const tables = botDb.db
+      .prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
+      .all() as Array<{ name: string }>;
+    expect(tables.map((t) => t.name)).toContain("user_audit");
+  });
+
   it("records and retrieves play history", () => {
     botDb.addPlayHistory({
       botId: "bot1",

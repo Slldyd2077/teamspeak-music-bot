@@ -6,14 +6,16 @@ import pino from "pino";
 import { createDatabase, type BotDatabase } from "../../data/database.js";
 import { createUserStore, type UserStore } from "../../data/users.js";
 import { createSessionStore, type SessionStore } from "../../data/sessions.js";
+import { createAuditStore } from "../../data/audit.js";
 import { createSessionRouter } from "./session.js";
 import { SESSION_COOKIE_NAME } from "../auth/validateSession.js";
 
-function makeApp(users: UserStore, sessions: SessionStore) {
+function makeApp(botDb: BotDatabase, users: UserStore, sessions: SessionStore) {
   const app = express();
   app.use(express.json());
   app.use(cookieParser());
-  app.use("/api/session", createSessionRouter(users, sessions, pino({ level: "silent" })));
+  const audit = createAuditStore(botDb.db);
+  app.use("/api/session", createSessionRouter(users, sessions, audit, pino({ level: "silent" })));
   return app;
 }
 
@@ -35,7 +37,7 @@ describe("session router", () => {
     botDb = createDatabase(":memory:");
     users = createUserStore(botDb.db);
     sessions = createSessionStore(botDb.db);
-    app = makeApp(users, sessions);
+    app = makeApp(botDb, users, sessions);
   });
 
   afterEach(() => botDb.close());

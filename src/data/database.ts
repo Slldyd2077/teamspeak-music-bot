@@ -147,6 +147,17 @@ function initTables(db: Database.Database): void {
 
     CREATE INDEX IF NOT EXISTS idx_sessions_userId ON sessions(userId);
     CREATE INDEX IF NOT EXISTS idx_sessions_expiresAt ON sessions(expiresAt);
+
+    CREATE TABLE IF NOT EXISTS user_audit (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      timestamp INTEGER NOT NULL,
+      actorId TEXT,
+      actorUsername TEXT,
+      targetUserId TEXT,
+      targetUsername TEXT,
+      action TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_user_audit_timestamp ON user_audit(timestamp DESC);
   `);
 }
 

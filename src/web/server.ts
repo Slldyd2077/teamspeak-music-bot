@@ -16,6 +16,8 @@ import { createPlayerRouter } from "./api/player.js";
 import { createAuthRouter } from "./api/auth.js";
 import { createSessionRouter } from "./api/session.js";
 import { createUsersRouter } from "./api/users.js";
+import { createAuditStore } from "../data/audit.js";
+import { createAuditRouter } from "./api/audit.js";
 import { setupWebSocket } from "./websocket.js";
 import { createUserStore } from "../data/users.js";
 import { createSessionStore } from "../data/sessions.js";
@@ -59,6 +61,7 @@ export function createWebServer(options: WebServerOptions): WebServer {
 
   const users = createUserStore(options.database.db);
   const sessions = createSessionStore(options.database.db);
+  const audit = createAuditStore(options.database.db);
 
   // ─── Public routes (no auth, no CSRF) ───────────────────────────────────
   app.get("/api/health", (_req, res) => {
@@ -70,7 +73,7 @@ export function createWebServer(options: WebServerOptions): WebServer {
     res.json({ publicUrl: raw ? raw.replace(/\/+$/, "") : null });
   });
 
-  app.use("/api/session", createSessionRouter(users, sessions, logger));
+  app.use("/api/session", createSessionRouter(users, sessions, audit, logger));
 
   // ─── Gates for everything else under /api ───────────────────────────────
   const requireAuth = createRequireAuth(sessions);
@@ -101,7 +104,8 @@ export function createWebServer(options: WebServerOptions): WebServer {
     "/api/auth",
     createAuthRouter(options.neteaseProvider, options.qqProvider, options.bilibiliProvider, logger, options.cookieStore)
   );
-  app.use("/api/users", createUsersRouter(users, sessions, logger));
+  app.use("/api/users", createUsersRouter(users, sessions, audit, logger));
+  app.use("/api/audit", createAuditRouter(audit));
 
   // ─── Static SPA (public) ────────────────────────────────────────────────
   if (options.staticDir) {

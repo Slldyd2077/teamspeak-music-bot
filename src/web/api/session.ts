@@ -3,6 +3,7 @@ import type { Request, Response, NextFunction } from "express";
 import type { Logger } from "../../logger.js";
 import type { UserStore } from "../../data/users.js";
 import type { SessionStore } from "../../data/sessions.js";
+import type { AuditStore } from "../../data/audit.js";
 import { SESSION_TTL_MS } from "../../data/sessions.js";
 import { SESSION_COOKIE_NAME, validateSessionFromHeaders, extractSessionToken } from "../auth/validateSession.js";
 
@@ -47,6 +48,7 @@ function parseTokenFromCookie(cookieHeader: string | undefined): string | null {
 export function createSessionRouter(
   users: UserStore,
   sessions: SessionStore,
+  audit: AuditStore,
   logger: Logger
 ): Router {
   const router = Router();
@@ -86,6 +88,11 @@ export function createSessionRouter(
       }
       const { token } = sessions.createSession(user.id);
       setSessionCookie(res, token);
+      audit.record({
+        actorId: user.id, actorUsername: user.username,
+        targetUserId: user.id, targetUsername: user.username,
+        action: "admin.first_created",
+      });
       logger.info({ userId: user.id, username }, "First admin created");
       res.json({ id: user.id, username: user.username });
     } catch (err) {
@@ -144,6 +151,11 @@ export function createSessionRouter(
     await users.changePassword(u.id, newPassword);
     const currentToken = parseTokenFromCookie(req.headers.cookie);
     sessions.deleteAllForUser(u.id, currentToken ?? undefined);
+    audit.record({
+      actorId: u.id, actorUsername: u.username,
+      targetUserId: u.id, targetUsername: u.username,
+      action: "user.password_changed",
+    });
     res.status(204).end();
   });
 
