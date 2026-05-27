@@ -460,13 +460,16 @@
     </section>
 
     <!-- User Management -->
-    <section class="settings-section">
+    <section v-if="session.isAdmin.value" class="settings-section">
       <h2 class="section-title">用户管理</h2>
       <div class="user-list">
         <div v-for="u in userList" :key="u.id" class="user-item">
           <div class="user-info">
             <div class="user-name">
               {{ u.username }}
+              <span class="user-role-badge" :class="`role-${u.role}`">
+                {{ u.role === 'admin' ? '管理员' : '成员' }}
+              </span>
               <span v-if="session.currentUser.value && u.id === session.currentUser.value.id" class="user-self-badge">本人</span>
             </div>
             <div class="user-created">创建于 {{ formatDate(u.createdAt) }}</div>
@@ -476,9 +479,18 @@
               <Icon icon="mdi:lock-reset" /> 重置密码
             </button>
             <button
+              class="btn-sm"
+              :disabled="changingRoleId === u.id || isLastAdmin(u)"
+              :title="isLastAdmin(u) ? '不能降级唯一的管理员' : (u.role === 'admin' ? '降级为成员' : '提升为管理员')"
+              @click="onToggleRole(u)"
+            >
+              <Icon icon="mdi:account-cog" />
+              {{ u.role === 'admin' ? '降为成员' : '提升管理员' }}
+            </button>
+            <button
               class="btn-sm btn-delete"
-              :disabled="!!(session.currentUser.value && u.id === session.currentUser.value.id)"
-              :title="session.currentUser.value && u.id === session.currentUser.value.id ? '不能删除自己' : ''"
+              :disabled="!!(session.currentUser.value && u.id === session.currentUser.value.id) || isLastAdmin(u)"
+              :title="session.currentUser.value && u.id === session.currentUser.value.id ? '不能删除自己' : (isLastAdmin(u) ? '不能删除唯一的管理员' : '')"
               @click="onDeleteUser(u)"
             >
               <Icon icon="mdi:delete" />
@@ -492,6 +504,10 @@
       <form class="user-add-form" @submit.prevent="onCreateUser">
         <input v-model="newUser.username" class="input" placeholder="新用户名 (3-32 字符)" required />
         <input v-model="newUser.password" type="password" class="input" placeholder="密码 (≥8 位)" minlength="8" required />
+        <select v-model="newUser.role" class="input user-role-select">
+          <option value="member">成员</option>
+          <option value="admin">管理员</option>
+        </select>
         <button class="btn-sm btn-primary" type="submit" :disabled="creatingUser">
           {{ creatingUser ? '创建中…' : '添加用户' }}
         </button>
@@ -519,7 +535,7 @@
     </section>
 
     <!-- Audit Log -->
-    <section class="settings-section">
+    <section v-if="session.isAdmin.value" class="settings-section">
       <h2 class="section-title">
         操作审计
         <button class="audit-refresh-btn" @click="loadAudit" :disabled="auditLoading" title="刷新">
@@ -923,16 +939,46 @@ async function updateProfile(botId: string, key: keyof ProfileConfig, value: boo
 // --- User Management ---
 const session = useSession();
 
-interface UserListEntry { id: string; username: string; createdAt: number }
+interface UserListEntry { id: string; username: string; createdAt: number; role: 'admin' | 'member' }
 const userList = ref<UserListEntry[]>([]);
 const userLoadError = ref('');
 const userMutationError = ref('');
-const newUser = reactive({ username: '', password: '' });
+const newUser = reactive({ username: '', password: '', role: 'member' as 'admin' | 'member' });
 const creatingUser = ref(false);
 const resetTarget = ref<UserListEntry | null>(null);
 const resetPassword = ref('');
 const resetError = ref('');
 const resettingPw = ref(false);
+const changingRoleId = ref<string | null>(null);
+
+function isLastAdmin(u: UserListEntry): boolean {
+  if (u.role !== 'admin') return false;
+  const adminCount = userList.value.filter((x) => x.role === 'admin').length;
+  return adminCount <= 1;
+}
+
+async function onToggleRole(u: UserListEntry) {
+  const newRole = u.role === 'admin' ? 'member' : 'admin';
+  if (!confirm(`确认将 ${u.username} 切换为${newRole === 'admin' ? '管理员' : '成员'}？`)) return;
+  userMutationError.value = '';
+  changingRoleId.value = u.id;
+  try {
+    const res = await fetch(`/api/users/${u.id}/role`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ role: newRole }),
+    });
+    if (!res.ok && res.status !== 204) {
+      const b = await res.json().catch(() => ({}));
+      throw new Error(b.error ?? `HTTP ${res.status}`);
+    }
+    await loadUsers();
+  } catch (e) {
+    userMutationError.value = (e as Error).message;
+  } finally {
+    changingRoleId.value = null;
+  }
+}
 
 async function loadUsers() {
   userLoadError.value = '';
@@ -953,7 +999,7 @@ async function onCreateUser() {
     const res = await fetch('/api/users', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ username: newUser.username, password: newUser.password }),
+      body: JSON.stringify({ username: newUser.username, password: newUser.password, role: newUser.role }),
     });
     if (!res.ok) {
       const b = await res.json().catch(() => ({}));
@@ -961,6 +1007,7 @@ async function onCreateUser() {
     }
     newUser.username = '';
     newUser.password = '';
+    newUser.role = 'member';
     await loadUsers();
   } catch (e) {
     userMutationError.value = (e as Error).message;
@@ -1080,8 +1127,10 @@ onMounted(() => {
   checkAuthStatus();
   loadQuality();
   loadIdleTimeout();
-  loadUsers();
-  loadAudit();
+  if (session.isAdmin.value) {
+    loadUsers();
+    loadAudit();
+  }
 });
 
 onUnmounted(() => {
@@ -1776,4 +1825,12 @@ onUnmounted(() => {
     gap: 4px;
   }
 }
+
+.user-role-badge {
+  font-size: 11px; padding: 2px 6px; border-radius: 4px; margin-left: 6px;
+  font-weight: 500;
+}
+.role-admin { background: rgba(99, 145, 226, 0.18); color: #6391e2; }
+.role-member { background: rgba(150, 150, 150, 0.18); color: var(--text-secondary); }
+.user-role-select { flex: 0 0 110px; }
 </style>

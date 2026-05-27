@@ -3,6 +3,7 @@ import { ref, computed, readonly } from "vue";
 interface User {
   id: string;
   username: string;
+  role: 'admin' | 'member';
 }
 
 const currentUser = ref<User | null>(null);
@@ -75,6 +76,7 @@ export function useSession() {
     currentUser: readonly(currentUser),
     needsSetup: readonly(needsSetup),
     isAuthenticated: computed(() => currentUser.value !== null),
+    isAdmin: computed(() => currentUser.value?.role === 'admin'),
     ready: readonly(ready),
     refresh,
     login,
