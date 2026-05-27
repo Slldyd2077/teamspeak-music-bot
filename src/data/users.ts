@@ -15,6 +15,7 @@ export interface UserRow {
 export interface UserStore {
   countUsers(): number;
   createUser(username: string, password: string): Promise<UserRow>;
+  createFirstUser(username: string, password: string): Promise<UserRow | null>;
   findByUsername(username: string): UserRow | null;
   findById(id: string): UserRow | null;
   verifyPassword(plain: string, hash: string): Promise<boolean>;
@@ -67,6 +68,26 @@ export function createUserStore(db: Database.Database): UserStore {
         throw err;
       }
       return { id, username, passwordHash: hash, createdAt: now, updatedAt: now };
+    },
+
+    async createFirstUser(username, password) {
+      const hash = await bcrypt.hash(password, BCRYPT_ROUNDS);
+      const id = randomUUID();
+      const now = Date.now();
+      const run = db.transaction(() => {
+        const count = (countStmt.get() as { n: number }).n;
+        if (count !== 0) return null;
+        try {
+          insertStmt.run(id, username, hash, now, now);
+        } catch (err) {
+          if (err && typeof err === "object" && (err as { code?: string }).code === "SQLITE_CONSTRAINT_UNIQUE") {
+            return null;
+          }
+          throw err;
+        }
+        return { id, username, passwordHash: hash, createdAt: now, updatedAt: now } as UserRow;
+      });
+      return run();
     },
 
     findByUsername(username) {

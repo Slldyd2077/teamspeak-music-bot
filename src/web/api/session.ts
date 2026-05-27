@@ -2,10 +2,9 @@ import { Router } from "express";
 import type { Request, Response, NextFunction } from "express";
 import type { Logger } from "../../logger.js";
 import type { UserStore } from "../../data/users.js";
-import { UsernameTakenError } from "../../data/users.js";
 import type { SessionStore } from "../../data/sessions.js";
 import { SESSION_TTL_MS } from "../../data/sessions.js";
-import { SESSION_COOKIE_NAME, validateSessionFromHeaders } from "../auth/validateSession.js";
+import { SESSION_COOKIE_NAME, validateSessionFromHeaders, extractSessionToken } from "../auth/validateSession.js";
 
 const FAILED_LOGIN_DELAY_MS = 250;
 
@@ -60,6 +59,8 @@ export function createSessionRouter(
       return;
     }
     req.user = { id: result.userId, username: result.username };
+    const token = extractSessionToken(req.headers.cookie);
+    if (token) setSessionCookie(res, token);
     next();
   };
 
@@ -78,16 +79,16 @@ export function createSessionRouter(
       return;
     }
     try {
-      const user = await users.createUser(username, password);
+      const user = await users.createFirstUser(username, password);
+      if (!user) {
+        res.status(409).json({ error: "already initialized" });
+        return;
+      }
       const { token } = sessions.createSession(user.id);
       setSessionCookie(res, token);
       logger.info({ userId: user.id, username }, "First admin created");
       res.json({ id: user.id, username: user.username });
     } catch (err) {
-      if (err instanceof UsernameTakenError) {
-        res.status(409).json({ error: "already initialized" });
-        return;
-      }
       logger.error({ err }, "setup failed");
       res.status(500).json({ error: "internal" });
     }

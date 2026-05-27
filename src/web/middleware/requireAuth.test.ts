@@ -53,4 +53,16 @@ describe("requireAuth middleware", () => {
     expect(res.body.ok).toBe(true);
     expect(res.body.user.username).toBe("alice");
   });
+
+  it("rolls the cookie max-age forward on successful auth", async () => {
+    const res = await request(app)
+      .get("/protected")
+      .set("Cookie", `${SESSION_COOKIE_NAME}=${validToken}`);
+    expect(res.status).toBe(200);
+    const setCookieHeaders = res.headers["set-cookie"];
+    const arr = Array.isArray(setCookieHeaders) ? setCookieHeaders : setCookieHeaders ? [setCookieHeaders] : [];
+    const refreshed = arr.find((c) => c.startsWith(`${SESSION_COOKIE_NAME}=`));
+    expect(refreshed).toBeDefined();
+    expect(refreshed!).toMatch(/Max-Age=\d+/);
+  });
 });

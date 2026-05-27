@@ -72,4 +72,24 @@ describe("UserStore", () => {
     expect(users.countUsers()).toBe(0);
     expect(users.deleteUser("not-a-real-id")).toBe(false);
   });
+
+  it("createFirstUser succeeds on empty db, returns null when a user already exists", async () => {
+    const a = await users.createFirstUser("alice", "pw-alice");
+    expect(a).not.toBeNull();
+    expect(a!.username).toBe("alice");
+    const b = await users.createFirstUser("bob", "pw-bob-bob");
+    expect(b).toBeNull();
+    expect(users.countUsers()).toBe(1);
+  });
+
+  it("createFirstUser is race-safe: concurrent calls produce exactly one user", async () => {
+    const [a, b, c] = await Promise.all([
+      users.createFirstUser("alice", "pw-alice"),
+      users.createFirstUser("bob", "pw-bob-bob"),
+      users.createFirstUser("charlie", "pw-charlie-pw"),
+    ]);
+    const created = [a, b, c].filter((u) => u !== null);
+    expect(created).toHaveLength(1);
+    expect(users.countUsers()).toBe(1);
+  });
 });

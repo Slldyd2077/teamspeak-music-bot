@@ -1,6 +1,11 @@
 import type { Request, Response, NextFunction, RequestHandler } from "express";
 import type { SessionStore } from "../../data/sessions.js";
-import { validateSessionFromHeaders, SESSION_COOKIE_NAME } from "../auth/validateSession.js";
+import { SESSION_TTL_MS } from "../../data/sessions.js";
+import {
+  validateSessionFromHeaders,
+  extractSessionToken,
+  SESSION_COOKIE_NAME,
+} from "../auth/validateSession.js";
 
 declare module "express-serve-static-core" {
   interface Request {
@@ -17,6 +22,16 @@ export function createRequireAuth(sessions: SessionStore): RequestHandler {
       return;
     }
     req.user = { id: result.userId, username: result.username };
+    const token = extractSessionToken(req.headers.cookie);
+    if (token) {
+      res.cookie(SESSION_COOKIE_NAME, token, {
+        httpOnly: true,
+        sameSite: "lax",
+        secure: req.secure,
+        path: "/",
+        maxAge: SESSION_TTL_MS,
+      });
+    }
     next();
   };
 }

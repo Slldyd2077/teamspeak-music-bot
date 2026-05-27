@@ -17,6 +17,11 @@ export function validateSessionFromHeaders(
   return sessions.validateAndTouch(token);
 }
 
+export function extractSessionToken(rawCookieHeader: string | undefined): string | null {
+  if (!rawCookieHeader) return null;
+  return parseCookie(rawCookieHeader, SESSION_COOKIE_NAME);
+}
+
 function parseCookie(header: string, name: string): string | null {
   for (const part of header.split(";")) {
     const trimmed = part.trim();
