@@ -1483,7 +1483,7 @@ onUnmounted(() => {
   font-family: inherit;
   font-size: 13px;
   outline: none;
-  resize: vertical;
+  resize: none;
   &:focus { border-color: var(--color-primary); }
 }
 

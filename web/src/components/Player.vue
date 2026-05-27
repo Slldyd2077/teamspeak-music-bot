@@ -27,10 +27,10 @@
       <div class="player-left" @click="toggleLyrics">
         <CoverArt :url="currentSong.coverUrl" :size="40" />
         <div class="song-info">
-          <div class="song-name">{{ currentSong.name }}</div>
+          <div class="song-name" :title="currentSong.name">{{ currentSong.name }}</div>
           <div class="song-artist">
             <span v-if="showBotBadge" class="bot-badge">{{ activeBot?.name }}</span>
-            {{ currentSong.artist }}
+            <span class="artist-name" :title="currentSong.artist">{{ currentSong.artist }}</span>
           </div>
         </div>
       </div>
@@ -310,6 +310,8 @@ function cycleMode() {
 
 .song-info {
   min-width: 0;
+  flex: 1;
+  overflow: hidden;
 }
 
 .song-name {
@@ -326,6 +328,16 @@ function cycleMode() {
   display: flex;
   align-items: center;
   gap: 4px;
+  min-width: 0;
+  overflow: hidden;
+}
+
+.artist-name {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  min-width: 0;
+  flex: 1;
 }
 
 .bot-badge {
