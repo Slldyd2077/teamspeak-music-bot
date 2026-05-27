@@ -24,6 +24,7 @@ import { createSessionStore } from "../data/sessions.js";
 import { createRequireAuth } from "./middleware/requireAuth.js";
 import { requireAdmin } from "./middleware/requireAdmin.js";
 import { csrfOriginCheck } from "./middleware/csrf.js";
+import { createRateLimit } from "./middleware/rateLimit.js";
 import { validateSessionFromHeaders } from "./auth/validateSession.js";
 
 const SESSION_CLEANUP_INTERVAL_MS = 60 * 60 * 1000; // 1 hour
@@ -73,6 +74,14 @@ export function createWebServer(options: WebServerOptions): WebServer {
     const raw = (options.config.publicUrl ?? "").trim();
     res.json({ publicUrl: raw ? raw.replace(/\/+$/, "") : null });
   });
+
+  // Anti-DoS: throttle expensive (bcrypt) auth endpoints.
+  // 5 req per minute per IP for /login (capacity 5, refill 5/60 = ~0.083/sec).
+  // 3 req per minute per IP for /setup (more limited; first-run is rare).
+  const loginLimit = createRateLimit({ capacity: 5, refillPerSec: 5 / 60 });
+  const setupLimit = createRateLimit({ capacity: 3, refillPerSec: 3 / 60 });
+  app.use("/api/session/login", loginLimit);
+  app.use("/api/session/setup", setupLimit);
 
   app.use("/api/session", createSessionRouter(users, sessions, audit, logger));
 

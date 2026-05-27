@@ -3,6 +3,7 @@ import type Database from "better-sqlite3";
 
 export const SESSION_TTL_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
 export const SESSION_TOUCH_INTERVAL_MS = 60 * 60 * 1000; // 1 hour
+export const MAX_SESSIONS_PER_USER = 10;
 
 export interface SessionValidation {
   userId: string;
@@ -40,9 +41,18 @@ export function createSessionStore(db: Database.Database): SessionStore {
     "DELETE FROM sessions WHERE userId = ? AND id != ?"
   );
   const cleanupStmt = db.prepare("DELETE FROM sessions WHERE expiresAt < ?");
+  const countForUserStmt = db.prepare("SELECT COUNT(*) AS n FROM sessions WHERE userId = ?");
+  const deleteOldestForUserStmt = db.prepare(
+    "DELETE FROM sessions WHERE id IN (SELECT id FROM sessions WHERE userId = ? ORDER BY createdAt ASC LIMIT ?)"
+  );
 
   return {
     createSession(userId) {
+      // Cap concurrent sessions per user — oldest gets evicted on overflow.
+      const existing = (countForUserStmt.get(userId) as { n: number }).n;
+      if (existing >= MAX_SESSIONS_PER_USER) {
+        deleteOldestForUserStmt.run(userId, existing - MAX_SESSIONS_PER_USER + 1);
+      }
       const token = randomBytes(32).toString("base64url");
       const id = hashToken(token);
       const now = Date.now();

@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { createHash } from "node:crypto";
 import { createDatabase, type BotDatabase } from "./database.js";
 import { createUserStore, type UserStore } from "./users.js";
-import { createSessionStore, type SessionStore, SESSION_TTL_MS, SESSION_TOUCH_INTERVAL_MS } from "./sessions.js";
+import { createSessionStore, type SessionStore, SESSION_TTL_MS, SESSION_TOUCH_INTERVAL_MS, MAX_SESSIONS_PER_USER } from "./sessions.js";
 
 function sha256(token: string) {
   return createHash("sha256").update(token).digest("hex");
@@ -100,5 +100,20 @@ describe("SessionStore", () => {
     sessions.cleanupExpired();
     const remaining = (botDb.db.prepare("SELECT COUNT(*) AS n FROM sessions").get() as { n: number }).n;
     expect(remaining).toBe(1);
+  });
+
+  it("createSession caps concurrent sessions per user at MAX_SESSIONS_PER_USER, evicting oldest", async () => {
+    // Create MAX + 2 sessions for the same user.
+    const tokens: string[] = [];
+    for (let i = 0; i < MAX_SESSIONS_PER_USER + 2; i++) {
+      tokens.push(sessions.createSession(userId).token);
+      await new Promise((r) => setTimeout(r, 2)); // stagger createdAt
+    }
+    const count = (botDb.db.prepare("SELECT COUNT(*) AS n FROM sessions").get() as { n: number }).n;
+    expect(count).toBe(MAX_SESSIONS_PER_USER);
+    // The first two should have been evicted, the last MAX remain
+    expect(sessions.validateAndTouch(tokens[0])).toBeNull();
+    expect(sessions.validateAndTouch(tokens[1])).toBeNull();
+    expect(sessions.validateAndTouch(tokens[tokens.length - 1])).not.toBeNull();
   });
 });
