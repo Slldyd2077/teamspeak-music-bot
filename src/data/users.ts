@@ -55,8 +55,7 @@ export function createUserStore(db: Database.Database): UserStore {
       try {
         insertStmt.run(id, username, hash, now, now);
       } catch (err) {
-        const msg = (err as Error).message;
-        if (msg.includes("UNIQUE") && msg.includes("users.username")) {
+        if (err && typeof err === "object" && (err as { code?: string }).code === "SQLITE_CONSTRAINT_UNIQUE") {
           throw new UsernameTakenError(username);
         }
         throw err;
