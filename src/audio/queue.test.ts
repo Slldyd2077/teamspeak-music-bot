@@ -484,4 +484,84 @@ describe("PlayQueue", () => {
       expect(promoted?.id).toBe("x");
     });
   });
+
+  // Issue #70: 随机循环 (rloop) used true random-with-replacement, so some
+  // songs repeated often while others were starved. It should behave like a
+  // shuffle bag (NetEase/QQ style): play every song once per cycle in random
+  // order, then reshuffle and continue, avoiding an immediate cross-cycle repeat.
+  describe("random-loop shuffle bag (issue #70)", () => {
+    it("plays every song exactly once per cycle before repeating", () => {
+      queue.setMode(PlayMode.RandomLoop);
+      const N = 12;
+      for (let i = 0; i < N; i++) queue.add(makeSong(`s${i}`));
+      queue.play();
+
+      const cycle1 = [queue.current()!.id];
+      for (let i = 0; i < N - 1; i++) cycle1.push(queue.next()!.id);
+      const cycle2: string[] = [];
+      for (let i = 0; i < N; i++) cycle2.push(queue.next()!.id);
+
+      // Each cycle is a full permutation of all N songs — zero repeats within
+      // a cycle, and both cycles cover the same complete set.
+      expect(new Set(cycle1).size).toBe(N);
+      expect(new Set(cycle2).size).toBe(N);
+      expect(new Set(cycle1)).toEqual(new Set(cycle2));
+    });
+
+    it("distributes plays evenly across songs over many cycles (no starvation)", () => {
+      queue.setMode(PlayMode.RandomLoop);
+      const N = 6;
+      const CYCLES = 20;
+      for (let i = 0; i < N; i++) queue.add(makeSong(`s${i}`));
+      queue.play();
+
+      const counts = new Map<string, number>();
+      counts.set(queue.current()!.id, 1);
+      for (let i = 0; i < CYCLES * N - 1; i++) {
+        const id = queue.next()!.id;
+        counts.set(id, (counts.get(id) ?? 0) + 1);
+      }
+
+      // Shuffle bag => each song plays exactly CYCLES times. True random
+      // would skew heavily.
+      for (let i = 0; i < N; i++) {
+        expect(counts.get(`s${i}`)).toBe(CYCLES);
+      }
+    });
+
+    it("does not replay the same song across a cycle boundary", () => {
+      queue.setMode(PlayMode.RandomLoop);
+      const N = 5;
+      for (let i = 0; i < N; i++) queue.add(makeSong(`s${i}`));
+      queue.play();
+
+      // Walk to the last song of cycle 1, then cross into cycle 2.
+      for (let i = 0; i < N - 1; i++) queue.next();
+      const lastOfCycle1 = queue.current()!.id;
+      const firstOfCycle2 = queue.next()!.id;
+      expect(firstOfCycle2).not.toBe(lastOfCycle1);
+    });
+
+    it("includes a song added mid-cycle within the current cycle", () => {
+      queue.setMode(PlayMode.RandomLoop);
+      queue.add(makeSong("A"));
+      queue.add(makeSong("B"));
+      queue.play(); // A
+      queue.next(); // B — both originals now played this cycle
+      queue.add(makeSong("C")); // added mid-cycle, still unplayed
+      // C is the only unplayed song, so it must come next (not a reshuffle).
+      expect(queue.next()?.id).toBe("C");
+    });
+
+    it("keeps looping forever with multiple songs (never returns null)", () => {
+      queue.setMode(PlayMode.RandomLoop);
+      queue.add(makeSong("A"));
+      queue.add(makeSong("B"));
+      queue.add(makeSong("C"));
+      queue.play();
+      for (let i = 0; i < 30; i++) {
+        expect(queue.next()).not.toBeNull();
+      }
+    });
+  });
 });

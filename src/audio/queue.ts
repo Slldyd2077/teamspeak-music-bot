@@ -155,33 +155,42 @@ export class PlayQueue {
             return this.songs[target];
           }
         }
-        // 前进栈为空，走纯随机逻辑
-        if (this.mode === PlayMode.Random) {
-          const unplayed: number[] = [];
-          for (let i = 0; i < this.songs.length; i++) {
-            if (!this.playedIndices.has(i)) unplayed.push(i);
-          }
-          if (unplayed.length === 0) return null;
-          const nextIndex =
-            unplayed[Math.floor(Math.random() * unplayed.length)];
-          this.pushHistory(this.currentIndex);
-          this.currentIndex = nextIndex;
-          this.playedIndices.add(nextIndex);
-          return this.songs[nextIndex];
-        } else {
+
+        // Shuffle bag: pick uniformly from the songs not yet played this
+        // cycle, so every song plays once before any repeats (NetEase/QQ
+        // style). Songs added mid-cycle aren't in playedIndices, so they're
+        // naturally eligible within the current cycle.
+        const unplayed: number[] = [];
+        for (let i = 0; i < this.songs.length; i++) {
+          if (!this.playedIndices.has(i)) unplayed.push(i);
+        }
+
+        if (unplayed.length === 0) {
+          // Cycle complete.
+          if (this.mode === PlayMode.Random) return null; // 随机：播完即停
+          // 随机循环：reshuffle and keep going forever.
           if (this.songs.length === 1) {
             this.pushHistory(this.currentIndex);
             this.currentIndex = 0;
+            this.playedIndices = new Set([0]);
             return this.songs[0];
           }
-          let idx: number;
-          do {
-            idx = Math.floor(Math.random() * this.songs.length);
-          } while (idx === this.currentIndex);
-          this.pushHistory(this.currentIndex);
-          this.currentIndex = idx;
-          return this.songs[idx];
+          // Start a fresh cycle: every song is eligible again, but exclude
+          // the song that just played from THIS pick only, so it doesn't
+          // repeat back-to-back across the boundary. It stays eligible for
+          // the rest of the new cycle, so every song still plays exactly once.
+          this.playedIndices = new Set();
+          for (let i = 0; i < this.songs.length; i++) {
+            if (i !== this.currentIndex) unplayed.push(i);
+          }
         }
+
+        const nextIndex =
+          unplayed[Math.floor(Math.random() * unplayed.length)];
+        this.pushHistory(this.currentIndex);
+        this.currentIndex = nextIndex;
+        this.playedIndices.add(nextIndex);
+        return this.songs[nextIndex];
       }
     }
   }
