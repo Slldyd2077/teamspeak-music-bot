@@ -17,6 +17,7 @@ import type { BotDatabase, ProfileConfig } from "../data/database.js";
 import type { BotConfig } from "../data/config.js";
 import { BotProfileManager } from "./profile.js";
 import type { AvatarStore } from "../data/avatars.js";
+import { decideOccupancyAction } from "./auto-pause.js";
 
 export interface BotInstanceOptions {
   id: string;
@@ -66,6 +67,7 @@ export class BotInstance extends EventEmitter {
   private isAdvancing = false;
   private idleTimer: ReturnType<typeof setTimeout> | null = null;
   private channelUserCount = 0;
+  private autoPaused = false;
   private profileManager: BotProfileManager;
   private isFmMode = false;
 
@@ -143,6 +145,8 @@ export class BotInstance extends EventEmitter {
       // short-circuited on !this.connected, leaving player stuck as "playing".
       this.connected = false;
       this.player.stop();
+      // A lifecycle change must not leave a stale auto-resume armed.
+      this.autoPaused = false;
       // Only emit externally once per lifecycle so clients don't see a
       // duplicate "disconnected" after an explicit disconnect() call.
       if (this.disconnectEmitted) return;
@@ -151,6 +155,8 @@ export class BotInstance extends EventEmitter {
     });
 
     this.tsClient.on("connected", () => {
+      // Fresh connection — clear any stale auto-pause flag from a prior session.
+      this.autoPaused = false;
       this._startIdlePoller();
     });
   }
@@ -187,6 +193,16 @@ export class BotInstance extends EventEmitter {
     if (minutes === 0) this._cancelIdleTimer();
   }
 
+  /** 外部更新 autoPauseOnEmpty（由 API 保存时调用） */
+  updateAutoPause(enabled: boolean): void {
+    this.config.autoPauseOnEmpty = enabled;
+    if (!enabled && this.autoPaused && this.player.getState() === "paused") {
+      this.player.resume();
+      this.autoPaused = false;
+      this.emit("stateChange");
+    }
+  }
+
   private _startIdlePoller(): void {
     // 每 30 秒检查一次频道人数
     const poll = async () => {
@@ -194,15 +210,33 @@ export class BotInstance extends EventEmitter {
       try {
         const clients = await this.tsClient.getClientsInChannel();
         const userCount = clients.length - 1; // 排除 bot 自身
-        if (userCount <= 0) {
-          this._scheduleIdleCheck();
-        } else {
-          this._cancelIdleTimer();
-        }
+        this.handleOccupancy(userCount);
       } catch { /* ignore */ }
       setTimeout(poll, 30_000);
     };
     setTimeout(poll, 30_000);
+  }
+
+  private handleOccupancy(userCount: number): void {
+    // idle-disconnect (unchanged behavior)
+    if (userCount <= 0) this._scheduleIdleCheck();
+    else this._cancelIdleTimer();
+    // auto-pause
+    const action = decideOccupancyAction(
+      this.player.getState(),
+      this.autoPaused,
+      this.config.autoPauseOnEmpty,
+      userCount,
+    );
+    if (action === "pause") {
+      this.player.pause();
+      this.autoPaused = true;
+      this.emit("stateChange");
+    } else if (action === "resume") {
+      this.player.resume();
+      this.autoPaused = false;
+      this.emit("stateChange");
+    }
   }
 
   private _scheduleIdleCheck(): void {
@@ -381,6 +415,9 @@ export class BotInstance extends EventEmitter {
       }
       song.url = url;
       this.player.play(url, 0, song.duration);
+      // Fresh playback (re)start — clear auto-pause so a later occupancy
+      // change won't try to "resume" a track the user already restarted.
+      this.autoPaused = false;
       this.database.addPlayHistory({
         botId: this.id,
         songId: song.id,
@@ -483,18 +520,23 @@ export class BotInstance extends EventEmitter {
 
   private cmdPause(): string {
     this.player.pause();
+    // User-initiated pause — clear auto-pause so occupancy won't auto-resume it.
+    this.autoPaused = false;
     this.emit("stateChange");
     return "Paused";
   }
 
   private cmdResume(): string {
     this.player.resume();
+    // User-initiated resume — drop any auto-pause flag.
+    this.autoPaused = false;
     this.emit("stateChange");
     return "Resumed";
   }
 
   private cmdStop(): string {
     this.player.stop();
+    this.autoPaused = false;
     this.queue.clear();
     this.isFmMode = false;
     this.profileManager.onSongChange(null).catch((err) => {
