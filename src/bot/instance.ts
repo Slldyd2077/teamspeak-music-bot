@@ -159,6 +159,22 @@ export class BotInstance extends EventEmitter {
       this.autoPaused = false;
       this._startIdlePoller();
     });
+
+    // React near-instantly to channel membership changes. The 30s idle
+    // poller remains the fallback if any of these events are missed.
+    this.tsClient.on("clientEnter", () => void this.refreshOccupancy());
+    this.tsClient.on("clientLeave", () => void this.refreshOccupancy());
+    this.tsClient.on("clientMoved", () => void this.refreshOccupancy());
+  }
+
+  private async refreshOccupancy(): Promise<void> {
+    if (!this.connected) return;
+    try {
+      const clients = await this.tsClient.getClientsInChannel();
+      this.handleOccupancy(clients.length - 1);
+    } catch {
+      // ignore — the 30s poll is the fallback
+    }
   }
 
   async connect(): Promise<void> {
