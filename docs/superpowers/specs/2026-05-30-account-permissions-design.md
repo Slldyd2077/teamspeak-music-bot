@@ -93,14 +93,14 @@ New `PermissionStore` in `src/data/permissions.ts` (mirrors `createUserStore` /
 
 ## Backend enforcement (real 403 — not just hidden UI)
 
-- **`req.user` widened** to carry `permissions: Set<string>` and bot access. Loaded in
+- **`req.user` widened** to carry `capabilities: Set<string>` and bot access. Loaded in
   `requireAuth` (one extra lookup, or a JOIN in the session query). The same
-  `{id,username,role,permissions,...}` shape must be kept in sync in the three places
+  `{id,username,role,capabilities,bots}` shape must be kept in sync in the three places
   it is built today: `requireAuth.ts`, `session.ts` `requireAuthInline`, and the WS
   upgrade handler in `server.ts` (WS only needs it if a push action becomes gated).
   Because it's read live, permission changes take effect immediately (no re-login).
 - **`requirePermission(cap)`** middleware (new, mirrors `requireAdmin.ts`): 401 if no
-  user; allow if `role === 'admin'` or `permissions.has(cap)`; else 403.
+  user; allow if `role === 'admin'` or `capabilities.has(cap)`; else 403.
 - **`requireBotAccess`** helper: allow if admin or `bots.all` or botId ∈ access list;
   else 403. Mounted on the player router's existing `/:botId` choke-point
   (`src/web/api/player.ts`) and on each `:id` route in `src/web/api/bot.ts`
