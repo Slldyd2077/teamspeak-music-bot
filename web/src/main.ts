@@ -14,4 +14,7 @@ app.use(router);
 // Wait for the initial navigation (and the beforeEach guard that reads ?bot)
 // to fully resolve before mounting, so the reactive route query is populated
 // when App.onMounted runs and the dedicated-bot scope locks the right bot.
-router.isReady().then(() => app.mount('#app'));
+// .catch keeps parity with the old unconditional mount: if the initial
+// navigation errors (e.g. a transient network failure in the auth guard),
+// still render the shell rather than leaving a blank page.
+router.isReady().catch(() => {}).then(() => app.mount('#app'));
