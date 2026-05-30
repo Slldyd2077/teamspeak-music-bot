@@ -4,6 +4,8 @@ interface User {
   id: string;
   username: string;
   role: 'admin' | 'member';
+  capabilities?: string[];
+  bots?: "all" | string[];
 }
 
 const currentUser = ref<User | null>(null);
@@ -70,6 +72,8 @@ async function login(username: string, password: string): Promise<void> {
     throw new Error(body.error ?? `login failed (${res.status})`);
   }
   currentUser.value = (await res.json()) as User;
+  // Login response omits capabilities/bots; fetch the authoritative ones from /me.
+  await refreshMe();
 }
 
 async function setup(username: string, password: string): Promise<void> {
@@ -85,12 +89,26 @@ async function setup(username: string, password: string): Promise<void> {
   }
   currentUser.value = (await res.json()) as User;
   needsSetup.value = false;
+  // Setup response omits capabilities/bots; fetch the authoritative ones from /me.
+  await refreshMe();
 }
 
 async function logout(): Promise<void> {
   stopPoll();
   await fetch("/api/session/logout", { method: "POST", credentials: "same-origin" });
   currentUser.value = null;
+}
+
+function can(cap: string): boolean {
+  const u = currentUser.value;
+  return !!u && (u.role === "admin" || (u.capabilities ?? []).includes(cap));
+}
+
+function canControlBot(botId: string): boolean {
+  const u = currentUser.value;
+  if (!u) return false;
+  if (u.role === "admin" || u.bots === "all") return true;
+  return Array.isArray(u.bots) && u.bots.includes(botId);
 }
 
 export function useSession() {
@@ -104,5 +122,7 @@ export function useSession() {
     login,
     logout,
     setup,
+    can,
+    canControlBot,
   };
 }
