@@ -67,3 +67,23 @@ export function createPermissionStore(db: Database.Database): PermissionStore {
     },
   };
 }
+
+export interface PermissionContext {
+  capabilities: Set<string>;
+  bots: "all" | Set<string>;
+}
+
+export function resolvePermissionContext(
+  role: "admin" | "member",
+  userId: string,
+  store: PermissionStore
+): PermissionContext {
+  if (role === "admin") {
+    return { capabilities: new Set(CAPABILITIES), bots: "all" };
+  }
+  const access = store.getBotAccess(userId);
+  return {
+    capabilities: new Set(store.getCapabilities(userId)),
+    bots: access === "all" ? "all" : new Set(access),
+  };
+}

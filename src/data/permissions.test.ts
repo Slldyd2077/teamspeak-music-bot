@@ -4,7 +4,7 @@ import path from "node:path";
 import os from "node:os";
 import { createDatabase, type BotDatabase } from "./database.js";
 import { createPermissionStore } from "./permissions.js";
-import { CAPABILITIES, BASIC_TIER_CAPABILITIES } from "./permissions.js";
+import { CAPABILITIES, BASIC_TIER_CAPABILITIES, resolvePermissionContext } from "./permissions.js";
 
 describe("PermissionStore", () => {
   let dbFile: string;
@@ -70,5 +70,21 @@ describe("PermissionStore", () => {
     store.setPermissions("u1", { capabilities: [], bots: ["botA", "botB"] });
     store.pruneBot("botA");
     expect(store.getBotAccess("u1")).toEqual(["botB"]);
+  });
+
+  describe("resolvePermissionContext", () => {
+    it("admin gets all capabilities and all bots regardless of stored rows", () => {
+      const store = createPermissionStore(db.db);
+      const ctx = resolvePermissionContext("admin", "u1", store);
+      expect([...ctx.capabilities].sort()).toEqual([...CAPABILITIES].sort());
+      expect(ctx.bots).toBe("all");
+    });
+    it("member reflects stored capabilities + bot access", () => {
+      const store = createPermissionStore(db.db);
+      store.setPermissions("u1", { capabilities: ["player.control"], bots: ["b1"] });
+      const ctx = resolvePermissionContext("member", "u1", store);
+      expect([...ctx.capabilities]).toEqual(["player.control"]);
+      expect(ctx.bots).toEqual(new Set(["b1"]));
+    });
   });
 });
