@@ -3,10 +3,10 @@
     <div class="queue-header">
       <h3 class="queue-title">播放队列</h3>
       <span class="queue-count">{{ botQueue.length }} 首</span>
-      <button 
-        v-if="botQueue.length > 0"
-        class="clear-btn" 
-        @click="clearAndStop" 
+      <button
+        v-if="botQueue.length > 0 && can('player.control')"
+        class="clear-btn"
+        @click="clearAndStop"
         title="清空队列并停止播放"
       >
         <Icon icon="mdi:stop-circle-outline" />
@@ -33,7 +33,7 @@
           <div class="queue-song-name">{{ song.name }}</div>
           <div class="queue-song-artist">{{ song.artist }}</div>
         </div>
-        <button class="remove-btn" @click="removeSong(i)" title="移除">
+        <button v-if="can('player.queue')" class="remove-btn" @click="removeSong(i)" title="移除">
           <Icon icon="mdi:close" />
         </button>
       </div>
@@ -46,6 +46,7 @@ import { watch, computed } from 'vue';
 import { Icon } from '@iconify/vue';
 import axios from 'axios';
 import { usePlayerStore } from '../stores/player.js';
+import { useSession } from '../composables/useSession.js';
 import CoverArt from './CoverArt.vue';
 
 const props = defineProps<{
@@ -57,6 +58,7 @@ defineEmits<{
 }>();
 
 const store = usePlayerStore();
+const { can } = useSession();
 const botQueue = computed(() => store.queue);
 
 // Fetch queue when panel opens
@@ -65,6 +67,7 @@ watch(() => props.open, (isOpen) => {
 });
 
 async function playAtIndex(index: number) {
+  if (!can('player.control')) return;
   await store.playAtIndex(index);
   await store.fetchQueue();
 }
