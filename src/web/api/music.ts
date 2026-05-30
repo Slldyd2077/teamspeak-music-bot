@@ -2,6 +2,7 @@ import { Router } from "express";
 import type { MusicProvider } from "../../music/provider.js";
 import { YouTubeProvider } from "../../music/youtube.js";
 import type { Logger } from "../../logger.js";
+import { requirePermission } from "../middleware/requirePermission.js";
 
 export function createMusicRouter(
   neteaseProvider: MusicProvider,
@@ -217,7 +218,7 @@ export function createMusicRouter(
   });
 
   // Set quality
-  router.post("/quality", (req, res) => {
+  router.post("/quality", requirePermission("quality"), (req, res) => {
     const { quality, platform } = req.body;
     if (!quality) {
       res.status(400).json({ error: "quality is required" });

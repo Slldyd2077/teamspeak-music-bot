@@ -5,6 +5,7 @@ import { saveConfig } from "../../data/config.js";
 import type { Logger } from "../../logger.js";
 import type { BotDatabase } from "../../data/database.js";
 import type { AvatarStore } from "../../data/avatars.js";
+import { requirePermission, requireBotAccess } from "../middleware/requirePermission.js";
 
 export function createBotRouter(
   botManager: BotManager,
@@ -62,7 +63,7 @@ export function createBotRouter(
     res.send(buf);
   });
 
-  router.put("/:id/avatar", (req, res) => {
+  router.put("/:id/avatar", requirePermission("bot.manage"), requireBotAccess("id"), (req, res) => {
     const exists =
       botManager.getBot(req.params.id) ||
       botDb.getBotInstances().some((b) => b.id === req.params.id);
@@ -96,7 +97,7 @@ export function createBotRouter(
     res.json({ path: rel });
   });
 
-  router.delete("/:id/avatar", (req, res) => {
+  router.delete("/:id/avatar", requirePermission("bot.manage"), requireBotAccess("id"), (req, res) => {
     const path = botDb.getCustomAvatarPath(req.params.id);
     if (path) avatarStore.remove(path);
     botDb.setCustomAvatarPath(req.params.id, null);
@@ -104,7 +105,7 @@ export function createBotRouter(
     res.status(204).end();
   });
 
-  router.post("/", async (req, res) => {
+  router.post("/", requirePermission("bot.manage"), async (req, res) => {
     try {
       const {
         name,
@@ -140,7 +141,7 @@ export function createBotRouter(
   });
 
   // Update bot config (must be stopped first to apply connection changes)
-  router.put("/:id", async (req, res) => {
+  router.put("/:id", requirePermission("bot.manage"), requireBotAccess("id"), async (req, res) => {
     try {
       const bot = botManager.getBot(req.params.id);
       if (!bot) {
@@ -159,7 +160,7 @@ export function createBotRouter(
     }
   });
 
-  router.delete("/:id", async (req, res) => {
+  router.delete("/:id", requirePermission("bot.manage"), requireBotAccess("id"), async (req, res) => {
     try {
       await botManager.removeBot(req.params.id);
       res.json({ success: true });
@@ -168,7 +169,7 @@ export function createBotRouter(
     }
   });
 
-  router.post("/:id/start", async (req, res) => {
+  router.post("/:id/start", requirePermission("bot.manage"), requireBotAccess("id"), async (req, res) => {
     try {
       await botManager.startBot(req.params.id);
       res.json({ success: true });
@@ -177,7 +178,7 @@ export function createBotRouter(
     }
   });
 
-  router.post("/:id/stop", (req, res) => {
+  router.post("/:id/stop", requirePermission("bot.manage"), requireBotAccess("id"), (req, res) => {
     try {
       botManager.stopBot(req.params.id);
       res.json({ success: true });
@@ -192,7 +193,7 @@ export function createBotRouter(
   });
 
   // POST /api/bot/settings — 保存全局 bot 行为设置
-  router.post("/settings", (req, res) => {
+  router.post("/settings", requirePermission("bot.manage"), (req, res) => {
     const { idleTimeoutMinutes } = req.body;
     if (typeof idleTimeoutMinutes !== "number" || idleTimeoutMinutes < 0) {
       res.status(400).json({ error: "idleTimeoutMinutes must be a non-negative number" });
