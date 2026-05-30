@@ -9,6 +9,7 @@ import { QQMusicProvider } from "./music/qq.js";
 import { BiliBiliProvider } from "./music/bilibili.js";
 import { createCookieStore } from "./music/auth.js";
 import { createAvatarStore } from "./data/avatars.js";
+import { createPermissionStore } from "./data/permissions.js";
 import { BotManager } from "./bot/manager.js";
 import { createWebServer } from "./web/server.js";
 
@@ -56,6 +57,8 @@ async function main() {
   const bilibiliCookie = cookieStore.load("bilibili");
   if (bilibiliCookie) bilibiliProvider.setCookie(bilibiliCookie);
 
+  const permissions = createPermissionStore(db.db);
+
   const botManager = new BotManager(
     neteaseProvider,
     qqProvider,
@@ -63,7 +66,8 @@ async function main() {
     db,
     config,
     logger,
-    avatarStore
+    avatarStore,
+    permissions
   );
   await botManager.loadSavedBots();
 

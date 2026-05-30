@@ -17,8 +17,13 @@ export function createBotRouter(
 ): Router {
   const router = Router();
 
-  router.get("/", (_req, res) => {
-    const bots = botManager.getAllBots().map((b) => b.getStatus());
+  router.get("/", (req, res) => {
+    const all = botManager.getAllBots().map((b) => b.getStatus());
+    const u = req.user!;
+    const bots =
+      u.role === "admin" || u.bots === "all"
+        ? all
+        : all.filter((b) => u.bots instanceof Set && u.bots.has(b.id));
     res.json({ bots });
   });
 

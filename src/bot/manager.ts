@@ -12,6 +12,7 @@ import type { Logger } from "../logger.js";
 
 import type { ServerProtocol } from "../ts-protocol/client.js";
 import type { AvatarStore } from "../data/avatars.js";
+import type { PermissionStore } from "../data/permissions.js";
 
 /**
  * Run bot.connect() with a hard deadline. If the handshake hangs (e.g. the
@@ -76,6 +77,7 @@ export class BotManager extends EventEmitter {
   private config: BotConfig;
   private logger: Logger;
   private avatarStore: AvatarStore;
+  private permissions: PermissionStore;
 
   constructor(
     neteaseProvider: MusicProvider,
@@ -84,7 +86,8 @@ export class BotManager extends EventEmitter {
     database: BotDatabase,
     config: BotConfig,
     logger: Logger,
-    avatarStore: AvatarStore
+    avatarStore: AvatarStore,
+    permissions: PermissionStore
   ) {
     super();
     this.neteaseProvider = neteaseProvider;
@@ -95,6 +98,7 @@ export class BotManager extends EventEmitter {
     this.config = config;
     this.logger = logger;
     this.avatarStore = avatarStore;
+    this.permissions = permissions;
   }
 
   async createBot(params: CreateBotParams): Promise<BotInstance> {
@@ -152,6 +156,7 @@ export class BotManager extends EventEmitter {
       this.bots.delete(id);
     }
     this.database.deleteBotInstance(id);
+    this.permissions.pruneBot(id);
     this.emit("botInstanceRemoved", id);
     this.logger.info({ botId: id }, "Bot instance removed");
   }
