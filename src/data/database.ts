@@ -165,6 +165,20 @@ function initTables(db: Database.Database): void {
       action TEXT NOT NULL
     );
     CREATE INDEX IF NOT EXISTS idx_user_audit_timestamp ON user_audit(timestamp DESC);
+
+    CREATE TABLE IF NOT EXISTS user_permissions (
+      userId     TEXT NOT NULL,
+      permission TEXT NOT NULL,
+      PRIMARY KEY (userId, permission),
+      FOREIGN KEY (userId) REFERENCES users(id) ON DELETE CASCADE
+    );
+    CREATE TABLE IF NOT EXISTS user_bot_access (
+      userId TEXT NOT NULL,
+      botId  TEXT NOT NULL,
+      PRIMARY KEY (userId, botId),
+      FOREIGN KEY (userId) REFERENCES users(id) ON DELETE CASCADE
+    );
+    CREATE INDEX IF NOT EXISTS idx_user_bot_access_userId ON user_bot_access(userId);
   `);
 }
 
