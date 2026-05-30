@@ -10,8 +10,8 @@
     </div>
 
     <div class="nav-right">
-      <!-- Bot selector (always shown when at least one bot exists) -->
-      <div v-if="store.bots.length > 0" class="bot-selector" ref="selectorRef">
+      <!-- Bot selector (always shown when at least one controllable bot exists) -->
+      <div v-if="controllableBots.length > 0" class="bot-selector" ref="selectorRef">
         <button class="bot-selector-btn" @click="dropdownOpen = !dropdownOpen">
           <span class="bot-dot" :class="{ online: activeBot?.connected }" />
           <span class="bot-selector-name">{{ activeBot?.name ?? '选择机器人' }}</span>
@@ -22,7 +22,7 @@
         <div v-if="dropdownOpen" class="bot-dropdown">
           <div class="bot-dropdown-header">机器人</div>
           <div
-            v-for="bot in store.bots"
+            v-for="bot in controllableBots"
             :key="bot.id"
             class="bot-card"
             :class="{ active: bot.id === store.activeBotId }"
@@ -131,12 +131,17 @@ import { useSession } from '../composables/useSession.js';
 
 const store = usePlayerStore();
 const session = useSession();
+const { canControlBot } = session;
 const navRouter = useRouter();
 
 async function onLogout() {
   await session.logout();
   navRouter.replace({ name: 'login' });
 }
+// Belt-and-suspenders: the backend already scopes store.bots to the allowed
+// set for members, but filtering here keeps the UI correct if an admin (who
+// sees all bots) is constrained, or if the list ever isn't pre-filtered.
+const controllableBots = computed(() => store.bots.filter((b) => canControlBot(b.id)));
 const activeBot = computed(() => store.activeBot);
 const dropdownOpen = ref(false);
 const selectorRef = ref<HTMLElement | null>(null);

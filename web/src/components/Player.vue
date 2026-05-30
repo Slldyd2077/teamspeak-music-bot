@@ -3,9 +3,10 @@
     <Queue :open="showQueue" @close="showQueue = false" />
 
     <div class="player-bar frosted-glass">
-      <!-- Progress bar -->
+      <!-- Progress bar (read-only display; seek interaction gated on player.control) -->
       <div
         class="progress-bar-container"
+        :class="{ 'no-seek': !canControl }"
         ref="progressBarRef"
         @click="onProgressClick"
         @mousemove="onProgressHover"
@@ -37,32 +38,38 @@
 
       <div class="player-center">
         <span class="time-display time-current">{{ formatTime(currentElapsed) }}</span>
-        <button class="control-btn" @click="store.prev()">
-          <Icon icon="mdi:skip-previous" />
-        </button>
-        <button class="play-btn" @click="togglePlay">
-          <Icon :icon="store.isPlaying ? 'mdi:pause' : 'mdi:play'" />
-        </button>
-        <button class="control-btn" @click="store.next()">
-          <Icon icon="mdi:skip-next" />
-        </button>
-        <button class="control-btn mode-btn" @click="cycleMode" :title="modeLabel">
-          <Icon :icon="modeIcon" />
-          <span class="mode-label">{{ modeLabel }}</span>
-        </button>
+        <!-- Transport controls require player.control -->
+        <template v-if="canControl">
+          <button class="control-btn" @click="store.prev()">
+            <Icon icon="mdi:skip-previous" />
+          </button>
+          <button class="play-btn" @click="togglePlay">
+            <Icon :icon="store.isPlaying ? 'mdi:pause' : 'mdi:play'" />
+          </button>
+          <button class="control-btn" @click="store.next()">
+            <Icon icon="mdi:skip-next" />
+          </button>
+          <button class="control-btn mode-btn" @click="cycleMode" :title="modeLabel">
+            <Icon :icon="modeIcon" />
+            <span class="mode-label">{{ modeLabel }}</span>
+          </button>
+        </template>
         <span class="time-display time-total">{{ formatTime(currentSong?.duration ?? 0) }}</span>
       </div>
 
       <div class="player-right">
-        <Icon icon="mdi:volume-high" class="volume-icon" />
-        <input
-          type="range"
-          min="0"
-          max="100"
-          :value="activeBot?.volume ?? 75"
-          @change="onVolumeChange"
-          class="volume-slider"
-        />
+        <!-- Volume requires player.control -->
+        <template v-if="canControl">
+          <Icon icon="mdi:volume-high" class="volume-icon" />
+          <input
+            type="range"
+            min="0"
+            max="100"
+            :value="activeBot?.volume ?? 75"
+            @change="onVolumeChange"
+            class="volume-slider"
+          />
+        </template>
         <button class="control-btn" :class="{ active: showQueue }" @click="showQueue = !showQueue">
           <Icon icon="mdi:playlist-music" />
         </button>
@@ -79,12 +86,16 @@ import { computed, ref, onMounted, onUnmounted } from 'vue';
 import { Icon } from '@iconify/vue';
 import { useRoute, useRouter } from 'vue-router';
 import { usePlayerStore } from '../stores/player.js';
+import { useSession } from '../composables/useSession.js';
 import CoverArt from './CoverArt.vue';
 import Queue from './Queue.vue';
 
 const route = useRoute();
 const router = useRouter();
 const showQueue = ref(false);
+
+const { can } = useSession();
+const canControl = computed(() => can('player.control'));
 
 const store = usePlayerStore();
 const activeBot = computed(() => store.activeBot);
@@ -133,6 +144,7 @@ function updateProgress() {
 }
 
 async function onProgressClick(e: MouseEvent) {
+  if (!canControl.value) return; // seek requires player.control
   const bar = progressBarRef.value;
   if (!bar) return;
   const rect = bar.getBoundingClientRect();
@@ -236,6 +248,14 @@ function cycleMode() {
   &:hover {
     .progress-bar-bg { height: 4px; }
     .progress-bar-thumb { opacity: 1; transform: scale(1); }
+  }
+
+  &.no-seek {
+    cursor: default;
+    &:hover {
+      .progress-bar-bg { height: 2px; }
+      .progress-bar-thumb { opacity: 0; transform: scale(0); }
+    }
   }
 }
 

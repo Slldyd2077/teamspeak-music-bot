@@ -50,8 +50,8 @@
       <p v-if="ownPwSuccess" class="user-success">{{ ownPwSuccess }}</p>
     </section>
 
-    <!-- Bot Management -->
-    <section class="settings-section">
+    <!-- Bot Management (create/edit/delete/start-stop) requires bot.manage -->
+    <section v-if="can('bot.manage')" class="settings-section">
       <h2 class="section-title">机器人管理</h2>
       <div class="bot-list">
         <div v-for="bot in store.bots" :key="bot.id" class="bot-item">
@@ -157,8 +157,8 @@
       </div>
     </section>
 
-    <!-- Music Account - QR Code Login -->
-    <section class="settings-section">
+    <!-- Music Account - QR Code Login (platform auth) requires platform.auth -->
+    <section v-if="can('platform.auth')" class="settings-section">
       <h2 class="section-title">音乐账号</h2>
 
       <!-- NetEase -->
@@ -371,8 +371,8 @@
       </div>
     </section>
 
-    <!-- Audio Quality -->
-    <section class="settings-section">
+    <!-- Audio Quality requires quality -->
+    <section v-if="can('quality')" class="settings-section">
       <h2 class="section-title">音质设置</h2>
       <div class="setting-row">
         <div class="setting-label">
@@ -967,6 +967,7 @@ async function updateProfile(botId: string, key: keyof ProfileConfig, value: boo
 
 // --- User Management ---
 const session = useSession();
+const { can } = session;
 
 // --- Own password change (available to all authenticated users) ---
 const ownPw = reactive({ old: '', new: '', confirm: '' });
