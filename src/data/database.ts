@@ -1,4 +1,5 @@
 import Database from "better-sqlite3";
+import { CAPABILITIES, BOTS_ALL } from "./permissions.js";
 
 export interface PlayHistoryEntry {
   botId: string;
@@ -196,7 +197,7 @@ export function backfillMemberPermissions(db: Database.Database): void {
   if (done) return;
   const members = db.prepare("SELECT id FROM users WHERE role = 'member'").all() as { id: string }[];
   const insCap = db.prepare("INSERT OR IGNORE INTO user_permissions (userId, permission) VALUES (?, ?)");
-  const tokens = ["player.control", "player.queue", "bot.manage", "platform.auth", "quality", "bots.all"];
+  const tokens = [...CAPABILITIES, BOTS_ALL];
   const tx = db.transaction(() => {
     for (const m of members) {
       for (const t of tokens) insCap.run(m.id, t);

@@ -102,6 +102,12 @@ describe("session router", () => {
     const me = await request(app).get("/api/session/me").set("Cookie", cookie);
     expect(me.status).toBe(200);
     expect(me.body.username).toBe("alice");
+    // alice is the first user (an admin), so /me exposes all capabilities and full bot access.
+    expect(Array.isArray(me.body.capabilities)).toBe(true);
+    expect(me.body.capabilities).toEqual(
+      expect.arrayContaining(["player.control", "player.queue", "bot.manage", "platform.auth", "quality"])
+    );
+    expect(me.body.bots).toBe("all");
 
     const anon = await request(app).get("/api/session/me");
     expect(anon.status).toBe(401);
