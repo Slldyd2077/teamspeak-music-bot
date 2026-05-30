@@ -433,6 +433,18 @@
           <button class="btn-primary" @click="saveIdleTimeout">保存</button>
         </div>
       </div>
+      <label class="profile-toggle behavior-toggle">
+        <div class="profile-toggle-text">
+          <div class="profile-toggle-label">频道无人时自动暂停播放</div>
+          <div class="profile-toggle-hint">机器人所在频道没有其他人时自动暂停，有人加入后可继续播放</div>
+        </div>
+        <input
+          v-model="autoPauseOnEmpty"
+          type="checkbox"
+          class="profile-toggle-switch"
+          @change="saveIdleTimeout"
+        />
+      </label>
     </section>
 
     <!-- Bot Profile (TeamSpeak Behavior) -->
@@ -885,17 +897,22 @@ async function savePrefix() {
 
 // Idle timeout
 const idleTimeout = ref(0);
+const autoPauseOnEmpty = ref(true);
 
 async function loadIdleTimeout() {
   try {
     const res = await axios.get('/api/bot/settings');
     idleTimeout.value = res.data.idleTimeoutMinutes ?? 0;
+    autoPauseOnEmpty.value = res.data.autoPauseOnEmpty ?? true;
   } catch { /* ignore */ }
 }
 
 async function saveIdleTimeout() {
   try {
-    await axios.post('/api/bot/settings', { idleTimeoutMinutes: idleTimeout.value });
+    await axios.post('/api/bot/settings', {
+      idleTimeoutMinutes: idleTimeout.value,
+      autoPauseOnEmpty: autoPauseOnEmpty.value,
+    });
   } catch { /* ignore */ }
 }
 
@@ -1792,6 +1809,12 @@ onUnmounted(() => {
 .profile-toggle-static {
   cursor: default;
   align-items: flex-start;
+}
+
+// Standalone toggle inside 行为设置 (not part of a bordered list)
+.behavior-toggle {
+  border-bottom: none;
+  padding-top: 4px;
 }
 
 @media (max-width: 768px) {
