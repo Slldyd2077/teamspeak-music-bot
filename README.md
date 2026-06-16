@@ -383,11 +383,11 @@ teamspeak-music-bot/
 │   └── docker/                 # Docker 部署文件
 │       ├── Dockerfile
 │       └── docker-compose.yml
-├── data/                       # 运行时数据（自动创建，不上传）
-│   ├── tsmusicbot.db           # SQLite 数据库
-│   ├── cookies/                # 登录 Cookie
-│   └── logs/                   # 日志文件
-└── config.json                 # 配置文件（首次运行自动生成，不上传）
+└── data/                       # 运行时数据（自动创建，不上传）
+    ├── config.json             # 配置文件（首次运行自动生成，可手动编辑）
+    ├── tsmusicbot.db           # SQLite 数据库
+    ├── cookies/                # 登录 Cookie
+    └── logs/                   # 日志文件
 ```
 
 ## 技术栈
