@@ -1,8 +1,8 @@
 import { describe, it, expect, afterEach } from "vitest";
 import { join } from "node:path";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync, existsSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { getDefaultConfig, loadConfig, saveConfig } from "./config.js";
+import { getDefaultConfig, loadConfig, saveConfig, migrateLegacyConfig } from "./config.js";
 
 describe("config", () => {
   const dirs: string[] = [];
@@ -50,5 +50,58 @@ describe("config", () => {
     expect(loaded.theme).toBe("dark");
     expect(loaded.commandPrefix).toBe("!");
     expect(loaded.autoPauseOnEmpty).toBe(true);
+  });
+
+  // --- #86: config.json must live under (and be created in) the persisted data dir ---
+
+  it("first run writes config.json into the data dir and reads it back", () => {
+    const root = makeTmpDir();
+    const dataDir = join(root, "data");
+    const configPath = join(dataDir, "config.json"); // mirrors index.ts CONFIG_PATH
+
+    // Boot sequence: load (missing -> defaults) then save.
+    const config = loadConfig(configPath);
+    saveConfig(configPath, config);
+
+    expect(existsSync(configPath)).toBe(true);
+    // A subsequent hand-edited file under the SAME persisted path is honored.
+    writeFileSync(configPath, JSON.stringify({ webPort: 9999 }), "utf-8");
+    expect(loadConfig(configPath).webPort).toBe(9999);
+  });
+
+  it("migrates a legacy root config into the data dir, preserving values", () => {
+    const root = makeTmpDir();
+    const legacyPath = join(root, "config.json");
+    const newPath = join(root, "data", "config.json");
+    writeFileSync(legacyPath, JSON.stringify({ webPort: 4242, publicUrl: "http://x" }), "utf-8");
+
+    const migrated = migrateLegacyConfig(legacyPath, newPath);
+
+    expect(migrated).toBe(true);
+    expect(existsSync(newPath)).toBe(true);
+    expect(existsSync(legacyPath)).toBe(false); // legacy moved, not duplicated
+    const loaded = loadConfig(newPath);
+    expect(loaded.webPort).toBe(4242);
+    expect(loaded.publicUrl).toBe("http://x");
+  });
+
+  it("does NOT overwrite an existing data-dir config during migration", () => {
+    const root = makeTmpDir();
+    const legacyPath = join(root, "config.json");
+    const newPath = join(root, "data", "config.json");
+    writeFileSync(legacyPath, JSON.stringify({ webPort: 1111 }), "utf-8");
+    saveConfig(newPath, { ...getDefaultConfig(), webPort: 2222 });
+
+    const migrated = migrateLegacyConfig(legacyPath, newPath);
+
+    expect(migrated).toBe(false); // new location wins, untouched
+    expect(loadConfig(newPath).webPort).toBe(2222);
+    expect(existsSync(legacyPath)).toBe(true); // legacy left intact when not migrated
+  });
+
+  it("migration is a no-op when there is no legacy config", () => {
+    const root = makeTmpDir();
+    const migrated = migrateLegacyConfig(join(root, "config.json"), join(root, "data", "config.json"));
+    expect(migrated).toBe(false);
   });
 });

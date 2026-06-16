@@ -1,6 +1,6 @@
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { loadConfig, saveConfig } from "./data/config.js";
+import { loadConfig, saveConfig, migrateLegacyConfig } from "./data/config.js";
 import { createDatabase } from "./data/database.js";
 import { createLogger } from "./logger.js";
 import { createApiServerManager } from "./music/api-server.js";
@@ -16,7 +16,11 @@ import { createWebServer } from "./web/server.js";
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT_DIR = path.resolve(__dirname, "..");
 const DATA_DIR = path.join(ROOT_DIR, "data");
-const CONFIG_PATH = path.join(ROOT_DIR, "config.json");
+// config.json lives under the persisted data dir (the Docker volume) alongside the
+// DB/cookies/logs, so it survives container restarts and manual edits take effect
+// (#86). LEGACY_CONFIG_PATH is the old root-level location we migrate from once.
+const CONFIG_PATH = path.join(DATA_DIR, "config.json");
+const LEGACY_CONFIG_PATH = path.join(ROOT_DIR, "config.json");
 const DB_PATH = path.join(DATA_DIR, "tsmusicbot.db");
 const LOG_DIR = path.join(DATA_DIR, "logs");
 const COOKIE_DIR = path.join(DATA_DIR, "cookies");
@@ -24,6 +28,9 @@ const AVATAR_DIR = path.join(DATA_DIR, "avatars");
 const STATIC_DIR = path.join(ROOT_DIR, "web", "dist");
 
 async function main() {
+  // Migrate a pre-#86 root-level config.json into the data dir so existing
+  // installs keep their settings; no-op if already migrated or none exists.
+  migrateLegacyConfig(LEGACY_CONFIG_PATH, CONFIG_PATH);
   const config = loadConfig(CONFIG_PATH);
   saveConfig(CONFIG_PATH, config);
 
