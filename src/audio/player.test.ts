@@ -2,7 +2,7 @@ import { describe, it, expect } from "vitest";
 import { mkdtempSync, writeFileSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { buildFfmpegArgs, shouldUsePowerShellDownload, cleanupTempDir, shouldEndOnStall } from "./player.js";
+import { buildFfmpegArgs, shouldUsePowerShellDownload, cleanupTempDir, shouldEndOnStall, volumeToFactor } from "./player.js";
 
 function getHeadersArg(args: string[]): string {
   const idx = args.indexOf("-headers");
@@ -86,6 +86,37 @@ describe("buildFfmpegArgs", () => {
     expect(args).toContain("-f");
     expect(args).toContain("s16le");
     expect(args[args.length - 1]).toBe("-");
+  });
+});
+
+describe("volumeToFactor (#84 smooth volume curve)", () => {
+  it("is 0 at vol 0 and exactly 1.0 at vol 100 (full loudness still reserved at 100)", () => {
+    expect(volumeToFactor(0)).toBe(0);
+    expect(volumeToFactor(100)).toBe(1);
+  });
+
+  it("clamps out-of-range input", () => {
+    expect(volumeToFactor(-20)).toBe(0);
+    expect(volumeToFactor(150)).toBe(1);
+  });
+
+  it("is strictly monotonic across the whole range (no dead zone)", () => {
+    for (let v = 0; v < 100; v++) {
+      expect(volumeToFactor(v + 1)).toBeGreaterThan(volumeToFactor(v));
+    }
+  });
+
+  it("removes the old flat 80-99 dead zone", () => {
+    // Old mapping moved only 0.16 -> 0.198 across 80..99; new curve climbs clearly.
+    expect(volumeToFactor(99) - volumeToFactor(80)).toBeGreaterThan(0.3);
+  });
+
+  it("removes the discontinuity at 100 (old jump was ~0.8)", () => {
+    expect(volumeToFactor(100) - volumeToFactor(99)).toBeLessThan(0.1);
+  });
+
+  it("keeps the low range gentle", () => {
+    expect(volumeToFactor(50)).toBeLessThan(0.12);
   });
 });
 

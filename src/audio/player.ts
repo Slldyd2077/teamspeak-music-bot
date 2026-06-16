@@ -130,6 +130,21 @@ export function shouldEndOnStall(
   return false;
 }
 
+/**
+ * Maps a 0-100 volume value to a linear PCM gain factor (#84).
+ *
+ * Continuous and strictly monotonic over [0,100]: 0 at vol 0 and exactly 1.0 at
+ * vol 100. The previous mapping was a two-piece step — gain = (vol/100)*0.2 for
+ * vol<100 (so the whole 0-99 range only spanned 0..0.198, making 80->99 feel
+ * flat) then a raw passthrough at vol===100 (a ~5x jump). This single curve keeps
+ * the low end gentle but ramps smoothly toward full loudness near the top, so the
+ * slider feels proportional with no dead zone and no discontinuity at 100.
+ */
+export function volumeToFactor(volume: number): number {
+  const x = Math.max(0, Math.min(100, volume)) / 100;
+  return 0.2 * x + 0.8 * Math.pow(x, 8);
+}
+
 export interface PlayerEvents {
   frame: (opusFrame: Buffer) => void;
   trackEnd: () => void;
@@ -552,8 +567,9 @@ export class AudioPlayer extends EventEmitter {
   }
 
   private applyVolume(pcm: Buffer): Buffer {
-    if (this.volume === 100) return Buffer.from(pcm);
-    const factor = (this.volume / 100) * 0.2;
+    const factor = volumeToFactor(this.volume);
+    // factor === 1 only at volume 100; skip the per-sample loop at full loudness.
+    if (factor >= 1) return Buffer.from(pcm);
     const out = Buffer.alloc(pcm.length);
     for (let i = 0; i < pcm.length; i += 2) {
       let sample = Math.round(pcm.readInt16LE(i) * factor);
