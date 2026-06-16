@@ -140,12 +140,20 @@ function cycleMobileMode() {
   playerStore.setMode(nextMode);
 }
 
-onMounted(() => {
+onMounted(async () => {
   playerStore.loadTheme();
   connect();
-  playerStore.fetchBots();
   syncTimer = setInterval(() => playerStore.syncElapsed(), 3000);
   mobileRaf = requestAnimationFrame(updateMobileProgress);
+  // Reconcile the dedicated-link scope only after the bot list is known: the
+  // router guard sets scopedBotId tentatively from ?bot, but applyScopeFromQuery
+  // validates it against the loaded bots (locks if it exists, clears if stale).
+  await playerStore.fetchBots();
+  // Read from the authoritative current route (not a possibly-stale reactive
+  // snapshot) so the scope reconciles against the ?bot present at refresh time.
+  const routeBot = router.currentRoute.value.query.bot;
+  const qBot = typeof routeBot === 'string' ? routeBot : null;
+  playerStore.applyScopeFromQuery(qBot);
 });
 
 onUnmounted(() => {

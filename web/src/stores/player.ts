@@ -1,5 +1,6 @@
 import { defineStore } from 'pinia';
 import axios from 'axios';
+import { resolveScopedBot } from './scope.js';
 
 export interface Song {
   id: string;
@@ -50,6 +51,9 @@ export const usePlayerStore = defineStore('player', {
   state: () => ({
     bots: [] as BotStatus[],
     activeBotId: null as string | null,
+    /** When set, the UI is locked to a single bot (dedicated link, from ?bot).
+     * Source of truth is the URL — never persisted to localStorage. */
+    scopedBotId: null as string | null,
     /** Per-bot queues keyed by botId */
     queues: {} as Record<string, Song[]>,
     /** Per-bot timing state keyed by botId */
@@ -72,6 +76,10 @@ export const usePlayerStore = defineStore('player', {
   getters: {
     activeBot(): BotStatus | null {
       return this.bots.find((b) => b.id === this.activeBotId) ?? this.bots[0] ?? null;
+    },
+    /** True when the UI is locked to a single bot via a dedicated link. */
+    isScoped(): boolean {
+      return this.scopedBotId !== null;
     },
     currentSong(): Song | null {
       return this.activeBot?.currentSong ?? null;
@@ -125,10 +133,38 @@ export const usePlayerStore = defineStore('player', {
     },
 
     setActiveBotId(id: string) {
+      // While scoped to a dedicated link, switching bots is blocked.
+      if (this.scopedBotId !== null && id !== this.scopedBotId) return;
       this.activeBotId = id;
       // Fetch queue for newly active bot if we don't have it yet
       if (!this.queues[id]) {
         this.fetchQueue();
+      }
+    },
+
+    /** Lock the UI to a single bot (dedicated link). Sets scope first so the
+     * setActiveBotId guard does not block the switch to the scoped bot. */
+    setScope(id: string) {
+      this.scopedBotId = id;
+      this.activeBotId = id;
+      // Lazily fetch this bot's queue, mirroring setActiveBotId.
+      if (!this.queues[id]) {
+        this.fetchQueue();
+      }
+    },
+
+    clearScope() {
+      this.scopedBotId = null;
+    },
+
+    /** Reconcile the scope with the desired id from the URL (?bot). A stale or
+     * forbidden id resolves to null and clears the scope rather than locking. */
+    applyScopeFromQuery(requestedId: string | null) {
+      const r = resolveScopedBot(requestedId, this.bots.map((b) => b.id));
+      if (r) {
+        this.setScope(r);
+      } else if (requestedId) {
+        this.clearScope();
       }
     },
 
