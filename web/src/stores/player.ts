@@ -473,15 +473,33 @@ export const usePlayerStore = defineStore('player', {
     },
 
     async addFavorite(playlist: { platform: string; playlistId: string; name: string; coverUrl: string; songCount: number }) {
-      await axios.post('/api/favorites', playlist);
-      await this.fetchFavorites();
-      this.notify('已收藏', 'info');
+      try {
+        await axios.post('/api/favorites', playlist);
+        await this.fetchFavorites();
+        this.notify('已收藏', 'info');
+      } catch (err: any) {
+        // 409 = already favorited (e.g. stale heart); just resync so the UI converges.
+        if (err?.response?.status === 409) {
+          await this.fetchFavorites();
+          return;
+        }
+        this.notify('收藏失败', 'error');
+      }
     },
 
     async removeFavorite(id: number) {
-      await axios.delete(`/api/favorites/${id}`);
-      await this.fetchFavorites();
-      this.notify('已取消收藏', 'info');
+      try {
+        await axios.delete(`/api/favorites/${id}`);
+        await this.fetchFavorites();
+        this.notify('已取消收藏', 'info');
+      } catch (err: any) {
+        // 404 = already gone; resync. Otherwise report failure.
+        if (err?.response?.status === 404) {
+          await this.fetchFavorites();
+          return;
+        }
+        this.notify('取消收藏失败', 'error');
+      }
     },
 
     isFavorited(playlistId: string, platform: string): boolean {
@@ -504,6 +522,10 @@ export const usePlayerStore = defineStore('player', {
         newAuth.netease !== this.authStatus.netease || newAuth.qq !== this.authStatus.qq;
       this.authStatus.netease = newAuth.netease;
       this.authStatus.qq = newAuth.qq;
+
+      // Favorites are user-local and cheap; always refresh them, even on a
+      // home-data cache hit, so hearts stay correct across tabs/sessions.
+      this.fetchFavorites();
 
       // Cache hit only if auth is unchanged AND within TTL.
       if (
@@ -575,9 +597,6 @@ export const usePlayerStore = defineStore('player', {
       if (authOk) {
         this.lastFetchTime = Date.now();
       }
-
-      // Fetch favorites in parallel — not cached by TTL; always fresh
-      this.fetchFavorites();
     },
   },
 });

@@ -143,6 +143,10 @@ function cycleMobileMode() {
 onMounted(async () => {
   playerStore.loadTheme();
   connect();
+  // Hydrate favorites once per session so deep-links / hard refreshes onto
+  // Search or Playlist render hearts correctly without first visiting Home.
+  // (fire-and-forget; fetchFavorites swallows the 401 when not yet logged in.)
+  playerStore.fetchFavorites();
   syncTimer = setInterval(() => playerStore.syncElapsed(), 3000);
   mobileRaf = requestAnimationFrame(updateMobileProgress);
   // Reconcile the dedicated-link scope only after the bot list is known: the

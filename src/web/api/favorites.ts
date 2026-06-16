@@ -15,7 +15,7 @@ export function createFavoritesRouter(database: BotDatabase, logger: Logger): Ro
   // POST /api/favorites — 添加收藏
   router.post("/", (req, res) => {
     const userId = req.user!.id;
-    const { platform, playlistId, name, coverUrl, songCount } = req.body;
+    const { platform, playlistId, name, coverUrl, songCount } = req.body ?? {};
     if (!platform || !playlistId || !name) {
       res.status(400).json({ error: "platform, playlistId, name are required" });
       return;
@@ -64,11 +64,11 @@ export function createFavoritesRouter(database: BotDatabase, logger: Logger): Ro
   router.get("/check", (req, res) => {
     const userId = req.user!.id;
     const { platform, playlistId } = req.query;
-    if (!platform || !playlistId) {
+    if (typeof platform !== "string" || typeof playlistId !== "string") {
       res.status(400).json({ error: "platform and playlistId required" });
       return;
     }
-    const favorited = database.isFavorited(userId, playlistId as string, platform as string);
+    const favorited = database.isFavorited(userId, playlistId, platform);
     res.json({ favorited });
   });
 
