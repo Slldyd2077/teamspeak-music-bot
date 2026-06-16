@@ -462,6 +462,9 @@ export class QQMusicProvider implements MusicProvider {
 
   setCookie(cookie: string): void {
     this.cookie = cookie;
+    // Reset radar pagination so a re-login (different account) starts from the
+    // first page rather than inheriting the previous account's cursor.
+    this.radarPage = 1;
   }
 
   getCookie(): string {

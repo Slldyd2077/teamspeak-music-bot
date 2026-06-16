@@ -747,6 +747,12 @@ export class BotInstance extends EventEmitter {
   }
 
   async startFm(provider: MusicProvider = this.neteaseProvider): Promise<string> {
+    // Match the !fm chat-command guard: refuse before mutating the queue when
+    // offline, so the web /fm route can't wipe the queue + flip into FM mode
+    // while nothing can actually play.
+    if (!this.connected) {
+      return "Bot is not connected to TeamSpeak";
+    }
     if (!provider.getPersonalFm) {
       return `Personal FM is not available for ${provider.platform}`;
     }

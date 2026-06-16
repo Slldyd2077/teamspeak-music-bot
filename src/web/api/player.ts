@@ -97,7 +97,13 @@ export function createPlayerRouter(
           : "netease"
       );
       const message = await bot.startFm(provider);
-      res.json({ ok: !message.startsWith("No FM songs") && !message.includes("not available"), message });
+      res.json({
+        ok:
+          !message.startsWith("No FM songs") &&
+          !message.includes("not available") &&
+          !message.includes("not connected"),
+        message,
+      });
     } catch (err) {
       res.status(500).json({ error: (err as Error).message });
     }
