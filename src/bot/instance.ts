@@ -6,12 +6,13 @@ import {
 } from "../ts-protocol/client.js";
 import { AudioPlayer } from "../audio/player.js";
 import { PlayQueue, PlayMode, type QueuedSong } from "../audio/queue.js";
-import type { MusicProvider } from "../music/provider.js";
+import type { MusicProvider, Song } from "../music/provider.js";
 import {
   parseCommand,
   isAdminCommand,
   type ParsedCommand,
 } from "./commands.js";
+import { parseSongRef, parseSelectionIndex } from "./song-ref.js";
 import type { Logger } from "../logger.js";
 import type { BotDatabase, ProfileConfig } from "../data/database.js";
 import type { BotConfig } from "../data/config.js";
@@ -71,6 +72,8 @@ export class BotInstance extends EventEmitter {
   private profileManager: BotProfileManager;
   private isFmMode = false;
   private fmProvider: MusicProvider | null = null;
+  /** Results of the most recent !search, for "#N" selection (issue #90). */
+  private lastSearchResults: Song[] = [];
 
   constructor(options: BotInstanceOptions) {
     super();
@@ -334,6 +337,9 @@ export class BotInstance extends EventEmitter {
       throw new Error("Bot is not connected to TeamSpeak");
     }
     switch (cmd.name) {
+      case "search":
+      case "find":
+        return this.cmdSearch(cmd);
       case "play":
         return this.cmdPlay(cmd);
       case "add":
@@ -467,36 +473,84 @@ export class BotInstance extends EventEmitter {
     }
   }
 
-  private async cmdPlay(cmd: ParsedCommand): Promise<string> {
-    if (!cmd.args) return "Usage: !play <song name or URL>";
-    const provider = this.getProvider(cmd.flags);
-    const result = await provider.search(cmd.args, 1);
-    if (result.songs.length === 0)
-      return `No results found for: ${cmd.args}`;
+  /**
+   * Resolve a !play/!add/!playnext argument into a single Song, supporting three
+   * forms (issue #90):
+   *   1) "#N"          — the Nth result of the previous !search
+   *   2) id:<id> / URL — an exact song (disambiguates same-name songs)
+   *   3) plain text    — search, returning the single most-popular hit (legacy)
+   */
+  private async resolvePlayQuery(cmd: ParsedCommand): Promise<{ song?: Song; error?: string }> {
+    const args = (cmd.args ?? "").trim();
+    const p = this.config.commandPrefix;
 
-    const song = result.songs[0];
+    // 1) "#N" — pick from the previous !search.
+    const sel = parseSelectionIndex(args);
+    if (sel !== null) {
+      if (this.lastSearchResults.length === 0)
+        return { error: `No recent search. Use ${p}search <name> first.` };
+      if (sel > this.lastSearchResults.length)
+        return { error: `Invalid selection #${sel}. ${p}search returned ${this.lastSearchResults.length} results.` };
+      return { song: this.lastSearchResults[sel - 1] };
+    }
+
+    // 2) id:/URL — fetch that exact song.
+    const ref = parseSongRef(args);
+    if (ref) {
+      const provider = ref.platform ? this.getProviderFor(ref.platform) : this.getProvider(cmd.flags);
+      const song = await provider.getSongDetail(ref.id);
+      if (!song) return { error: `No song found for ${ref.platform ?? provider.platform} id: ${ref.id}` };
+      return { song: { ...song, platform: provider.platform } };
+    }
+
+    // 3) Plain search term — single most-popular hit (historical behavior).
+    const provider = this.getProvider(cmd.flags);
+    const result = await provider.search(args, 1);
+    if (result.songs.length === 0) return { error: `No results found for: ${args}` };
+    return { song: { ...result.songs[0], platform: provider.platform } };
+  }
+
+  private async cmdSearch(cmd: ParsedCommand): Promise<string> {
+    const p = this.config.commandPrefix;
+    if (!cmd.args) return `Usage: ${p}search <name> [-q|-b|-y]`;
+    const provider = this.getProvider(cmd.flags);
+    const result = await provider.search(cmd.args, 8);
+    if (result.songs.length === 0) return `No results found for: ${cmd.args}`;
+    this.lastSearchResults = result.songs.map((s) => ({ ...s, platform: provider.platform }));
+    const lines = this.lastSearchResults.map(
+      (s, i) => `${i + 1}. ${s.name} - ${s.artist}${s.album ? ` 《${s.album}》` : ""} [id:${s.id}]`,
+    );
+    return [
+      `搜索结果（用 ${p}play #序号 播放，或 ${p}play id:<id>）:`,
+      ...lines,
+    ].join("\n");
+  }
+
+  private async cmdPlay(cmd: ParsedCommand): Promise<string> {
+    if (!cmd.args) return `Usage: ${this.config.commandPrefix}play <song name | #N | id:<id> | URL>`;
+    const { song, error } = await this.resolvePlayQuery(cmd);
+    if (error) return error;
+    const song0 = song!;
     this.queue.clear();
     this.disableFmMode();
-    this.queue.add({ ...song, platform: provider.platform });
+    this.queue.add({ ...song0 });
     this.queue.play();
 
     // Reset failure counter on user-initiated play
     this.player.resetFailures();
     const ok = await this.resolveAndPlay(this.queue.current()!);
-    if (!ok) return `Cannot play: ${song.name}`;
-    return `Now playing: ${song.name} - ${song.artist}`;
+    if (!ok) return `Cannot play: ${song0.name}`;
+    return `Now playing: ${song0.name} - ${song0.artist}`;
   }
 
   private async cmdAdd(cmd: ParsedCommand): Promise<string> {
-    if (!cmd.args) return "Usage: !add <song name>";
-    const provider = this.getProvider(cmd.flags);
-    const result = await provider.search(cmd.args, 1);
-    if (result.songs.length === 0)
-      return `No results found for: ${cmd.args}`;
+    if (!cmd.args) return `Usage: ${this.config.commandPrefix}add <song name | #N | id:<id> | URL>`;
+    const { song, error } = await this.resolvePlayQuery(cmd);
+    if (error) return error;
+    const s = song!;
 
-    const song = result.songs[0];
     const wasIdle = this.player.getState() === "idle";
-    this.queue.add({ ...song, platform: provider.platform });
+    this.queue.add({ ...s });
 
     // If nothing was playing, start this newly-added song immediately.
     // Matches /api/player/:id/add-by-id behavior so both add paths feel
@@ -506,21 +560,19 @@ export class BotInstance extends EventEmitter {
       this.player.resetFailures();
       await this.resolveAndPlay(this.queue.current()!);
       this.emit("stateChange");
-      return `Now playing: ${song.name} - ${song.artist}`;
+      return `Now playing: ${s.name} - ${s.artist}`;
     }
 
     this.emit("stateChange");
-    return `Added to queue: ${song.name} - ${song.artist} (position ${this.queue.size()})`;
+    return `Added to queue: ${s.name} - ${s.artist} (position ${this.queue.size()})`;
   }
 
   private async cmdPlayNext(cmd: ParsedCommand): Promise<string> {
-    if (!cmd.args) return "Usage: !playnext <song name>";
-    const provider = this.getProvider(cmd.flags);
-    const result = await provider.search(cmd.args, 1);
-    if (result.songs.length === 0)
-      return `No results found for: ${cmd.args}`;
+    if (!cmd.args) return `Usage: ${this.config.commandPrefix}playnext <song name | #N | id:<id> | URL>`;
+    const { song, error } = await this.resolvePlayQuery(cmd);
+    if (error) return error;
+    const s = song!;
 
-    const song = result.songs[0];
     const wasIdle = this.player.getState() === "idle";
     // Capture the slot addNext WILL insert at, before mutating the queue.
     // addNext pushes when currentIndex<0 (slot = size); otherwise splices
@@ -531,19 +583,19 @@ export class BotInstance extends EventEmitter {
       this.queue.getCurrentIndex() < 0
         ? this.queue.size()
         : this.queue.getCurrentIndex() + 1;
-    this.queue.addNext({ ...song, platform: provider.platform });
+    this.queue.addNext({ ...s });
 
     if (wasIdle) {
       this.queue.playAt(insertedAt);
       this.player.resetFailures();
       const ok = await this.resolveAndPlay(this.queue.current()!);
       this.emit("stateChange");
-      if (!ok) return `Cannot play: ${song.name}`;
-      return `Now playing: ${song.name} - ${song.artist}`;
+      if (!ok) return `Cannot play: ${s.name}`;
+      return `Now playing: ${s.name} - ${s.artist}`;
     }
 
     this.emit("stateChange");
-    return `Up next: ${song.name} - ${song.artist}`;
+    return `Up next: ${s.name} - ${s.artist}`;
   }
 
   private cmdPause(): string {
@@ -868,11 +920,14 @@ export class BotInstance extends EventEmitter {
     const p = this.config.commandPrefix;
     return [
       "TSMusicBot Commands:",
-      `${p}play <song>  — Search and play`,
+      `${p}play <song>  — Search and play (most popular match)`,
       `${p}play -q <song> — Search from QQ Music`,
       `${p}play -b <song> — Search from BiliBili`,
       `${p}play -y <song> — Search from YouTube (yt-dlp)`,
-      `${p}add <song>   — Add to queue`,
+      `${p}search <name> — List top matches to pick a specific (same-name) song`,
+      `${p}play #N       — Play the Nth result of the last ${p}search`,
+      `${p}play id:<id>  — Play an exact song by id / URL (NetEase·QQ·BiliBili)`,
+      `${p}add <song>   — Add to queue (also accepts #N / id: / URL)`,
       `${p}playnext <song> — Insert as next song (alias: ${p}pn)`,
       `${p}pause/resume — Pause/resume`,
       `${p}next/prev    — Next/previous`,
