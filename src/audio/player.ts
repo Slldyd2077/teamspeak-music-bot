@@ -91,6 +91,11 @@ export function buildFfmpegArgs(url: string, seekSeconds: number): string[] {
   if (isHttp) {
     args.push(
       "-reconnect", "1",
+      // Long B站 streams sit on a CDN whose session/token can close the
+      // connection mid-file (premature EOF). Without this, FFmpeg treats that
+      // EOF as end-of-input and stops ~partway through (see #89); with it, it
+      // re-issues a Range request from the current offset to finish the stream.
+      "-reconnect_at_eof", "1",
       "-reconnect_streamed", "1",
       "-reconnect_delay_max", "30",
       "-reconnect_on_network_error", "1",
@@ -101,6 +106,28 @@ export function buildFfmpegArgs(url: string, seekSeconds: number): string[] {
   args.push("-i", url, "-f", "s16le", "-ar", "48000", "-ac", "2", "-acodec", "pcm_s16le", "-");
 
   return args;
+}
+
+/**
+ * Decide whether to end the current track when FFmpeg is still alive but has
+ * produced no decodable audio for `emptyAttempts` consecutive frame ticks.
+ *
+ * - Near the song end we end quickly (`maxEmptyAttempts`): a normal EOF.
+ * - Far from the end we wait much longer (`maxStallAttempts`) before giving up,
+ *   so a transient buffer underrun on a healthy stream does NOT cause a false
+ *   skip — but a genuinely dead stream (e.g. a long B站 stream whose CDN session
+ *   expired mid-playback, #89) still recovers by advancing instead of going
+ *   permanently silent.
+ */
+export function shouldEndOnStall(
+  emptyAttempts: number,
+  isNearEnd: boolean,
+  maxEmptyAttempts: number,
+  maxStallAttempts: number,
+): boolean {
+  if (isNearEnd && emptyAttempts >= maxEmptyAttempts) return true;
+  if (emptyAttempts >= maxStallAttempts) return true;
+  return false;
 }
 
 export interface PlayerEvents {
@@ -138,6 +165,11 @@ export class AudioPlayer extends EventEmitter {
   private currentTempDir: string | null = null;
   private emptyFrameAttempts = 0;
   private static readonly MAX_EMPTY_ATTEMPTS = 250; // ~5秒的20ms帧循环（增加容错）
+  // Far-from-end stall watchdog (#89): if FFmpeg is alive but produces no audio
+  // for this many consecutive frame ticks (~60s at 20ms/frame), treat the stream
+  // as dead and advance instead of staying silent forever. Set high so a normal
+  // transient underrun never trips it.
+  private static readonly MAX_STALL_ATTEMPTS = 3000;
   private currentSongDuration = 0; // 当前歌曲总时长（秒）
 
   constructor(logger: Logger) {
@@ -436,16 +468,27 @@ export class AudioPlayer extends EventEmitter {
       if (this.ffmpeg !== null && this.pcmBuffer.length < PCM_FRAME_BYTES) {
         this.emptyFrameAttempts++;
         
-        // 只有同时满足：达到空帧阈值 + 接近结尾，才判定为播放结束
-        if (this.emptyFrameAttempts >= AudioPlayer.MAX_EMPTY_ATTEMPTS && isNearEnd) {
-          this.logger.info({ 
+        // End the track when FFmpeg has gone silent: quickly if we're near the
+        // end (normal EOF), or after a much longer stall window if we're not
+        // (a dead/expired stream — #89 — so playback recovers instead of going
+        // permanently silent).
+        if (
+          shouldEndOnStall(
+            this.emptyFrameAttempts,
+            isNearEnd,
+            AudioPlayer.MAX_EMPTY_ATTEMPTS,
+            AudioPlayer.MAX_STALL_ATTEMPTS,
+          )
+        ) {
+          this.logger.info({
             sessionId: this.sessionId,
             emptyAttempts: this.emptyFrameAttempts,
             bufferSize: this.pcmBuffer.length,
             elapsed: Math.round(elapsed),
             duration: this.currentSongDuration,
-            remaining: Math.round(this.currentSongDuration - elapsed)
-          }, "FFmpeg stopped outputting data near end, ending track");
+            remaining: Math.round(this.currentSongDuration - elapsed),
+            nearEnd: isNearEnd,
+          }, "FFmpeg stopped outputting data, ending track");
           this.frameLoopRunning = false;
           if (this.state !== "idle") {
             this.state = "idle";
