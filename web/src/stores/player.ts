@@ -202,6 +202,11 @@ export const usePlayerStore = defineStore('player', {
       this.bots = this.bots.filter((b) => b.id !== botId);
       delete this.queues[botId];
       delete this.timings[botId];
+      // If the bot we were locked to is gone, drop the scope so the UI does not
+      // stay 'locked' onto a phantom (activeBot would silently fall back to bots[0]).
+      if (this.scopedBotId === botId) {
+        this.clearScope();
+      }
     },
 
     setQueue(botId: string, queue: Song[]) {
