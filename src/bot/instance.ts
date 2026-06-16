@@ -18,7 +18,7 @@ import type { BotDatabase, ProfileConfig } from "../data/database.js";
 import type { BotConfig } from "../data/config.js";
 import { BotProfileManager } from "./profile.js";
 import type { AvatarStore } from "../data/avatars.js";
-import { decideOccupancyAction } from "./auto-pause.js";
+import { decideOccupancyAction, occupancyFromClientList } from "./auto-pause.js";
 
 export interface BotInstanceOptions {
   id: string;
@@ -175,7 +175,11 @@ export class BotInstance extends EventEmitter {
     if (!this.connected) return;
     try {
       const clients = await this.tsClient.getClientsInChannel();
-      this.handleOccupancy(clients.length - 1);
+      // A 0-length result means the clientlist query failed (the bot is always
+      // in its own channel) — occupancy is unknown, so don't act. Acting on it
+      // would mis-read it as "empty" and falsely auto-pause / idle-disconnect.
+      const userCount = occupancyFromClientList(clients.length);
+      if (userCount !== null) this.handleOccupancy(userCount);
     } catch {
       // ignore — the 30s poll is the fallback
     }
@@ -229,8 +233,9 @@ export class BotInstance extends EventEmitter {
       if (!this.connected) return;
       try {
         const clients = await this.tsClient.getClientsInChannel();
-        const userCount = clients.length - 1; // 排除 bot 自身
-        this.handleOccupancy(userCount);
+        // null = clientlist query failed (occupancy unknown) → don't act.
+        const userCount = occupancyFromClientList(clients.length);
+        if (userCount !== null) this.handleOccupancy(userCount);
       } catch { /* ignore */ }
       setTimeout(poll, 30_000);
     };

@@ -36,7 +36,10 @@ export function getDefaultConfig(): BotConfig {
     adminPassword: "",
     adminGroups: [],
     autoReturnDelay: 300,
-    autoPauseOnEmpty: true,
+    // Default OFF: occupancy detection relies on the full-client `clientlist`
+    // command, which is unreliable on some servers (it can time out when other
+    // clients are present). Users can opt in from the web UI.
+    autoPauseOnEmpty: false,
     idleTimeoutMinutes: 0,
     publicUrl: "",
     trustProxy: false,

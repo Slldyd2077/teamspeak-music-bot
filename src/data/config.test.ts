@@ -49,7 +49,8 @@ describe("config", () => {
     // defaults should fill in the rest
     expect(loaded.theme).toBe("dark");
     expect(loaded.commandPrefix).toBe("!");
-    expect(loaded.autoPauseOnEmpty).toBe(true);
+    // auto-pause defaults OFF (occupancy detection is unreliable on some servers)
+    expect(loaded.autoPauseOnEmpty).toBe(false);
   });
 
   // --- #86: config.json must live under (and be created in) the persisted data dir ---
