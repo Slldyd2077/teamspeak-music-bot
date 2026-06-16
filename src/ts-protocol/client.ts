@@ -12,6 +12,8 @@ import {
   type Identity,
   type TextMessage,
   type ClientInfo,
+  type ClientLeftViewEvent,
+  type ClientMovedEvent,
   type FileUploadInfo,
 } from "@honeybbq/teamspeak-client";
 import type { Logger } from "../logger.js";
@@ -221,6 +223,20 @@ export class TS3Client extends EventEmitter {
         { nickname: info.nickname, id: info.id },
         "Client entered"
       );
+      this.emit("clientEnter", info);
+    });
+
+    this.client.on("clientLeave", (ev: ClientLeftViewEvent) => {
+      this.logger.debug({ id: ev.id }, "Client left");
+      this.emit("clientLeave", ev);
+    });
+
+    this.client.on("clientMoved", (ev: ClientMovedEvent) => {
+      this.logger.debug(
+        { id: ev.id, targetChannelID: ev.targetChannelID.toString() },
+        "Client moved"
+      );
+      this.emit("clientMoved", ev);
     });
 
     await this.client.connect();
