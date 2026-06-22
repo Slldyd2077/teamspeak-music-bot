@@ -23,6 +23,7 @@ export interface BotInstance {
   serverPort: number;
   nickname: string;
   defaultChannel: string;
+  channelId: string;
   channelPassword: string;
   autoStart: boolean;
   /** "ts3" | "ts6" | "" (empty = auto-detect) */
@@ -96,6 +97,9 @@ function migrateSchema(db: Database.Database): void {
   if (!names.includes("serverPassword")) {
     db.exec("ALTER TABLE bot_instances ADD COLUMN serverPassword TEXT NOT NULL DEFAULT ''");
   }
+  if (!names.includes("channelId")) {
+    db.exec("ALTER TABLE bot_instances ADD COLUMN channelId TEXT NOT NULL DEFAULT ''");
+  }
   // Profile feature flags
   const profileCols = [
     "profile_avatar_enabled",
@@ -142,6 +146,7 @@ function initTables(db: Database.Database): void {
       serverPort INTEGER NOT NULL,
       nickname TEXT NOT NULL,
       defaultChannel TEXT NOT NULL,
+      channelId TEXT NOT NULL DEFAULT '',
       channelPassword TEXT NOT NULL,
       autoStart INTEGER NOT NULL DEFAULT 0,
       serverProtocol TEXT NOT NULL DEFAULT '',
@@ -254,14 +259,15 @@ export function createDatabase(dbPath: string): BotDatabase {
   `);
 
   const upsertInstance = db.prepare(`
-    INSERT INTO bot_instances (id, name, serverAddress, serverPort, nickname, defaultChannel, channelPassword, autoStart, serverProtocol, ts6ApiKey, serverPassword, identity)
-    VALUES (@id, @name, @serverAddress, @serverPort, @nickname, @defaultChannel, @channelPassword, @autoStart, @serverProtocol, @ts6ApiKey, @serverPassword, @identity)
+    INSERT INTO bot_instances (id, name, serverAddress, serverPort, nickname, defaultChannel, channelId, channelPassword, autoStart, serverProtocol, ts6ApiKey, serverPassword, identity)
+    VALUES (@id, @name, @serverAddress, @serverPort, @nickname, @defaultChannel, @channelId, @channelPassword, @autoStart, @serverProtocol, @ts6ApiKey, @serverPassword, @identity)
     ON CONFLICT(id) DO UPDATE SET
       name = excluded.name,
       serverAddress = excluded.serverAddress,
       serverPort = excluded.serverPort,
       nickname = excluded.nickname,
       defaultChannel = excluded.defaultChannel,
+      channelId = excluded.channelId,
       channelPassword = excluded.channelPassword,
       autoStart = excluded.autoStart,
       serverProtocol = excluded.serverProtocol,
@@ -342,6 +348,7 @@ export function createDatabase(dbPath: string): BotDatabase {
         serverProtocol: r.serverProtocol ?? "",
         ts6ApiKey: r.ts6ApiKey ?? "",
         serverPassword: r.serverPassword ?? "",
+        channelId: r.channelId ?? "",
         identity: r.identity ?? undefined,
       }));
     },

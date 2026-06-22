@@ -46,8 +46,12 @@
         <input v-model="nickname" placeholder="MusicBot" class="input" />
       </div>
       <div class="form-group">
-        <label>默认频道 (可选)</label>
-        <input v-model="defaultChannel" placeholder="音乐频道" class="input" />
+        <label>默认频道名称（可选）</label>
+        <input v-model="defaultChannel" :disabled="!!channelId" placeholder="音乐频道" class="input" :class="{ disabled: !!channelId }" />
+      </div>
+      <div class="form-group">
+        <label>默认频道ID（可选）</label>
+        <input v-model="channelId" :disabled="!!defaultChannel" placeholder="如 1234" class="input" :class="{ disabled: !!defaultChannel }" />
       </div>
       <div class="btn-row">
         <button class="btn-secondary" @click="currentStep = 0">上一步</button>
@@ -87,6 +91,7 @@ const serverAddress = ref('');
 const serverPort = ref(9987);
 const nickname = ref('MusicBot');
 const defaultChannel = ref('');
+const channelId = ref('');
 
 async function createBotAndNext() {
   try {
@@ -96,6 +101,7 @@ async function createBotAndNext() {
       serverPort: serverPort.value,
       nickname: nickname.value,
       defaultChannel: defaultChannel.value,
+      channelId: channelId.value || undefined,
       autoStart: true,
     });
     currentStep.value = 2;
@@ -192,6 +198,10 @@ async function createBotAndNext() {
 
   &:focus {
     border-color: var(--color-primary);
+  }
+  &.disabled {
+    opacity: 0.4;
+    cursor: not-allowed;
   }
 }
 
