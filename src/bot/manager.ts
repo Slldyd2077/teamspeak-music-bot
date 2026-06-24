@@ -57,6 +57,7 @@ export interface CreateBotParams {
   queryPort?: number;
   nickname: string;
   defaultChannel?: string;
+  channelId?: string;
   channelPassword?: string;
   autoStart?: boolean;
   /** Force TS3 or TS6 protocol; omit or "unknown" for auto-detect. */
@@ -113,6 +114,7 @@ export class BotManager extends EventEmitter {
         queryPort: params.queryPort ?? 10011,
         nickname: params.nickname,
         defaultChannel: params.defaultChannel,
+        channelId: params.channelId,
         channelPassword: params.channelPassword,
         serverPassword: params.serverPassword,
         serverProtocol: params.serverProtocol,
@@ -138,6 +140,7 @@ export class BotManager extends EventEmitter {
       serverPort: params.serverPort,
       nickname: params.nickname,
       defaultChannel: params.defaultChannel ?? "",
+      channelId: params.channelId ?? "",
       channelPassword: params.channelPassword ?? "",
       autoStart: params.autoStart ?? false,
       serverProtocol: params.serverProtocol ?? "",
@@ -173,6 +176,7 @@ export class BotManager extends EventEmitter {
       serverPort: params.serverPort ?? existing.serverPort,
       nickname: params.nickname ?? existing.nickname,
       defaultChannel: params.defaultChannel ?? existing.defaultChannel,
+      channelId: params.channelId ?? existing.channelId,
       channelPassword: params.channelPassword ?? existing.channelPassword,
       serverProtocol: params.serverProtocol ?? existing.serverProtocol,
       ts6ApiKey: params.ts6ApiKey ?? existing.ts6ApiKey,
@@ -231,6 +235,7 @@ export class BotManager extends EventEmitter {
           // each connect and strips all previously granted groups.
           identity: saved.identity || undefined,
           defaultChannel: saved.defaultChannel || undefined,
+          channelId: saved.channelId || undefined,
           channelPassword: saved.channelPassword || undefined,
           serverPassword: saved.serverPassword || undefined,
           serverProtocol: proto === "ts3" || proto === "ts6" ? proto : undefined,
@@ -282,6 +287,7 @@ export class BotManager extends EventEmitter {
           nickname: saved.nickname,
           identity: saved.identity || undefined,
           defaultChannel: saved.defaultChannel || undefined,
+          channelId: saved.channelId || undefined,
           channelPassword: saved.channelPassword || undefined,
           serverPassword: saved.serverPassword || undefined,
           serverProtocol: proto === "ts3" || proto === "ts6" ? proto : undefined,

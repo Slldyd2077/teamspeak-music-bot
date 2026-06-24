@@ -98,8 +98,12 @@
             </div>
           </div>
           <div class="form-group">
-            <label>默认频道（可选）</label>
-            <input v-model="editForm.defaultChannel" class="input" placeholder="音乐频道" />
+            <label>默认频道名称（可选）</label>
+            <input v-model="editForm.defaultChannel" :disabled="!!editForm.channelId" class="input" :class="{ disabled: !!editForm.channelId }" placeholder="音乐频道" />
+          </div>
+          <div class="form-group">
+            <label>默认频道ID（可选）</label>
+            <input v-model="editForm.channelId" :disabled="!!editForm.defaultChannel" class="input" :class="{ disabled: !!editForm.defaultChannel }" placeholder="如 12" />
           </div>
           <div class="form-group">
             <label>频道密码（可选）</label>
@@ -142,8 +146,12 @@
           <input v-model="newBotNickname" class="input" placeholder="MusicBot" />
         </div>
         <div class="form-group">
-          <label>默认频道（可选）</label>
-          <input v-model="newBotChannel" class="input" placeholder="音乐频道" />
+          <label>默认频道名称（可选）</label>
+          <input v-model="newBotChannel" :disabled="!!newBotChannelId" class="input" :class="{ disabled: !!newBotChannelId }" placeholder="音乐频道" />
+        </div>
+        <div class="form-group">
+          <label>默认频道ID（可选）</label>
+          <input v-model="newBotChannelId" :disabled="!!newBotChannel" class="input" :class="{ disabled: !!newBotChannel }" placeholder="如 12" />
         </div>
         <div class="form-group">
           <label>服务器密码（可选）</label>
@@ -408,7 +416,7 @@
         </div>
       </div>
     </section>
-    
+
     <!-- Idle Timeout -->
     <section v-if="can('bot.manage')" class="settings-section">
       <h2 class="section-title">行为设置</h2>
@@ -685,6 +693,7 @@ const newBotServer = ref('');
 const newBotPort = ref(9987);
 const newBotNickname = ref('MusicBot');
 const newBotChannel = ref('');
+const newBotChannelId = ref('');
 const newBotServerPassword = ref('');
 const newBotAvatar = ref<string | null>(null);
 
@@ -696,6 +705,7 @@ const editForm = reactive({
   serverPort: 9987,
   nickname: '',
   defaultChannel: '',
+  channelId: '',
   channelPassword: '',
   serverPassword: '',
 });
@@ -853,6 +863,7 @@ async function createBot() {
       serverPort: newBotPort.value || 9987,
       nickname: newBotNickname.value || newBotName.value,
       defaultChannel: newBotChannel.value || undefined,
+      channelId: newBotChannelId.value || undefined,
       serverPassword: newBotServerPassword.value || undefined,
       autoStart: false,
     });
@@ -868,6 +879,7 @@ async function createBot() {
     newBotPort.value = 9987;
     newBotNickname.value = 'MusicBot';
     newBotChannel.value = '';
+    newBotChannelId.value = '';
     newBotServerPassword.value = '';
     newBotAvatar.value = null;
     await store.fetchBots();
@@ -901,6 +913,7 @@ async function openEditBot(bot: any) {
     editForm.serverPort = res.data.serverPort ?? 9987;
     editForm.nickname = res.data.nickname ?? '';
     editForm.defaultChannel = res.data.defaultChannel ?? '';
+    editForm.channelId = res.data.channelId ?? '';
     editForm.channelPassword = res.data.channelPassword ?? '';
     editForm.serverPassword = res.data.serverPassword ?? '';
   } catch {
@@ -909,6 +922,7 @@ async function openEditBot(bot: any) {
     editForm.serverPort = 9987;
     editForm.nickname = bot.name;
     editForm.defaultChannel = '';
+    editForm.channelId = '';
     editForm.channelPassword = '';
     editForm.serverPassword = '';
   }
@@ -1635,6 +1649,10 @@ onUnmounted(() => {
   font-size: 13px;
   outline: none;
   &:focus { border-color: var(--color-primary); }
+  &.disabled {
+    opacity: 0.4;
+    cursor: not-allowed;
+  }
 }
 
 .input-sm { max-width: 80px; }
