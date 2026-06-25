@@ -3,13 +3,15 @@ import { ref, computed, readonly } from "vue";
 interface User {
   id: string;
   username: string;
-  role: 'admin' | 'member';
+  role: 'admin' | 'member' | 'guest';
   capabilities?: string[];
   bots?: "all" | string[];
+  guest?: Record<string, boolean> | null;
 }
 
 const currentUser = ref<User | null>(null);
 const needsSetup = ref<boolean | null>(null); // null = unknown / not fetched yet
+const guestAllowed = ref(false);
 const ready = ref(false);
 
 let pollTimer: ReturnType<typeof setInterval> | null = null;
@@ -37,6 +39,7 @@ async function refreshNeedsSetup(): Promise<void> {
   if (res.ok) {
     const body = await res.json();
     needsSetup.value = Boolean(body.needsSetup);
+    guestAllowed.value = Boolean(body.guestAllowed);
   }
 }
 
@@ -76,6 +79,16 @@ async function login(username: string, password: string): Promise<void> {
   await refreshMe();
 }
 
+async function continueAsGuest(): Promise<void> {
+  const res = await fetch("/api/session/guest", { method: "POST", credentials: "same-origin" });
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({}));
+    throw new Error(body.error ?? `guest entry failed (${res.status})`);
+  }
+  currentUser.value = (await res.json()) as User;
+  await refreshMe(); // authoritative role + guest flags + bots
+}
+
 async function setup(username: string, password: string): Promise<void> {
   const res = await fetch("/api/session/setup", {
     method: "POST",
@@ -104,6 +117,11 @@ function can(cap: string): boolean {
   return !!u && (u.role === "admin" || (u.capabilities ?? []).includes(cap));
 }
 
+function guestCan(flag: string): boolean {
+  const u = currentUser.value;
+  return !!u && u.role === "guest" && !!u.guest && u.guest[flag] === true;
+}
+
 function canControlBot(botId: string): boolean {
   const u = currentUser.value;
   if (!u) return false;
@@ -115,14 +133,18 @@ export function useSession() {
   return {
     currentUser: readonly(currentUser),
     needsSetup: readonly(needsSetup),
+    guestAllowed: readonly(guestAllowed),
     isAuthenticated: computed(() => currentUser.value !== null),
     isAdmin: computed(() => currentUser.value?.role === 'admin'),
+    isGuest: computed(() => currentUser.value?.role === 'guest'),
     ready: readonly(ready),
     refresh,
     login,
     logout,
     setup,
+    continueAsGuest,
     can,
+    guestCan,
     canControlBot,
   };
 }
