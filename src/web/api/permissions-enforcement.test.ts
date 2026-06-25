@@ -235,3 +235,129 @@ describe("permission enforcement on action routes", () => {
     });
   });
 });
+
+// --------------------------------------------------------------------------
+// Guest enforcement on the player routes. Guests carry per-flag permissions
+// (req.user.guest) instead of capabilities; authorize() opens a route only
+// when its guestFlag is set AND enabled. Routes with no guestFlag are denied
+// to guests no matter which flags are on. We reuse makeApp() (it injects
+// req.user and mounts the real player router over the fake bot manager) and
+// assert purely on 403-vs-not-403 — a 200/500 from the fake bot both prove
+// the gate let the request through.
+// --------------------------------------------------------------------------
+
+const SONG = { id: "1", platform: "netease", name: "x", artist: "y" };
+
+// Build a guest user with all flags off, then override the ones passed in.
+const guest = (perms: Partial<Record<string, boolean>> = {}) => ({
+  id: "__guest__",
+  username: "游客",
+  role: "guest" as const,
+  capabilities: new Set<string>(),
+  bots: "all" as const,
+  guest: {
+    addToQueue: false,
+    playNext: false,
+    playNow: false,
+    skip: false,
+    transport: false,
+    removeClear: false,
+    playMode: false,
+    ...perms,
+  },
+});
+
+const mountGuest = (perms: Partial<Record<string, boolean>> = {}) => makeApp(guest(perms));
+
+describe("guest enforcement on player routes", () => {
+  it("addToQueue flag gates POST /add, /add-song, /add-by-id", async () => {
+    const allow = mountGuest({ addToQueue: true });
+    const deny = mountGuest({ addToQueue: false });
+    for (const path of ["add", "add-song", "add-by-id"]) {
+      expect((await request(allow).post(`/api/player/${ALLOWED_BOT}/${path}`).send({ song: SONG, songId: "1", query: "x" })).status).not.toBe(403);
+      expect((await request(deny).post(`/api/player/${ALLOWED_BOT}/${path}`).send({ song: SONG, songId: "1", query: "x" })).status).toBe(403);
+    }
+  });
+
+  it("playNext flag gates /play-next-song", async () => {
+    expect((await request(mountGuest({ playNext: true })).post(`/api/player/${ALLOWED_BOT}/play-next-song`).send({ song: SONG })).status).not.toBe(403);
+    expect((await request(mountGuest({})).post(`/api/player/${ALLOWED_BOT}/play-next-song`).send({ song: SONG })).status).toBe(403);
+  });
+
+  it("playNow flag gates the new /play-now-song", async () => {
+    expect((await request(mountGuest({ playNow: true })).post(`/api/player/${ALLOWED_BOT}/play-now-song`).send({ song: SONG })).status).not.toBe(403);
+    expect((await request(mountGuest({})).post(`/api/player/${ALLOWED_BOT}/play-now-song`).send({ song: SONG })).status).toBe(403);
+    // playNext does NOT open play-now-song, and playNow does NOT open play-next-song.
+    expect((await request(mountGuest({ playNext: true })).post(`/api/player/${ALLOWED_BOT}/play-now-song`).send({ song: SONG })).status).toBe(403);
+    expect((await request(mountGuest({ playNow: true })).post(`/api/player/${ALLOWED_BOT}/play-next-song`).send({ song: SONG })).status).toBe(403);
+  });
+
+  it("skip flag gates /next", async () => {
+    expect((await request(mountGuest({ skip: true })).post(`/api/player/${ALLOWED_BOT}/next`)).status).not.toBe(403);
+    expect((await request(mountGuest({})).post(`/api/player/${ALLOWED_BOT}/next`)).status).toBe(403);
+  });
+
+  it("transport flag gates /pause, /resume, /seek, /volume", async () => {
+    const allow = mountGuest({ transport: true });
+    const deny = mountGuest({ transport: false });
+    expect((await request(allow).post(`/api/player/${ALLOWED_BOT}/pause`)).status).not.toBe(403);
+    expect((await request(allow).post(`/api/player/${ALLOWED_BOT}/resume`)).status).not.toBe(403);
+    expect((await request(allow).post(`/api/player/${ALLOWED_BOT}/seek`).send({ position: 0 })).status).not.toBe(403);
+    expect((await request(allow).post(`/api/player/${ALLOWED_BOT}/volume`).send({ volume: 50 })).status).not.toBe(403);
+    expect((await request(deny).post(`/api/player/${ALLOWED_BOT}/pause`)).status).toBe(403);
+    expect((await request(deny).post(`/api/player/${ALLOWED_BOT}/resume`)).status).toBe(403);
+    expect((await request(deny).post(`/api/player/${ALLOWED_BOT}/seek`).send({ position: 0 })).status).toBe(403);
+    expect((await request(deny).post(`/api/player/${ALLOWED_BOT}/volume`).send({ volume: 50 })).status).toBe(403);
+  });
+
+  it("playMode flag gates /mode, /fm", async () => {
+    const allow = mountGuest({ playMode: true });
+    const deny = mountGuest({ playMode: false });
+    expect((await request(allow).post(`/api/player/${ALLOWED_BOT}/mode`).send({ mode: "seq" })).status).not.toBe(403);
+    expect((await request(allow).post(`/api/player/${ALLOWED_BOT}/fm`).send({})).status).not.toBe(403);
+    expect((await request(deny).post(`/api/player/${ALLOWED_BOT}/mode`).send({ mode: "seq" })).status).toBe(403);
+    expect((await request(deny).post(`/api/player/${ALLOWED_BOT}/fm`).send({})).status).toBe(403);
+  });
+
+  it("removeClear flag gates /clear and DELETE /queue/:index", async () => {
+    const allow = mountGuest({ removeClear: true });
+    const deny = mountGuest({ removeClear: false });
+    expect((await request(allow).post(`/api/player/${ALLOWED_BOT}/clear`)).status).not.toBe(403);
+    expect((await request(allow).delete(`/api/player/${ALLOWED_BOT}/queue/0`)).status).not.toBe(403);
+    expect((await request(deny).post(`/api/player/${ALLOWED_BOT}/clear`)).status).toBe(403);
+    expect((await request(deny).delete(`/api/player/${ALLOWED_BOT}/queue/0`)).status).toBe(403);
+  });
+
+  it("each guest flag opens exactly its own route(s) — a single flag does not leak", async () => {
+    // With only addToQueue on, a transport route stays denied.
+    expect((await request(mountGuest({ addToQueue: true })).post(`/api/player/${ALLOWED_BOT}/pause`)).status).toBe(403);
+    // With only transport on, an add route stays denied.
+    expect((await request(mountGuest({ transport: true })).post(`/api/player/${ALLOWED_BOT}/add-song`).send({ song: SONG })).status).toBe(403);
+  });
+
+  it("guests are always denied /play, /prev, /stop, /play-song, /play-at, /play-playlist, /play-album, /playlist, /profile even with ALL flags on", async () => {
+    const all = mountGuest({
+      addToQueue: true,
+      playNext: true,
+      playNow: true,
+      skip: true,
+      transport: true,
+      removeClear: true,
+      playMode: true,
+    });
+    expect((await request(all).post(`/api/player/${ALLOWED_BOT}/play`).send({ query: "x" })).status).toBe(403);
+    expect((await request(all).post(`/api/player/${ALLOWED_BOT}/prev`)).status).toBe(403);
+    expect((await request(all).post(`/api/player/${ALLOWED_BOT}/stop`)).status).toBe(403);
+    expect((await request(all).post(`/api/player/${ALLOWED_BOT}/play-song`).send({ song: SONG })).status).toBe(403);
+    expect((await request(all).post(`/api/player/${ALLOWED_BOT}/play-at`).send({ index: 0 })).status).toBe(403);
+    expect((await request(all).post(`/api/player/${ALLOWED_BOT}/play-playlist`).send({ playlistId: "1" })).status).toBe(403);
+    expect((await request(all).post(`/api/player/${ALLOWED_BOT}/play-album`).send({ albumId: "1" })).status).toBe(403);
+    expect((await request(all).post(`/api/player/${ALLOWED_BOT}/playlist`).send({ playlistId: "1" })).status).toBe(403);
+    expect((await request(all).put(`/api/player/${ALLOWED_BOT}/profile`).send({})).status).toBe(403);
+  });
+
+  it("members are unaffected — player.queue still reaches /add-song", async () => {
+    const m = makeApp(member(["player.queue"], [ALLOWED_BOT]));
+    expect((await request(m).post(`/api/player/${ALLOWED_BOT}/add-song`).send({ song: SONG })).status).not.toBe(403);
+  });
+});
