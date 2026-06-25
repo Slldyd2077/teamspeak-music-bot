@@ -141,7 +141,16 @@ export function createSessionRouter(
       res.status(403).json({ error: "guest mode disabled" });
       return;
     }
-    const { token } = sessions.createSession(GUEST_USER_ID, { ttlMs: GUEST_SESSION_TTL_MS, skipCap: true });
+    let token: string;
+    try {
+      // If the reserved guest row is somehow missing, the session FK would
+      // throw; surface a clean 503 rather than letting it become a 500.
+      ({ token } = sessions.createSession(GUEST_USER_ID, { ttlMs: GUEST_SESSION_TTL_MS, skipCap: true }));
+    } catch (err) {
+      logger.error({ err }, "guest session creation failed");
+      res.status(503).json({ error: "guest unavailable" });
+      return;
+    }
     setSessionCookie(res, token);
     res.json({ id: GUEST_USER_ID, username: GUEST_USERNAME, role: "guest" });
   });

@@ -1,7 +1,7 @@
 import { Router } from "express";
 import type { Logger } from "../../logger.js";
 import type { UserStore } from "../../data/users.js";
-import { UsernameTakenError } from "../../data/users.js";
+import { UsernameTakenError, GUEST_USER_ID } from "../../data/users.js";
 import type { SessionStore } from "../../data/sessions.js";
 import type { AuditStore } from "../../data/audit.js";
 import { isCapability, BASIC_TIER_CAPABILITIES, type PermissionStore } from "../../data/permissions.js";
@@ -63,6 +63,7 @@ export function createUsersRouter(
 
   router.delete("/:id", (req, res) => {
     const targetId = req.params.id;
+    if (targetId === GUEST_USER_ID) { res.status(404).json({ error: "not found" }); return; }
     // Snapshot target's username BEFORE deletion for audit
     const target = users.findById(targetId);
     if (!target) {
@@ -104,6 +105,7 @@ export function createUsersRouter(
       return;
     }
     const targetId = req.params.id;
+    if (targetId === GUEST_USER_ID) { res.status(404).json({ error: "not found" }); return; }
     const target = users.findById(targetId);
     if (!target) {
       res.status(404).json({ error: "not found" });
@@ -130,6 +132,7 @@ export function createUsersRouter(
 
   router.patch("/:id/role", (req, res) => {
     const targetId = req.params.id;
+    if (targetId === GUEST_USER_ID) { res.status(404).json({ error: "not found" }); return; }
     const { role: newRole } = req.body ?? {};
     if (newRole !== "admin" && newRole !== "member") {
       res.status(400).json({ error: "invalid role" });
@@ -168,6 +171,7 @@ export function createUsersRouter(
   });
 
   router.get("/:id/permissions", (req, res) => {
+    if (req.params.id === GUEST_USER_ID) { res.status(404).json({ error: "not found" }); return; }
     const user = users.findById(req.params.id);
     if (!user) {
       res.status(404).json({ error: "not_found" });
@@ -180,6 +184,7 @@ export function createUsersRouter(
   });
 
   router.put("/:id/permissions", (req, res) => {
+    if (req.params.id === GUEST_USER_ID) { res.status(404).json({ error: "not found" }); return; }
     const user = users.findById(req.params.id);
     if (!user) {
       res.status(404).json({ error: "not_found" });

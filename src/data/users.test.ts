@@ -208,4 +208,19 @@ describe("guest row exclusion", () => {
     expect(users.countUsers()).toBe(1); // alice only
     expect(users.listUsers().some((u) => u.id === GUEST_USER_ID)).toBe(false);
   });
+
+  it("setRoleIfNotLastAdmin refuses to re-role the reserved guest principal", () => {
+    // The guest row is seeded by createDatabase via ensureGuestUser.
+    expect(users.findById(GUEST_USER_ID)!.role).toBe("guest"); // sanity
+    expect(users.setRoleIfNotLastAdmin(GUEST_USER_ID, "admin")).toBe("not_found");
+    // The guest row's role is unchanged.
+    expect(users.findById(GUEST_USER_ID)!.role).toBe("guest");
+  });
+
+  it("deleteUserIfNotLastAdmin refuses to delete the reserved guest principal", () => {
+    expect(users.findById(GUEST_USER_ID)).not.toBeNull(); // sanity
+    expect(users.deleteUserIfNotLastAdmin(GUEST_USER_ID)).toBe("not_found");
+    // The guest row still exists.
+    expect(users.findById(GUEST_USER_ID)).not.toBeNull();
+  });
 });

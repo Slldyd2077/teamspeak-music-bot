@@ -137,6 +137,7 @@ export function createUserStore(db: Database.Database): UserStore {
       const tx = db.transaction(() => {
         const row = findByIdStmt.get(id) as UserRow | undefined;
         if (!row) return "not_found" as const;
+        if (row.role === "guest") return "not_found" as const; // reserved synthetic principal
         if (row.role === newRole) return "ok" as const; // no-op
         if (row.role === "admin" && newRole === "member") {
           const adminCount = (countAdminsStmt.get() as { n: number }).n;
@@ -161,6 +162,7 @@ export function createUserStore(db: Database.Database): UserStore {
       const tx = db.transaction(() => {
         const row = findByIdStmt.get(id) as UserRow | undefined;
         if (!row) return "not_found" as const;
+        if (row.role === "guest") return "not_found" as const; // reserved synthetic principal
         if (row.role === "admin") {
           const adminCount = (countAdminsStmt.get() as { n: number }).n;
           if (adminCount <= 1) return "would_orphan" as const;
