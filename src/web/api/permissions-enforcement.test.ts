@@ -6,6 +6,8 @@ import { createPlayerRouter } from "./player.js";
 import { createBotRouter } from "./bot.js";
 import { createAuthRouter } from "./auth.js";
 import { createMusicRouter } from "./music.js";
+import { createFavoritesRouter } from "./favorites.js";
+import { requireNotGuest } from "../middleware/requireNotGuest.js";
 
 const logger = pino({ level: "silent" });
 
@@ -204,7 +206,7 @@ describe("permission enforcement on action routes", () => {
       expect(res.status).not.toBe(403);
     });
 
-    it("GET /api/music/quality not gated", async () => {
+    it("GET /api/music/quality readable by members, denied to guests", async () => {
       const app = makeApp(member([], "all"));
       const res = await request(app).get("/api/music/quality");
       expect(res.status).not.toBe(403);
@@ -214,6 +216,12 @@ describe("permission enforcement on action routes", () => {
       const app = makeApp(member([], "all"));
       const res = await request(app).get("/api/bot");
       expect(res.status).not.toBe(403);
+    });
+
+    it("GET /api/auth/status and /api/auth/qrcode/status are 403 for guests", async () => {
+      const app = makeApp(guest());
+      expect((await request(app).get("/api/auth/status")).status).toBe(403);
+      expect((await request(app).get("/api/auth/qrcode/status?key=k")).status).toBe(403);
     });
   });
 
@@ -366,5 +374,50 @@ describe("guest enforcement on player routes", () => {
   it("members are unaffected — player.queue still reaches /add-song", async () => {
     const m = makeApp(member(["player.queue"], [ALLOWED_BOT]));
     expect((await request(m).post(`/api/player/${ALLOWED_BOT}/add-song`).send({ song: SONG })).status).not.toBe(403);
+  });
+});
+
+// --------------------------------------------------------------------------
+// Favorites are member-only: the router keys everything off req.user.id and
+// all guests share the __guest__ principal, so a guest must never reach it.
+// server.ts gates the mount with requireNotGuest; we mirror that mount here
+// and assert a guest gets 403 (the requireNotGuest guard runs before any
+// handler, so the fake database is never touched).
+// --------------------------------------------------------------------------
+
+function makeFavoritesApp(user: any) {
+  const app = express();
+  app.use(express.json());
+  app.use((req, _res, next) => { (req as any).user = user; next(); });
+  const fakeDb = {
+    getFavorites: () => [],
+    addFavorite: () => {},
+    removeFavorite: () => {},
+    isFavorited: () => false,
+  } as any;
+  app.use("/api/favorites", requireNotGuest, createFavoritesRouter(fakeDb, logger));
+  return app;
+}
+
+describe("favorites are denied to guests", () => {
+  it("403 for a guest on GET /api/favorites", async () => {
+    const app = makeFavoritesApp(guest());
+    expect((await request(app).get("/api/favorites")).status).toBe(403);
+  });
+
+  it("403 for a guest on GET /api/favorites/check", async () => {
+    const app = makeFavoritesApp(guest());
+    expect((await request(app).get("/api/favorites/check?platform=netease&playlistId=x")).status).toBe(403);
+  });
+
+  it("403 for a guest on POST /api/favorites", async () => {
+    const app = makeFavoritesApp(guest());
+    const res = await request(app).post("/api/favorites").send({ platform: "netease", playlistId: "x", name: "n" });
+    expect(res.status).toBe(403);
+  });
+
+  it("NOT 403 for a member on GET /api/favorites", async () => {
+    const app = makeFavoritesApp(member([], "all"));
+    expect((await request(app).get("/api/favorites")).status).not.toBe(403);
   });
 });

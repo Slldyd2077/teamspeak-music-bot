@@ -25,6 +25,7 @@ import { createSessionStore } from "../data/sessions.js";
 import { createPermissionStore } from "../data/permissions.js";
 import { createRequireAuth } from "./middleware/requireAuth.js";
 import { requireAdmin } from "./middleware/requireAdmin.js";
+import { requireNotGuest } from "./middleware/requireNotGuest.js";
 import { csrfOriginCheck } from "./middleware/csrf.js";
 import { createRateLimit } from "./middleware/rateLimit.js";
 import { validateSessionFromHeaders } from "./auth/validateSession.js";
@@ -126,7 +127,7 @@ export function createWebServer(options: WebServerOptions): WebServer {
     "/api/auth",
     createAuthRouter(options.neteaseProvider, options.qqProvider, options.bilibiliProvider, logger, options.cookieStore)
   );
-  app.use("/api/favorites", createFavoritesRouter(options.database, logger));
+  app.use("/api/favorites", requireNotGuest, createFavoritesRouter(options.database, logger));
 
   // admin-only routes
   app.use("/api/users", requireAdmin, createUsersRouter(users, sessions, audit, logger, permissions));

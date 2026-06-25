@@ -3,7 +3,7 @@
     <Queue :open="showQueue" @close="showQueue = false" />
 
     <div class="player-bar frosted-glass">
-      <!-- Progress bar (read-only display; seek interaction gated on player.control) -->
+      <!-- Progress bar (read-only display; seek interaction gated on transport / canTransport) -->
       <div
         class="progress-bar-container"
         :class="{ 'no-seek': !canTransport }"
@@ -147,7 +147,7 @@ function updateProgress() {
 }
 
 async function onProgressClick(e: MouseEvent) {
-  if (!canTransport.value) return; // seek requires player.control
+  if (!canTransport.value) return; // seek gated on transport (canTransport)
   const bar = progressBarRef.value;
   if (!bar) return;
   const rect = bar.getBoundingClientRect();

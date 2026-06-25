@@ -73,6 +73,7 @@ async function enterAsGuest() {
 .auth-page {
   min-height: 100vh;
   display: flex;
+  flex-direction: column;
   align-items: center;
   justify-content: center;
   background: var(--bg-primary);
@@ -100,7 +101,7 @@ async function enterAsGuest() {
 .auth-card button:disabled { opacity: 0.6; cursor: progress; }
 .auth-error { color: #e26a6a; font-size: 13px; margin: 0; }
 .guest-btn {
-  height: 38px; margin-top: 4px; border-radius: var(--radius-sm);
+  width: 360px; height: 38px; margin-top: 4px; border-radius: var(--radius-sm);
   background: transparent; color: var(--text-secondary);
   border: 1px solid var(--border-color); cursor: pointer;
 }

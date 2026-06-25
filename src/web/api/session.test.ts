@@ -236,4 +236,37 @@ describe("session router — guest mode", () => {
     const res = await request(app).get("/api/session/needs-setup");
     expect(res.body.guestAllowed).toBe(true);
   });
+
+  it("GET /me returns 401 for a guest session once guest mode is disabled", async () => {
+    // Build an app whose guest config can be toggled at runtime, mirroring an
+    // admin flipping the setting mid-session (requireAuthInline must reject).
+    botDb = createDatabase(":memory:");
+    const users = createUserStore(botDb.db);
+    const sessions = createSessionStore(botDb.db);
+    const audit = createAuditStore(botDb.db);
+    const permissions = createPermissionStore(botDb.db);
+    const guestCfg: GuestModeConfig = {
+      enabled: true,
+      bots: getDefaultConfig().guestMode.bots,
+      permissions: getDefaultConfig().guestMode.permissions,
+    };
+    const app = express();
+    app.use(express.json());
+    app.use(cookieParser());
+    app.use(
+      "/api/session",
+      createSessionRouter(users, sessions, audit, pino({ level: "silent" }), permissions, () => guestCfg)
+    );
+
+    const login = await request(app).post("/api/session/guest");
+    expect(login.status).toBe(200);
+    const cookie = login.headers["set-cookie"];
+
+    // While enabled, /me works for the guest.
+    expect((await request(app).get("/api/session/me").set("Cookie", cookie)).status).toBe(200);
+
+    // Admin disables guest mode → the in-flight guest session is now invalid.
+    guestCfg.enabled = false;
+    expect((await request(app).get("/api/session/me").set("Cookie", cookie)).status).toBe(401);
+  });
 });

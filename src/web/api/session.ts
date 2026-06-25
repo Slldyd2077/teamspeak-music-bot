@@ -65,6 +65,13 @@ export function createSessionRouter(
       res.status(401).json({ error: "unauthenticated" });
       return;
     }
+    // A guest session is only valid while guest mode is enabled. Disabling it
+    // immediately invalidates any in-flight guest sessions (mirrors createRequireAuth).
+    if (result.role === "guest" && !getGuestConfig().enabled) {
+      clearSessionCookie(res);
+      res.status(401).json({ error: "unauthenticated" });
+      return;
+    }
     req.user = { id: result.userId, username: result.username, role: result.role };
     const token = extractSessionToken(req.headers.cookie);
     if (token) setSessionCookie(res, token);
