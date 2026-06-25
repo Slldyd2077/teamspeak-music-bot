@@ -215,27 +215,34 @@ export function createPlayerRouter(
         res.status(400).json({ error: "index is required" });
         return;
       }
-      const queue = bot.getQueueManager();
-      // Validate the index BEFORE stopping current playback — otherwise an
-      // invalid index silently kills the user's current song and leaves the
-      // queue idle.
-      if (index >= queue.size()) {
-        res.status(400).json({ error: "Invalid queue index" });
+      // Serialize the index-validation + stop/reset/playAt/resolveAndPlay so a
+      // concurrent request can't interleave between mutating the queue and
+      // starting playback (audible track must match queue.currentIndex).
+      const result = await bot.runExclusive(async () => {
+        const queue = bot.getQueueManager();
+        // Validate the index BEFORE stopping current playback — otherwise an
+        // invalid index silently kills the user's current song and leaves the
+        // queue idle.
+        if (index >= queue.size()) {
+          return { status: 400 as const, body: { error: "Invalid queue index" } };
+        }
+        bot.getPlayer().stop();
+        bot.getPlayer().resetFailures();
+        const song = queue.playAt(index);
+        if (!song) {
+          return { status: 400 as const, body: { error: "Invalid queue index" } };
+        }
+        const ok = await bot.resolveAndPlay(song);
+        if (!ok) {
+          return { body: { message: `Cannot play: ${song.name}` } };
+        }
+        return { body: { message: `Now playing: ${song.name} - ${song.artist}` } };
+      });
+      if (result.status) {
+        res.status(result.status).json(result.body);
         return;
       }
-      bot.getPlayer().stop();
-      bot.getPlayer().resetFailures();
-      const song = queue.playAt(index);
-      if (!song) {
-        res.status(400).json({ error: "Invalid queue index" });
-        return;
-      }
-      const ok = await bot.resolveAndPlay(song);
-      if (!ok) {
-        res.json({ message: `Cannot play: ${song.name}` });
-        return;
-      }
-      res.json({ message: `Now playing: ${song.name} - ${song.artist}` });
+      res.json(result.body);
     } catch (err) {
       res.status(500).json({ error: (err as Error).message });
     }
@@ -453,31 +460,34 @@ export function createPlayerRouter(
         res.status(400).json({ error: "song object with id and platform is required" });
         return;
       }
-      const queue = bot.getQueueManager();
-      const wasIdle = bot.getPlayer().getState() === "idle";
-      // Capture the slot addNext WILL insert at, before mutating the queue.
-      // addNext pushes when currentIndex<0 (slot = size); otherwise splices
-      // at currentIndex+1. Using size-1 after addNext was wrong when the
-      // queue had stale currentIndex>=0 while the player was idle (e.g.,
-      // after natural track end without queue.clear()).
-      const insertedAt =
-        queue.getCurrentIndex() < 0 ? queue.size() : queue.getCurrentIndex() + 1;
-      queue.addNext(song);
+      // Serialize the queue mutation + playback so concurrent requests can't
+      // interleave (audible track must match queue.currentIndex).
+      const body = await bot.runExclusive(async () => {
+        const queue = bot.getQueueManager();
+        const wasIdle = bot.getPlayer().getState() === "idle";
+        // Capture the slot addNext WILL insert at, before mutating the queue.
+        // addNext pushes when currentIndex<0 (slot = size); otherwise splices
+        // at currentIndex+1. Using size-1 after addNext was wrong when the
+        // queue had stale currentIndex>=0 while the player was idle (e.g.,
+        // after natural track end without queue.clear()).
+        const insertedAt =
+          queue.getCurrentIndex() < 0 ? queue.size() : queue.getCurrentIndex() + 1;
+        queue.addNext(song);
 
-      if (wasIdle) {
-        // Promote the just-added song to current and start it.
-        queue.playAt(insertedAt);
-        bot.getPlayer().resetFailures();
-        const ok = await bot.resolveAndPlay(queue.current()!);
-        if (!ok) {
-          res.json({ ok: false, message: `无法播放「${song.name || song.id}」（区域/版权限制）` });
-          return;
+        if (wasIdle) {
+          // Promote the just-added song to current and start it.
+          queue.playAt(insertedAt);
+          bot.getPlayer().resetFailures();
+          const ok = await bot.resolveAndPlay(queue.current()!);
+          if (!ok) {
+            return { ok: false, message: `无法播放「${song.name || song.id}」（区域/版权限制）` };
+          }
+          return { ok: true, message: `正在播放：${song.name || 'Unknown'} - ${song.artist || 'Unknown'}` };
         }
-        res.json({ ok: true, message: `正在播放：${song.name || 'Unknown'} - ${song.artist || 'Unknown'}` });
-        return;
-      }
 
-      res.json({ ok: true, message: `已加入下一首：${song.name || 'Unknown'} - ${song.artist || 'Unknown'}` });
+        return { ok: true, message: `已加入下一首：${song.name || 'Unknown'} - ${song.artist || 'Unknown'}` };
+      });
+      res.json(body);
     } catch (err) {
       res.status(500).json({ error: (err as Error).message });
     }
@@ -494,18 +504,22 @@ export function createPlayerRouter(
         res.status(400).json({ error: "song object with id and platform is required" });
         return;
       }
-      const queue = bot.getQueueManager();
-      const insertedAt =
-        queue.getCurrentIndex() < 0 ? queue.size() : queue.getCurrentIndex() + 1;
-      queue.addNext(song);
-      queue.playAt(insertedAt);
-      bot.getPlayer().resetFailures();
-      const ok = await bot.resolveAndPlay(queue.current()!);
-      if (!ok) {
-        res.json({ ok: false, message: `无法播放「${song.name || song.id}」（区域/版权限制）` });
-        return;
-      }
-      res.json({ ok: true, message: `正在播放：${song.name || "Unknown"} - ${song.artist || "Unknown"}` });
+      // Serialize the insert-after-current + promote + playback so concurrent
+      // requests can't interleave (audible track must match queue.currentIndex).
+      const body = await bot.runExclusive(async () => {
+        const queue = bot.getQueueManager();
+        const insertedAt =
+          queue.getCurrentIndex() < 0 ? queue.size() : queue.getCurrentIndex() + 1;
+        queue.addNext(song);
+        queue.playAt(insertedAt);
+        bot.getPlayer().resetFailures();
+        const ok = await bot.resolveAndPlay(queue.current()!);
+        if (!ok) {
+          return { ok: false, message: `无法播放「${song.name || song.id}」（区域/版权限制）` };
+        }
+        return { ok: true, message: `正在播放：${song.name || "Unknown"} - ${song.artist || "Unknown"}` };
+      });
+      res.json(body);
     } catch (err) {
       res.status(500).json({ error: (err as Error).message });
     }
@@ -519,20 +533,24 @@ export function createPlayerRouter(
         res.status(400).json({ error: "song object with id and platform is required" });
         return;
       }
-      const queue = bot.getQueueManager();
-      const wasIdle = bot.getPlayer().getState() === "idle";
-      queue.add(song);
+      // Serialize the queue mutation + (possible) playback so concurrent
+      // requests can't interleave (audible track must match queue.currentIndex).
+      const body = await bot.runExclusive(async () => {
+        const queue = bot.getQueueManager();
+        const wasIdle = bot.getPlayer().getState() === "idle";
+        queue.add(song);
 
-      // If nothing was playing, start this newly-added song immediately.
-      if (wasIdle) {
-        queue.playAt(queue.size() - 1);
-        bot.getPlayer().resetFailures();
-        await bot.resolveAndPlay(queue.current()!);
-        res.json({ message: `Now playing: ${song.name || 'Unknown'} - ${song.artist || 'Unknown'}` });
-        return;
-      }
+        // If nothing was playing, start this newly-added song immediately.
+        if (wasIdle) {
+          queue.playAt(queue.size() - 1);
+          bot.getPlayer().resetFailures();
+          await bot.resolveAndPlay(queue.current()!);
+          return { message: `Now playing: ${song.name || 'Unknown'} - ${song.artist || 'Unknown'}` };
+        }
 
-      res.json({ message: `Added to queue: ${song.name || 'Unknown'} - ${song.artist || 'Unknown'} (position ${queue.size()})` });
+        return { message: `Added to queue: ${song.name || 'Unknown'} - ${song.artist || 'Unknown'} (position ${queue.size()})` };
+      });
+      res.json(body);
     } catch (err) {
       res.status(500).json({ error: (err as Error).message });
     }

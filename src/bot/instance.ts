@@ -78,6 +78,7 @@ export class BotInstance extends EventEmitter {
   private fmProvider: MusicProvider | null = null;
   /** Results of the most recent !search, for "#N" selection (issue #90). */
   private lastSearchResults: Song[] = [];
+  private playGate: Promise<unknown> = Promise.resolve();
 
   constructor(options: BotInstanceOptions) {
     super();
@@ -1049,6 +1050,14 @@ export class BotInstance extends EventEmitter {
     const pathMatch = input.match(/\/(\d+)/);
     if (pathMatch) return pathMatch[1];
     return input;
+  }
+
+  /** Serialize queue-mutation + play sequences so concurrent requests can't
+   *  interleave (audible track must match queue.currentIndex). */
+  runExclusive<T>(fn: () => Promise<T>): Promise<T> {
+    const next = this.playGate.then(fn, fn);
+    this.playGate = next.catch(() => {});
+    return next;
   }
 
   getStatus(): BotStatus {
