@@ -66,7 +66,7 @@
         <Icon icon="mdi:music-box-multiple" class="tab-icon" />
         <span class="tab-label">音乐库</span>
       </RouterLink>
-      <RouterLink to="/settings" class="m-tab" :class="{ active: route.path.startsWith('/settings') }">
+      <RouterLink v-if="!session.isGuest.value" to="/settings" class="m-tab" :class="{ active: route.path.startsWith('/settings') }">
         <Icon icon="mdi:cog" class="tab-icon" />
         <span class="tab-label">设置</span>
       </RouterLink>
@@ -80,6 +80,7 @@ import { useRoute, useRouter } from 'vue-router';
 import { Icon } from '@iconify/vue';
 import { usePlayerStore } from './stores/player.js';
 import { useWebSocket } from './composables/useWebSocket.js';
+import { useSession } from './composables/useSession.js';
 import Navbar from './components/Navbar.vue';
 import Player from './components/Player.vue';
 import CoverArt from './components/CoverArt.vue';
@@ -87,6 +88,7 @@ import Toast from './components/Toast.vue';
 import Queue from './components/Queue.vue';
 
 const playerStore = usePlayerStore();
+const session = useSession();
 const theme = computed(() => playerStore.theme);
 const route = useRoute();
 const router = useRouter();
