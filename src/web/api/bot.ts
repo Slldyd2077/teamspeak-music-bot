@@ -6,6 +6,8 @@ import type { Logger } from "../../logger.js";
 import type { BotDatabase } from "../../data/database.js";
 import type { AvatarStore } from "../../data/avatars.js";
 import { requirePermission, requireBotAccess } from "../middleware/requirePermission.js";
+import { requireNotGuest } from "../middleware/requireNotGuest.js";
+import { GUEST_PERMISSION_FLAGS } from "../../data/permissions.js";
 
 export function createBotRouter(
   botManager: BotManager,
@@ -29,17 +31,18 @@ export function createBotRouter(
 
   // GET /api/bot/settings — 读取全局 bot 行为设置
   // NOTE: must be registered before "/:id" so it isn't shadowed by the param route.
-  router.get("/settings", (_req, res) => {
+  router.get("/settings", requireNotGuest, (_req, res) => {
     res.json({
       idleTimeoutMinutes: config.idleTimeoutMinutes ?? 0,
       autoPauseOnEmpty: config.autoPauseOnEmpty,
+      guestMode: config.guestMode,
     });
   });
 
   // POST /api/bot/settings — 保存全局 bot 行为设置 (gated: changing global bot
   // behavior is a bot.manage operation, consistent with PR #80's permission model)
   router.post("/settings", requirePermission("bot.manage"), (req, res) => {
-    const { idleTimeoutMinutes, autoPauseOnEmpty } = req.body;
+    const { idleTimeoutMinutes, autoPauseOnEmpty, guestMode } = req.body;
 
     const hasIdle = idleTimeoutMinutes !== undefined;
     if (hasIdle && (typeof idleTimeoutMinutes !== "number" || idleTimeoutMinutes < 0)) {
@@ -51,6 +54,24 @@ export function createBotRouter(
 
     if (hasIdle) config.idleTimeoutMinutes = idleTimeoutMinutes;
     if (hasAutoPause) config.autoPauseOnEmpty = autoPauseOnEmpty;
+
+    if (guestMode !== undefined && guestMode !== null && typeof guestMode === "object") {
+      const gm = config.guestMode;
+      if (typeof guestMode.enabled === "boolean") gm.enabled = guestMode.enabled;
+      if (guestMode.bots === "all") {
+        gm.bots = "all";
+      } else if (Array.isArray(guestMode.bots)) {
+        gm.bots = guestMode.bots.filter((id: unknown): id is string => typeof id === "string");
+      }
+      if (guestMode.permissions && typeof guestMode.permissions === "object") {
+        for (const f of GUEST_PERMISSION_FLAGS) {
+          if (typeof guestMode.permissions[f] === "boolean") {
+            gm.permissions[f] = guestMode.permissions[f];
+          }
+        }
+      }
+    }
+
     saveConfig(configPath, config);
 
     // 通知所有 bot 实例更新
@@ -62,6 +83,7 @@ export function createBotRouter(
     res.json({
       idleTimeoutMinutes: config.idleTimeoutMinutes ?? 0,
       autoPauseOnEmpty: config.autoPauseOnEmpty,
+      guestMode: config.guestMode,
     });
   });
 
