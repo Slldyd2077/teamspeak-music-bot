@@ -199,6 +199,29 @@ describe("permission enforcement on action routes", () => {
     });
   });
 
+  // The operator's personal-account reads (their recommendations, FM, and
+  // playlists) must never leak to login-less guests. These routes are gated
+  // with requireNotGuest; generic search/browse stays open.
+  describe("operator personal-data reads are denied to guests", () => {
+    const personalRoutes = [
+      "/api/music/recommend/songs",
+      "/api/music/personal/fm",
+      "/api/music/user/playlists",
+    ];
+
+    for (const route of personalRoutes) {
+      it(`GET ${route} is 403 for a guest`, async () => {
+        const app = makeApp(guest());
+        expect((await request(app).get(route)).status).toBe(403);
+      });
+
+      it(`GET ${route} is NOT 403 for a member`, async () => {
+        const app = makeApp(member([], "all"));
+        expect((await request(app).get(route)).status).not.toBe(403);
+      });
+    }
+  });
+
   describe("read-only routes stay open", () => {
     it("GET /api/auth/status not gated", async () => {
       const app = makeApp(member([], "all"));
