@@ -83,7 +83,10 @@ export function createSessionStore(db: Database.Database): SessionStore {
         return null;
       }
       if (now - row.lastSeenAt > SESSION_TOUCH_INTERVAL_MS) {
-        touchStmt.run(now, now + SESSION_TTL_MS, id);
+        // Refresh against the role's own TTL — guests are short-lived (1d) and
+        // must NOT be bumped to the member/admin 7d window on touch.
+        const ttl = row.role === "guest" ? GUEST_SESSION_TTL_MS : SESSION_TTL_MS;
+        touchStmt.run(now, now + ttl, id);
       }
       return { userId: row.userId, username: row.username, role: row.role as "admin" | "member" | "guest" };
     },

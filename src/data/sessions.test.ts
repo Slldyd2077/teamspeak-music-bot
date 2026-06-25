@@ -160,4 +160,40 @@ describe("guest sessions", () => {
     const { expiresAt } = sessions.createSession("__guest__", { ttlMs: GUEST_SESSION_TTL_MS, skipCap: true });
     expect(expiresAt).toBeLessThanOrEqual(Date.now() + GUEST_SESSION_TTL_MS + 50);
   });
+
+  it("validateAndTouch refreshes a guest session to GUEST_SESSION_TTL_MS (1d), not SESSION_TTL_MS (7d)", () => {
+    const { token } = sessions.createSession("__guest__", { ttlMs: GUEST_SESSION_TTL_MS, skipCap: true });
+    // Force the touch branch: backdate lastSeenAt past the touch interval.
+    botDb.db
+      .prepare("UPDATE sessions SET lastSeenAt = ? WHERE userId = '__guest__'")
+      .run(Date.now() - (SESSION_TOUCH_INTERVAL_MS + 1000));
+    const result = sessions.validateAndTouch(token);
+    expect(result?.role).toBe("guest");
+    const row = botDb.db
+      .prepare("SELECT expiresAt FROM sessions WHERE userId = '__guest__'")
+      .get() as { expiresAt: number };
+    // Should refresh to ~now + 1 day, NOT now + 7 days.
+    expect(row.expiresAt).toBeGreaterThan(Date.now() + GUEST_SESSION_TTL_MS - 5000);
+    expect(row.expiresAt).toBeLessThanOrEqual(Date.now() + GUEST_SESSION_TTL_MS + 5000);
+    // Sanity: well below the 7d window.
+    expect(row.expiresAt).toBeLessThan(Date.now() + SESSION_TTL_MS);
+  });
+
+  it("validateAndTouch still refreshes a non-guest (admin) session to SESSION_TTL_MS (7d) on touch", () => {
+    botDb.db
+      .prepare("INSERT INTO users (id, username, passwordHash, createdAt, updatedAt, role) VALUES ('admin1','adminuser','!',?,?, 'admin')")
+      .run(Date.now(), Date.now());
+    const { token } = sessions.createSession("admin1");
+    botDb.db
+      .prepare("UPDATE sessions SET lastSeenAt = ? WHERE userId = 'admin1'")
+      .run(Date.now() - (SESSION_TOUCH_INTERVAL_MS + 1000));
+    const result = sessions.validateAndTouch(token);
+    expect(result?.role).toBe("admin");
+    const row = botDb.db
+      .prepare("SELECT expiresAt FROM sessions WHERE userId = 'admin1'")
+      .get() as { expiresAt: number };
+    // Refreshes to ~now + 7 days, NOT the 1d guest window.
+    expect(row.expiresAt).toBeGreaterThan(Date.now() + SESSION_TTL_MS - 5000);
+    expect(row.expiresAt).toBeLessThanOrEqual(Date.now() + SESSION_TTL_MS + 5000);
+  });
 });
