@@ -6,6 +6,7 @@ import { createDatabase, type BotDatabase } from "../../data/database.js";
 import { createUserStore } from "../../data/users.js";
 import { createSessionStore } from "../../data/sessions.js";
 import { createPermissionStore } from "../../data/permissions.js";
+import { getDefaultConfig } from "../../data/config.js";
 import { createRequireAuth } from "./requireAuth.js";
 import { requireAdmin } from "./requireAdmin.js";
 import { SESSION_COOKIE_NAME } from "../auth/validateSession.js";
@@ -27,7 +28,7 @@ describe("requireAdmin middleware", () => {
     memberCookie = `${SESSION_COOKIE_NAME}=${sessions.createSession(member.id).token}`;
     app = express();
     app.use(cookieParser());
-    app.use(createRequireAuth(sessions, permissions));
+    app.use(createRequireAuth(sessions, permissions, () => getDefaultConfig().guestMode));
     app.use(requireAdmin);
     app.get("/admin-only", (_req, res) => res.json({ ok: true }));
   });

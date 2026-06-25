@@ -98,7 +98,7 @@ export function createWebServer(options: WebServerOptions): WebServer {
   app.use("/api/session", createSessionRouter(users, sessions, audit, logger, permissions));
 
   // ─── Gates for everything else under /api ───────────────────────────────
-  const requireAuth = createRequireAuth(sessions, permissions);
+  const requireAuth = createRequireAuth(sessions, permissions, () => options.config.guestMode);
   app.use("/api", csrfOriginCheck);
   app.use("/api", requireAuth);
 

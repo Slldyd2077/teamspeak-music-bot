@@ -60,7 +60,7 @@ describe("bot router /settings", () => {
     app = express();
     app.use(express.json());
     app.use(cookieParser());
-    app.use("/api", createRequireAuth(sessions, createPermissionStore(botDb.db)));
+    app.use("/api", createRequireAuth(sessions, createPermissionStore(botDb.db), () => getDefaultConfig().guestMode));
     app.use(
       "/api/bot",
       createBotRouter(fakeManager, config, configPath, pino({ level: "silent" }), botDb, avatarStore),

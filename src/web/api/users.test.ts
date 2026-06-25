@@ -8,6 +8,7 @@ import { createUserStore, type UserStore } from "../../data/users.js";
 import { createSessionStore, type SessionStore } from "../../data/sessions.js";
 import { createAuditStore, type AuditStore } from "../../data/audit.js";
 import { createPermissionStore, type PermissionStore } from "../../data/permissions.js";
+import { getDefaultConfig } from "../../data/config.js";
 import { createRequireAuth } from "../middleware/requireAuth.js";
 import { createUsersRouter } from "./users.js";
 import { SESSION_COOKIE_NAME } from "../auth/validateSession.js";
@@ -17,7 +18,7 @@ function makeApp(botDb: BotDatabase, users: UserStore, sessions: SessionStore) {
   app.use(express.json());
   app.use(cookieParser());
   const permissions = createPermissionStore(botDb.db);
-  const requireAuth = createRequireAuth(sessions, permissions);
+  const requireAuth = createRequireAuth(sessions, permissions, () => getDefaultConfig().guestMode);
   const audit = createAuditStore(botDb.db);
   app.use("/api", requireAuth);
   app.use("/api/users", createUsersRouter(users, sessions, audit, pino({ level: "silent" }), permissions));
@@ -152,7 +153,7 @@ describe("users router", () => {
     const localApp = express();
     localApp.use(express.json());
     localApp.use(cookieParser());
-    localApp.use("/api", createRequireAuth(sessions, createPermissionStore(botDb.db)));
+    localApp.use("/api", createRequireAuth(sessions, createPermissionStore(botDb.db), () => getDefaultConfig().guestMode));
     localApp.use(
       "/api/users",
       createUsersRouter(users, sessions, brokenAudit, pino({ level: "silent" }), createPermissionStore(botDb.db))
