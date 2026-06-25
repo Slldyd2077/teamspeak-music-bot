@@ -13,6 +13,15 @@
       <p v-if="error" class="auth-error">{{ error }}</p>
       <button type="submit" :disabled="loading">{{ loading ? '登录中…' : '登录' }}</button>
     </form>
+    <button
+      v-if="session.guestAllowed.value"
+      type="button"
+      class="guest-btn"
+      :disabled="loading"
+      @click="enterAsGuest"
+    >
+      以游客身份进入
+    </button>
   </div>
 </template>
 
@@ -34,6 +43,21 @@ async function submit() {
   loading.value = true;
   try {
     await session.login(username.value, password.value);
+    const rawNext = typeof route.query.next === 'string' ? route.query.next : '/';
+    const next = rawNext.startsWith('/') && !rawNext.startsWith('//') ? rawNext : '/';
+    router.replace(next);
+  } catch (e) {
+    error.value = (e as Error).message;
+  } finally {
+    loading.value = false;
+  }
+}
+
+async function enterAsGuest() {
+  error.value = '';
+  loading.value = true;
+  try {
+    await session.continueAsGuest();
     const rawNext = typeof route.query.next === 'string' ? route.query.next : '/';
     const next = rawNext.startsWith('/') && !rawNext.startsWith('//') ? rawNext : '/';
     router.replace(next);
@@ -75,4 +99,11 @@ async function submit() {
 }
 .auth-card button:disabled { opacity: 0.6; cursor: progress; }
 .auth-error { color: #e26a6a; font-size: 13px; margin: 0; }
+.guest-btn {
+  height: 38px; margin-top: 4px; border-radius: var(--radius-sm);
+  background: transparent; color: var(--text-secondary);
+  border: 1px solid var(--border-color); cursor: pointer;
+}
+.guest-btn:hover { color: var(--text-primary); }
+.guest-btn:disabled { opacity: 0.6; cursor: progress; }
 </style>
