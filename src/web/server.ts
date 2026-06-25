@@ -175,8 +175,22 @@ export function createWebServer(options: WebServerOptions): WebServer {
       socket.destroy();
       return;
     }
+    // Guest sessions are only valid while guest mode is enabled.
+    if (result.role === "guest" && !options.config.guestMode.enabled) {
+      socket.write("HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\n");
+      socket.destroy();
+      return;
+    }
+    const guestBots = options.config.guestMode.bots;
+    const botScope: "all" | Set<string> =
+      result.role === "guest"
+        ? guestBots === "all" ? "all" : new Set(guestBots)
+        : "all";
     wss.handleUpgrade(req, socket, head, (ws) => {
-      (ws as unknown as { userId: string }).userId = result.userId;
+      const w = ws as unknown as { userId: string; isGuest: boolean; botScope: "all" | Set<string> };
+      w.userId = result.userId;
+      w.isGuest = result.role === "guest";
+      w.botScope = botScope;
       wss.emit("connection", ws, req);
     });
   });

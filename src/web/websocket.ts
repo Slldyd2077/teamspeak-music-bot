@@ -10,6 +10,17 @@ export function setupWebSocket(
 ): () => void {
   const clients = new Set<WebSocket>();
 
+  /**
+   * Whether a given bot is visible to a WebSocket client. Member/admin clients
+   * (non-guest) and guests with full scope see everything; scoped guests only
+   * see bots in their allowed set.
+   */
+  function visibleToClient(ws: WebSocket, botId: string): boolean {
+    const w = ws as unknown as { isGuest?: boolean; botScope?: "all" | Set<string> };
+    if (!w.isGuest || w.botScope === "all" || !w.botScope) return true;
+    return w.botScope.has(botId);
+  }
+
   /** Track which bot instances have listeners attached (keyed by id, storing ref) */
   const attachedBots = new Map<string, {
     bot: BotInstance;
@@ -22,7 +33,10 @@ export function setupWebSocket(
     clients.add(ws);
     logger.debug("WebSocket client connected");
 
-    const bots = botManager.getAllBots().map((b) => b.getStatus());
+    const bots = botManager
+      .getAllBots()
+      .filter((b) => visibleToClient(ws, b.id))
+      .map((b) => b.getStatus());
     ws.send(JSON.stringify({ type: "init", bots }));
 
     ws.on("close", () => {
@@ -36,15 +50,15 @@ export function setupWebSocket(
     });
   });
 
-  const broadcast = (data: object) => {
+  const broadcast = (data: object, botId?: string) => {
     const message = JSON.stringify(data);
     for (const client of clients) {
-      if (client.readyState === WebSocket.OPEN) {
-        try {
-          client.send(message);
-        } catch {
-          clients.delete(client);
-        }
+      if (client.readyState !== WebSocket.OPEN) continue;
+      if (botId !== undefined && !visibleToClient(client, botId)) continue;
+      try {
+        client.send(message);
+      } catch {
+        clients.delete(client);
       }
     }
   };
@@ -72,7 +86,7 @@ export function setupWebSocket(
         botId: bot.id,
         status: bot.getStatus(),
         queue: bot.getQueue(),
-      });
+      }, bot.id);
     };
 
     const onConnected = () => {
@@ -80,7 +94,7 @@ export function setupWebSocket(
         type: "botConnected",
         botId: bot.id,
         status: bot.getStatus(),
-      });
+      }, bot.id);
     };
 
     const onDisconnected = () => {
@@ -88,7 +102,7 @@ export function setupWebSocket(
         type: "botDisconnected",
         botId: bot.id,
         status: bot.getStatus(),
-      });
+      }, bot.id);
     };
 
     bot.on("stateChange", onStateChange);
@@ -117,7 +131,7 @@ export function setupWebSocket(
   // React when a bot is removed: detach its listener and tell clients to drop it
   const onBotInstanceRemoved = (id: string) => {
     detachBotListener(id);
-    broadcast({ type: "botRemoved", botId: id });
+    broadcast({ type: "botRemoved", botId: id }, id);
   };
   botManager.on("botInstanceRemoved", onBotInstanceRemoved);
 

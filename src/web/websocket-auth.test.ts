@@ -7,6 +7,7 @@ import { createDatabase, type BotDatabase } from "../data/database.js";
 import { createUserStore } from "../data/users.js";
 import { createSessionStore } from "../data/sessions.js";
 import { validateSessionFromHeaders, SESSION_COOKIE_NAME } from "./auth/validateSession.js";
+import { setupWebSocket } from "./websocket.js";
 
 function buildServer(sessions: ReturnType<typeof createSessionStore>) {
   const app = express();
@@ -70,5 +71,46 @@ describe("WebSocket auth at upgrade", () => {
     });
     expect(msg).toBe("hello");
     ws.close();
+  });
+});
+
+describe("WebSocket guest bot scope", () => {
+  it("guest init is filtered to the guest bot scope", () => {
+    const sent: any[] = [];
+    const fakeWs: any = {
+      readyState: 1,
+      isGuest: true,
+      botScope: new Set(["bot1"]),
+      send: (m: string) => sent.push(JSON.parse(m)),
+      on: () => {},
+    };
+    const fakeWss: any = {
+      on: (ev: string, cb: any) => {
+        if (ev === "connection") fakeWss._conn = cb;
+      },
+    };
+    const makeBot = (id: string) => ({
+      id,
+      getStatus: () => ({ id }),
+      getQueue: () => [],
+      on: () => {},
+      removeListener: () => {},
+    });
+    const botManager: any = {
+      getAllBots: () => [makeBot("bot1"), makeBot("bot2")],
+      on: () => {},
+      off: () => {},
+      removeListener: () => {},
+    };
+    const cleanup = setupWebSocket(fakeWss, botManager, {
+      debug() {},
+      error() {},
+      info() {},
+      warn() {},
+    } as any);
+    fakeWss._conn(fakeWs);
+    const init = sent.find((m) => m.type === "init");
+    expect(init.bots.map((b: any) => b.id)).toEqual(["bot1"]);
+    cleanup();
   });
 });
