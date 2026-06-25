@@ -58,6 +58,12 @@ router.beforeEach(async (to) => {
     return { name: 'login', query: { next: to.fullPath } };
   }
 
+  // Guests may never reach settings/setup, even by typing the URL.
+  const GUEST_BLOCKED = new Set(['settings', 'setup']);
+  if (session.isGuest.value && GUEST_BLOCKED.has(to.name as string)) {
+    return { name: 'home' };
+  }
+
   // Navigation is allowed to proceed to `to` past here (auth/setup redirects above take precedence).
   // Sync + preserve the dedicated-link scope carried by ?bot.
   const store = usePlayerStore();
