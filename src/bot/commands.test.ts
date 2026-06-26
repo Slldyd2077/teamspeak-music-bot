@@ -1,5 +1,6 @@
 import { describe, it, expect } from "vitest";
 import { parseCommand } from "./commands.js";
+import { canRunCommand, isAdminCommand } from "./commands.js";
 
 describe("Command Parser", () => {
   it("parses simple command", () => {
@@ -58,5 +59,38 @@ describe("Command Parser", () => {
     const result = parseCommand("!remove 3", "!");
     expect(result!.name).toBe("remove");
     expect(result!.args).toBe("3");
+  });
+});
+
+describe("isAdminCommand classification", () => {
+  it("treats stop/clear/remove/move/vol/mode as admin", () => {
+    for (const c of ["stop", "clear", "remove", "move", "vol", "mode"]) {
+      expect(isAdminCommand(c)).toBe(true);
+    }
+  });
+  it("treats follow and play as NOT admin", () => {
+    expect(isAdminCommand("follow")).toBe(false);
+    expect(isAdminCommand("play")).toBe(false);
+  });
+});
+
+describe("canRunCommand", () => {
+  it("allows any public command regardless of groups", () => {
+    expect(canRunCommand("play", [], [6])).toBe(true);
+    expect(canRunCommand("follow", [], [6])).toBe(true);
+  });
+  it("allows admin command when enforcement is off (empty adminGroups)", () => {
+    expect(canRunCommand("stop", [], [])).toBe(true);
+  });
+  it("allows admin command when an invoker group matches (string vs number)", () => {
+    expect(canRunCommand("stop", ["6"], [6])).toBe(true);
+    expect(canRunCommand("stop", [6], [6])).toBe(true);
+    expect(canRunCommand("vol", ["8", "6"], [6])).toBe(true);
+  });
+  it("denies admin command when no invoker group matches", () => {
+    expect(canRunCommand("stop", ["8"], [6])).toBe(false);
+  });
+  it("denies admin command when invoker has no groups and enforcement is on", () => {
+    expect(canRunCommand("clear", [], [6])).toBe(false);
   });
 });

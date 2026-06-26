@@ -5,14 +5,13 @@ export interface ParsedCommand {
   flags: Set<string>;
 }
 
-export const PUBLIC_COMMANDS = new Set([
-  "play", "add", "queue", "list", "now", "lyrics", "vote", "help",
-  "playlist", "album", "fm", "prev", "next", "skip", "pause", "resume",
-  "artist",
-]);
-
+/**
+ * The fixed set of "admin" chat commands. This is the SINGLE source of truth
+ * for which commands the permission gate restricts; reclassifying a command is
+ * a one-line edit here. Everything not in this set is public.
+ */
 export const ADMIN_COMMANDS = new Set([
-  "stop", "clear", "move", "vol", "mode", "follow", "remove",
+  "stop", "clear", "remove", "move", "vol", "mode",
 ]);
 
 export function parseCommand(
@@ -58,4 +57,25 @@ export function parseCommand(
 
 export function isAdminCommand(commandName: string): boolean {
   return ADMIN_COMMANDS.has(commandName);
+}
+
+/**
+ * Decide whether a chat command may run, given the invoker's TS server groups
+ * and the configured admin groups. Pure + synchronous so it is trivially unit
+ * tested and reused by the async gate in BotInstance.
+ *
+ * Allowed iff: (1) it is a public command, OR (2) enforcement is off
+ * (adminGroups empty), OR (3) some invoker group is in adminGroups.
+ * invokerGroups (strings from TS) and adminGroups (numbers) are normalized to
+ * strings before comparison so "6" matches 6.
+ */
+export function canRunCommand(
+  commandName: string,
+  invokerGroups: readonly (string | number)[],
+  adminGroups: readonly number[],
+): boolean {
+  if (!isAdminCommand(commandName)) return true;
+  if (adminGroups.length === 0) return true;
+  const admin = new Set(adminGroups.map((g) => String(g)));
+  return invokerGroups.some((g) => admin.has(String(g)));
 }
