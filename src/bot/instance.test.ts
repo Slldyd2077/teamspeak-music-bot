@@ -117,14 +117,18 @@ describe("BotInstance.runExclusive — serialization", () => {
  *  `this.isCommandAllowed(...)` resolve against this same object. */
 function makeGateCtx(opts: {
   adminGroups?: number[];
-  clients?: Array<{ id: number; serverGroups: string[] }>;
+  lookupGroups?: string[];
+  lookupThrows?: boolean;
 }) {
   const ctx: any = {
     config: { commandPrefix: "!", commandAliases: {}, adminGroups: opts.adminGroups ?? [] },
     logger: { info: vi.fn(), error: vi.fn() },
     tsClient: {
       sendTextMessage: vi.fn(async () => {}),
-      getClientsInChannel: vi.fn(async () => opts.clients ?? []),
+      getClientServerGroups: vi.fn(async () => {
+        if (opts.lookupThrows) throw new Error("query failed");
+        return opts.lookupGroups ?? [];
+      }),
     },
     executeCommand: vi.fn(async () => null),
     isCommandAllowed: (BotInstance.prototype as any).isCommandAllowed,
@@ -143,52 +147,66 @@ const handleTextMessage = (BotInstance.prototype as any).handleTextMessage as (
 ) => Promise<void>;
 
 describe("BotInstance.handleTextMessage — command permission gate", () => {
-  it("runs a public command even with enforcement on", async () => {
+  it("runs a public command with no group lookup, even under enforcement", async () => {
     const ctx = makeGateCtx({ adminGroups: [6] });
-    await handleTextMessage.call(ctx, makeMsg("!play 晴天"));
+    await handleTextMessage.call(ctx, makeMsg("!play 晴天", ["6"]));
     expect(ctx.executeCommand).toHaveBeenCalledTimes(1);
+    expect(ctx.tsClient.getClientServerGroups).not.toHaveBeenCalled();
     expect(ctx.tsClient.sendTextMessage).not.toHaveBeenCalledWith(COMMAND_DENIED_MESSAGE);
   });
 
-  it("runs an admin command when enforcement is off (empty adminGroups)", async () => {
+  it("runs an admin command with no lookup when enforcement is off", async () => {
     const ctx = makeGateCtx({ adminGroups: [] });
     await handleTextMessage.call(ctx, makeMsg("!stop"));
     expect(ctx.executeCommand).toHaveBeenCalledTimes(1);
+    expect(ctx.tsClient.getClientServerGroups).not.toHaveBeenCalled();
   });
 
-  it("runs an admin command when the event carried a matching group", async () => {
-    const ctx = makeGateCtx({ adminGroups: [6] });
+  it("allows an enforced admin command when the live lookup returns a matching group", async () => {
+    const ctx = makeGateCtx({ adminGroups: [6], lookupGroups: ["6"] });
+    await handleTextMessage.call(ctx, makeMsg("!stop"));
+    expect(ctx.tsClient.getClientServerGroups).toHaveBeenCalledTimes(1);
+    expect(ctx.executeCommand).toHaveBeenCalledTimes(1);
+  });
+
+  it("denies an enforced admin command when the live lookup has no matching group", async () => {
+    const ctx = makeGateCtx({ adminGroups: [6], lookupGroups: ["8"] });
+    await handleTextMessage.call(ctx, makeMsg("!stop"));
+    expect(ctx.executeCommand).not.toHaveBeenCalled();
+    expect(ctx.tsClient.sendTextMessage).toHaveBeenCalledWith(COMMAND_DENIED_MESSAGE);
+  });
+
+  it("fails closed when the live lookup returns no groups", async () => {
+    const ctx = makeGateCtx({ adminGroups: [6], lookupGroups: [] });
+    await handleTextMessage.call(ctx, makeMsg("!stop"));
+    expect(ctx.executeCommand).not.toHaveBeenCalled();
+    expect(ctx.tsClient.sendTextMessage).toHaveBeenCalledWith(COMMAND_DENIED_MESSAGE);
+  });
+
+  it("fails closed when the live lookup throws", async () => {
+    const ctx = makeGateCtx({ adminGroups: [6], lookupThrows: true });
+    await handleTextMessage.call(ctx, makeMsg("!stop"));
+    expect(ctx.executeCommand).not.toHaveBeenCalled();
+    expect(ctx.tsClient.sendTextMessage).toHaveBeenCalledWith(COMMAND_DENIED_MESSAGE);
+  });
+
+  it("ignores stale event groups: a demoted sender (cached match) is denied by the live lookup", async () => {
+    const ctx = makeGateCtx({ adminGroups: [6], lookupGroups: ["8"] });
     await handleTextMessage.call(ctx, makeMsg("!stop", ["6"]));
-    expect(ctx.executeCommand).toHaveBeenCalledTimes(1);
-    expect(ctx.tsClient.getClientsInChannel).not.toHaveBeenCalled(); // no fallback needed
+    expect(ctx.executeCommand).not.toHaveBeenCalled();
+    expect(ctx.tsClient.sendTextMessage).toHaveBeenCalledWith(COMMAND_DENIED_MESSAGE);
   });
 
-  it("denies an admin command when known groups do not match (no fallback, with reply)", async () => {
-    const ctx = makeGateCtx({ adminGroups: [6] });
+  it("uses live groups, not stale event groups: a freshly-promoted sender is allowed", async () => {
+    const ctx = makeGateCtx({ adminGroups: [6], lookupGroups: ["6"] });
     await handleTextMessage.call(ctx, makeMsg("!stop", ["8"]));
-    expect(ctx.executeCommand).not.toHaveBeenCalled();
-    expect(ctx.tsClient.getClientsInChannel).not.toHaveBeenCalled();
-    expect(ctx.tsClient.sendTextMessage).toHaveBeenCalledWith(COMMAND_DENIED_MESSAGE);
-  });
-
-  it("falls back to a group lookup when the event carried no groups, and allows on match", async () => {
-    const ctx = makeGateCtx({ adminGroups: [6], clients: [{ id: 5, serverGroups: ["6"] }] });
-    await handleTextMessage.call(ctx, makeMsg("!stop", [], "5"));
-    expect(ctx.tsClient.getClientsInChannel).toHaveBeenCalledTimes(1);
     expect(ctx.executeCommand).toHaveBeenCalledTimes(1);
   });
 
-  it("fails closed when the fallback finds the client but no matching group", async () => {
-    const ctx = makeGateCtx({ adminGroups: [6], clients: [{ id: 5, serverGroups: ["8"] }] });
+  it("resolves out-of-channel senders server-wide: empty event groups but a matching live group → allowed", async () => {
+    const ctx = makeGateCtx({ adminGroups: [6], lookupGroups: ["6"] });
     await handleTextMessage.call(ctx, makeMsg("!stop", [], "5"));
-    expect(ctx.executeCommand).not.toHaveBeenCalled();
-    expect(ctx.tsClient.sendTextMessage).toHaveBeenCalledWith(COMMAND_DENIED_MESSAGE);
-  });
-
-  it("fails closed when the fallback cannot find the client at all", async () => {
-    const ctx = makeGateCtx({ adminGroups: [6], clients: [] });
-    await handleTextMessage.call(ctx, makeMsg("!stop", [], "5"));
-    expect(ctx.executeCommand).not.toHaveBeenCalled();
-    expect(ctx.tsClient.sendTextMessage).toHaveBeenCalledWith(COMMAND_DENIED_MESSAGE);
+    expect(ctx.tsClient.getClientServerGroups).toHaveBeenCalledTimes(1);
+    expect(ctx.executeCommand).toHaveBeenCalledTimes(1);
   });
 });

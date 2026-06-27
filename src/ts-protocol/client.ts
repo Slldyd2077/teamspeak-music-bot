@@ -8,6 +8,7 @@ import {
   listChannels,
   listClients,
   clientMove,
+  getClientInfo,
   fileTransferDeleteFile,
   type Identity,
   type TextMessage,
@@ -328,6 +329,26 @@ export class TS3Client extends EventEmitter {
       const allClients = await listClients(this.client);
       const myChannelId = this.client.channelID();
       return allClients.filter((c) => c.channelID === myChannelId);
+    } catch {
+      return [];
+    }
+  }
+
+  /**
+   * Resolve a client's CURRENT server groups by client id, server-wide (works
+   * regardless of channel/view) via a targeted `clientinfo` query. The raw
+   * `client_servergroups` field is a comma-separated list (same field
+   * `listClients` parses). Returns [] if the client can't be resolved or the
+   * query fails, so callers fail closed.
+   */
+  async getClientServerGroups(clid: number): Promise<string[]> {
+    if (!this.client) return [];
+    try {
+      const info = await getClientInfo(this.client, clid);
+      // `client_servergroups`: comma-separated server-group ids (verified in
+      // @honeybbq/teamspeak-client dist/index.mjs; listClients parses the same).
+      const raw = info.client_servergroups ?? "";
+      return raw ? raw.split(",") : [];
     } catch {
       return [];
     }

@@ -362,35 +362,34 @@ export class BotInstance extends EventEmitter {
 
   /**
    * Decide whether a chat command may run for this sender. Reads adminGroups
-   * live from this.config (the router mutates the same object). Only performs
-   * the async group lookup when the synchronous decision is "deny because the
-   * event carried no groups" — i.e. an admin command, enforcement on, and
-   * empty invokerGroups. Fails closed if groups remain undeterminable.
+   * live from this.config. Public commands and the enforcement-off case are
+   * allowed with NO query. For an ENFORCED admin command we resolve the
+   * sender's CURRENT server groups with a targeted server-wide lookup rather
+   * than trusting the text event's cached groups — those are empty for
+   * out-of-channel senders and stale after a live promotion/demotion. Fails
+   * closed when the groups can't be determined.
    */
   private async isCommandAllowed(commandName: string, msg: TS3TextMessage): Promise<boolean> {
     const adminGroups = this.config.adminGroups;
-    if (canRunCommand(commandName, msg.invokerGroups, adminGroups)) return true;
-    // Here: admin command, enforcement on, and the provided groups did not match.
-    // If the event actually carried groups, this is a genuine deny — no lookup.
-    if (msg.invokerGroups.length > 0) return false;
-    // Groups unknown (sender not in the view cache): one targeted lookup, then
-    // re-decide. canRunCommand([], …) is false ⇒ fail-closed when still unknown.
+    // Public command, or enforcement off → allow without any lookup.
+    // (canRunCommand with empty groups is true iff the command is public OR
+    // adminGroups is empty.)
+    if (canRunCommand(commandName, [], adminGroups)) return true;
+    // Enforced admin command: authoritative decision uses freshly-resolved,
+    // server-wide groups. Fail closed if they can't be determined.
     const groups = await this.lookupInvokerGroups(msg.invokerId);
     return canRunCommand(commandName, groups, adminGroups);
   }
 
   /**
-   * Best-effort lookup of a sender's server groups by client id, via the
-   * channel client list (whose entries already carry parsed serverGroups).
-   * Returns [] when the client can't be found or the query fails (→ deny).
+   * Resolve the sender's current server groups by client id, server-wide.
+   * Returns [] on a bad id or query failure (→ fail-closed deny upstream).
    */
   private async lookupInvokerGroups(invokerId: string): Promise<string[]> {
     const clid = Number(invokerId);
     if (!Number.isFinite(clid) || clid <= 0) return [];
     try {
-      const clients = await this.tsClient.getClientsInChannel();
-      const match = clients.find((c) => c.id === clid);
-      return match?.serverGroups ?? [];
+      return await this.tsClient.getClientServerGroups(clid);
     } catch {
       return [];
     }
