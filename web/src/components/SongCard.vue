@@ -1,5 +1,5 @@
 <template>
-  <div class="song-card" :class="{ active }" @dblclick="$emit('play')">
+  <div class="song-card" :class="{ active }" @dblclick="showPlay && $emit('play')">
     <div class="song-index">{{ index }}</div>
     <CoverArt :url="song.coverUrl" :size="36" :radius="6" />
     <div class="song-info">
@@ -15,13 +15,13 @@
     <div class="song-album">{{ song.album }}</div>
     <div class="song-duration">{{ formatDuration(song.duration) }}</div>
     <div class="song-actions">
-      <button class="action-btn" @click.stop="$emit('play')" title="播放">
+      <button v-if="showPlay" class="action-btn" @click.stop="$emit('play')" title="播放">
         <Icon icon="mdi:play" />
       </button>
-      <button class="action-btn" @click.stop="$emit('playNext')" title="下一首播放">
+      <button v-if="showPlayNext" class="action-btn" @click.stop="$emit('playNext')" title="下一首播放">
         <Icon icon="mdi:playlist-play" />
       </button>
-      <button class="action-btn" @click.stop="$emit('add')" title="添加到队列">
+      <button v-if="showAdd" class="action-btn" @click.stop="$emit('add')" title="添加到队列">
         <Icon icon="mdi:playlist-plus" />
       </button>
     </div>
@@ -29,15 +29,22 @@
 </template>
 
 <script setup lang="ts">
+import { computed } from 'vue';
 import { Icon } from '@iconify/vue';
 import CoverArt from './CoverArt.vue';
 import { Song } from '../stores/player.js';
+import { useSession } from '../composables/useSession.js';
 
 defineProps<{
   song: Song;
   index: number;
   active?: boolean;
 }>();
+
+const { can, guestCan } = useSession();
+const showPlay = computed(() => can('player.control') || guestCan('playNow'));
+const showPlayNext = computed(() => can('player.control') || guestCan('playNext'));
+const showAdd = computed(() => can('player.queue') || guestCan('addToQueue'));
 
 defineEmits<{
   play: [];

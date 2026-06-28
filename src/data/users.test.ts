@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { createDatabase, type BotDatabase } from "./database.js";
-import { createUserStore, UsernameTakenError, type UserStore } from "./users.js";
+import { createUserStore, UsernameTakenError, GUEST_USER_ID, GUEST_USERNAME, type UserStore } from "./users.js";
 
 describe("UserStore", () => {
   let botDb: BotDatabase;
@@ -182,5 +182,45 @@ describe("UserStore", () => {
     expect(oks).toBe(1);
     expect(orphans).toBe(1);
     expect(users.countAdmins()).toBe(1);
+  });
+});
+
+describe("guest row exclusion", () => {
+  let botDb: BotDatabase;
+  let users: UserStore;
+
+  beforeEach(() => {
+    botDb = createDatabase(":memory:");
+    users = createUserStore(botDb.db);
+  });
+
+  afterEach(() => {
+    botDb.close();
+  });
+
+  it("countUsers and listUsers ignore the reserved guest row", async () => {
+    await users.createUser("alice", "password123", "member");
+    // Insert the reserved guest row directly (mirrors the migration).
+    botDb.db.prepare(
+      "INSERT OR IGNORE INTO users (id, username, passwordHash, createdAt, updatedAt, role) VALUES (?, ?, ?, ?, ?, 'guest')"
+    ).run(GUEST_USER_ID, GUEST_USERNAME, "!", Date.now(), Date.now());
+
+    expect(users.countUsers()).toBe(1); // alice only
+    expect(users.listUsers().some((u) => u.id === GUEST_USER_ID)).toBe(false);
+  });
+
+  it("setRoleIfNotLastAdmin refuses to re-role the reserved guest principal", () => {
+    // The guest row is seeded by createDatabase via ensureGuestUser.
+    expect(users.findById(GUEST_USER_ID)!.role).toBe("guest"); // sanity
+    expect(users.setRoleIfNotLastAdmin(GUEST_USER_ID, "admin")).toBe("not_found");
+    // The guest row's role is unchanged.
+    expect(users.findById(GUEST_USER_ID)!.role).toBe("guest");
+  });
+
+  it("deleteUserIfNotLastAdmin refuses to delete the reserved guest principal", () => {
+    expect(users.findById(GUEST_USER_ID)).not.toBeNull(); // sanity
+    expect(users.deleteUserIfNotLastAdmin(GUEST_USER_ID)).toBe("not_found");
+    // The guest row still exists.
+    expect(users.findById(GUEST_USER_ID)).not.toBeNull();
   });
 });

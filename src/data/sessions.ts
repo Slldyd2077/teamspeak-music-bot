@@ -2,17 +2,18 @@ import { createHash, randomBytes } from "node:crypto";
 import type Database from "better-sqlite3";
 
 export const SESSION_TTL_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
+export const GUEST_SESSION_TTL_MS = 24 * 60 * 60 * 1000; // 1 day — guests are short-lived
 export const SESSION_TOUCH_INTERVAL_MS = 60 * 60 * 1000; // 1 hour
 export const MAX_SESSIONS_PER_USER = 10;
 
 export interface SessionValidation {
   userId: string;
   username: string;
-  role: "admin" | "member";
+  role: "admin" | "member" | "guest";
 }
 
 export interface SessionStore {
-  createSession(userId: string): { token: string; expiresAt: number };
+  createSession(userId: string, opts?: { ttlMs?: number; skipCap?: boolean }): { token: string; expiresAt: number };
   validateAndTouch(rawToken: string): SessionValidation | null;
   deleteSession(rawToken: string): void;
   deleteAllForUser(userId: string, exceptToken?: string): void;
@@ -47,7 +48,7 @@ export function createSessionStore(db: Database.Database): SessionStore {
   );
 
   return {
-    createSession(userId) {
+    createSession(userId, opts) {
       // Cap concurrent sessions per user — oldest gets evicted on overflow.
       // Wrap the count → delete → insert in a transaction so concurrent logins
       // for the same user can't both pass the cap check and both insert,
@@ -55,11 +56,13 @@ export function createSessionStore(db: Database.Database): SessionStore {
       const token = randomBytes(32).toString("base64url");
       const id = hashToken(token);
       const now = Date.now();
-      const expiresAt = now + SESSION_TTL_MS;
+      const expiresAt = now + (opts?.ttlMs ?? SESSION_TTL_MS);
       const tx = db.transaction(() => {
-        const existing = (countForUserStmt.get(userId) as { n: number }).n;
-        if (existing >= MAX_SESSIONS_PER_USER) {
-          deleteOldestForUserStmt.run(userId, existing - MAX_SESSIONS_PER_USER + 1);
+        if (!opts?.skipCap) {
+          const existing = (countForUserStmt.get(userId) as { n: number }).n;
+          if (existing >= MAX_SESSIONS_PER_USER) {
+            deleteOldestForUserStmt.run(userId, existing - MAX_SESSIONS_PER_USER + 1);
+          }
         }
         insertStmt.run(id, userId, now, expiresAt, now);
       });
@@ -80,9 +83,12 @@ export function createSessionStore(db: Database.Database): SessionStore {
         return null;
       }
       if (now - row.lastSeenAt > SESSION_TOUCH_INTERVAL_MS) {
-        touchStmt.run(now, now + SESSION_TTL_MS, id);
+        // Refresh against the role's own TTL — guests are short-lived (1d) and
+        // must NOT be bumped to the member/admin 7d window on touch.
+        const ttl = row.role === "guest" ? GUEST_SESSION_TTL_MS : SESSION_TTL_MS;
+        touchStmt.run(now, now + ttl, id);
       }
-      return { userId: row.userId, username: row.username, role: row.role as "admin" | "member" };
+      return { userId: row.userId, username: row.username, role: row.role as "admin" | "member" | "guest" };
     },
 
     deleteSession(rawToken) {

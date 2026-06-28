@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { createHash } from "node:crypto";
 import { createDatabase, type BotDatabase } from "./database.js";
 import { createUserStore, type UserStore } from "./users.js";
-import { createSessionStore, type SessionStore, SESSION_TTL_MS, SESSION_TOUCH_INTERVAL_MS, MAX_SESSIONS_PER_USER } from "./sessions.js";
+import { createSessionStore, type SessionStore, SESSION_TTL_MS, SESSION_TOUCH_INTERVAL_MS, MAX_SESSIONS_PER_USER, GUEST_SESSION_TTL_MS } from "./sessions.js";
 
 function sha256(token: string) {
   return createHash("sha256").update(token).digest("hex");
@@ -124,5 +124,76 @@ describe("SessionStore", () => {
     await Promise.all(Array.from({ length: N }, () => Promise.resolve(sessions.createSession(userId))));
     const count = (botDb.db.prepare("SELECT COUNT(*) AS n FROM sessions").get() as { n: number }).n;
     expect(count).toBe(MAX_SESSIONS_PER_USER);
+  });
+});
+
+describe("guest sessions", () => {
+  let botDb: BotDatabase;
+  let sessions: SessionStore;
+
+  beforeEach(() => {
+    botDb = createDatabase(":memory:");
+    sessions = createSessionStore(botDb.db);
+    // Create the synthetic guest user row to satisfy the sessions FK.
+    botDb.db
+      .prepare("INSERT OR IGNORE INTO users (id, username, passwordHash, createdAt, updatedAt, role) VALUES ('__guest__','游客','!',?,?, 'guest')")
+      .run(Date.now(), Date.now());
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    botDb.close();
+  });
+
+  it("skipCap lets more than MAX_SESSIONS_PER_USER coexist for one principal", () => {
+    const tokens: string[] = [];
+    for (let i = 0; i < MAX_SESSIONS_PER_USER + 3; i++) {
+      tokens.push(sessions.createSession("__guest__", { ttlMs: GUEST_SESSION_TTL_MS, skipCap: true }).token);
+    }
+    // The first token must STILL validate (not evicted).
+    expect(sessions.validateAndTouch(tokens[0])?.role).toBe("guest");
+    const n = (botDb.db.prepare("SELECT COUNT(*) AS n FROM sessions WHERE userId='__guest__'").get() as { n: number }).n;
+    expect(n).toBe(MAX_SESSIONS_PER_USER + 3);
+  });
+
+  it("ttlMs sets a shorter expiry than the default", () => {
+    const { expiresAt } = sessions.createSession("__guest__", { ttlMs: GUEST_SESSION_TTL_MS, skipCap: true });
+    expect(expiresAt).toBeLessThanOrEqual(Date.now() + GUEST_SESSION_TTL_MS + 50);
+  });
+
+  it("validateAndTouch refreshes a guest session to GUEST_SESSION_TTL_MS (1d), not SESSION_TTL_MS (7d)", () => {
+    const { token } = sessions.createSession("__guest__", { ttlMs: GUEST_SESSION_TTL_MS, skipCap: true });
+    // Force the touch branch: backdate lastSeenAt past the touch interval.
+    botDb.db
+      .prepare("UPDATE sessions SET lastSeenAt = ? WHERE userId = '__guest__'")
+      .run(Date.now() - (SESSION_TOUCH_INTERVAL_MS + 1000));
+    const result = sessions.validateAndTouch(token);
+    expect(result?.role).toBe("guest");
+    const row = botDb.db
+      .prepare("SELECT expiresAt FROM sessions WHERE userId = '__guest__'")
+      .get() as { expiresAt: number };
+    // Should refresh to ~now + 1 day, NOT now + 7 days.
+    expect(row.expiresAt).toBeGreaterThan(Date.now() + GUEST_SESSION_TTL_MS - 5000);
+    expect(row.expiresAt).toBeLessThanOrEqual(Date.now() + GUEST_SESSION_TTL_MS + 5000);
+    // Sanity: well below the 7d window.
+    expect(row.expiresAt).toBeLessThan(Date.now() + SESSION_TTL_MS);
+  });
+
+  it("validateAndTouch still refreshes a non-guest (admin) session to SESSION_TTL_MS (7d) on touch", () => {
+    botDb.db
+      .prepare("INSERT INTO users (id, username, passwordHash, createdAt, updatedAt, role) VALUES ('admin1','adminuser','!',?,?, 'admin')")
+      .run(Date.now(), Date.now());
+    const { token } = sessions.createSession("admin1");
+    botDb.db
+      .prepare("UPDATE sessions SET lastSeenAt = ? WHERE userId = 'admin1'")
+      .run(Date.now() - (SESSION_TOUCH_INTERVAL_MS + 1000));
+    const result = sessions.validateAndTouch(token);
+    expect(result?.role).toBe("admin");
+    const row = botDb.db
+      .prepare("SELECT expiresAt FROM sessions WHERE userId = 'admin1'")
+      .get() as { expiresAt: number };
+    // Refreshes to ~now + 7 days, NOT the 1d guest window.
+    expect(row.expiresAt).toBeGreaterThan(Date.now() + SESSION_TTL_MS - 5000);
+    expect(row.expiresAt).toBeLessThanOrEqual(Date.now() + SESSION_TTL_MS + 5000);
   });
 });

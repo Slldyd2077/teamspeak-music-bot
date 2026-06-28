@@ -98,14 +98,14 @@
         </div>
       </div>
 
-      <RouterLink to="/settings" class="settings-btn">
+      <RouterLink v-if="!session.isGuest.value" to="/settings" class="settings-btn">
         <Icon icon="mdi:cog" />
       </RouterLink>
 
       <div v-if="session.currentUser.value" class="nav-user">
         <span class="nav-user-name">{{ session.currentUser.value.username }}</span>
         <span class="nav-user-role" :class="`role-${session.currentUser.value.role}`">
-          {{ session.currentUser.value.role === 'admin' ? '管理员' : '成员' }}
+          {{ session.currentUser.value.role === 'admin' ? '管理员' : session.currentUser.value.role === 'guest' ? '游客' : '成员' }}
         </span>
         <button class="nav-user-logout" @click="onLogout" title="退出">
           <Icon icon="mdi:logout" />
@@ -769,4 +769,5 @@ onUnmounted(() => {
 }
 .role-admin { background: rgba(99, 145, 226, 0.18); color: #6391e2; }
 .role-member { background: rgba(150, 150, 150, 0.18); color: var(--text-secondary); }
+.role-guest { background: rgba(150, 150, 150, 0.18); color: var(--text-secondary); }
 </style>

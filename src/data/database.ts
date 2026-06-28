@@ -1,5 +1,6 @@
 import Database from "better-sqlite3";
 import { CAPABILITIES, BOTS_ALL } from "./permissions.js";
+import { GUEST_USER_ID, GUEST_USERNAME } from "./users.js";
 
 export interface PlayHistoryEntry {
   botId: string;
@@ -241,6 +242,19 @@ export function backfillMemberPermissions(db: Database.Database): void {
   tx();
 }
 
+/**
+ * Ensure the reserved guest principal exists. Idempotent via the PK on
+ * `users.id`. This row only backs login-less guest sessions; it is excluded
+ * from countUsers()/listUsers() so it never interferes with first-run setup
+ * or the user-management UI, and holds an unusable password hash.
+ */
+export function ensureGuestUser(db: Database.Database): void {
+  const now = Date.now();
+  db.prepare(
+    "INSERT OR IGNORE INTO users (id, username, passwordHash, createdAt, updatedAt, role) VALUES (?, ?, '!', ?, ?, 'guest')"
+  ).run(GUEST_USER_ID, GUEST_USERNAME, now, now);
+}
+
 export function createDatabase(dbPath: string): BotDatabase {
   const db = new Database(dbPath);
   db.pragma("journal_mode = WAL");
@@ -248,6 +262,7 @@ export function createDatabase(dbPath: string): BotDatabase {
   initTables(db);
   migrateSchema(db);
   backfillMemberPermissions(db);
+  ensureGuestUser(db);
 
   const insertHistory = db.prepare(`
     INSERT INTO play_history (botId, songId, songName, artist, album, platform, coverUrl)

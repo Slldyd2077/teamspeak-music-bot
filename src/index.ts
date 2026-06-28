@@ -74,7 +74,8 @@ async function main() {
     config,
     logger,
     avatarStore,
-    permissions
+    permissions,
+    CONFIG_PATH
   );
   await botManager.loadSavedBots();
 

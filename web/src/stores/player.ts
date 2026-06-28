@@ -1,6 +1,7 @@
 import { defineStore } from 'pinia';
 import axios from 'axios';
 import { resolveScopedBot } from './scope.js';
+import { useSession } from '../composables/useSession.js';
 
 export interface Song {
   id: string;
@@ -334,7 +335,10 @@ export const usePlayerStore = defineStore('player', {
 
     async playSong(song: Song) {
       if (!this.activeBotId) return;
-      const res = await axios.post(`/api/player/${this.activeBotId}/play-song`, { song });
+      // Guests use the non-destructive "play now" (insert-next + skip) so they
+      // can't wipe everyone else's queue; members/admins keep the normal behavior.
+      const endpoint = useSession().isGuest.value ? 'play-now-song' : 'play-song';
+      const res = await axios.post(`/api/player/${this.activeBotId}/${endpoint}`, { song });
       if (res.data?.ok === false && res.data?.message) {
         this.notify(res.data.message, 'error');
       }

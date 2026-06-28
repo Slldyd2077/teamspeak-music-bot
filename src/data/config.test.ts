@@ -106,3 +106,74 @@ describe("config", () => {
     expect(migrated).toBe(false);
   });
 });
+
+describe("guestMode config", () => {
+  it("defaults to disabled, all-bots, append-only", () => {
+    const c = getDefaultConfig();
+    expect(c.guestMode.enabled).toBe(false);
+    expect(c.guestMode.bots).toBe("all");
+    expect(c.guestMode.permissions).toEqual({
+      addToQueue: true, playNext: false, playNow: false,
+      skip: false, transport: false, removeClear: false, playMode: false,
+    });
+  });
+
+  it("deep-merges a partial guestMode so missing sub-keys are back-filled", () => {
+    const dir = mkdtempSync(join(tmpdir(), "tsmb-cfg-"));
+    const p = join(dir, "config.json");
+    writeFileSync(p, JSON.stringify({ guestMode: { enabled: true, permissions: { playNext: true } } }));
+    const c = loadConfig(p);
+    expect(c.guestMode.enabled).toBe(true);
+    expect(c.guestMode.bots).toBe("all"); // back-filled
+    expect(c.guestMode.permissions.playNext).toBe(true);
+    expect(c.guestMode.permissions.addToQueue).toBe(true); // back-filled default
+    expect(c.guestMode.permissions.skip).toBe(false); // back-filled default
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  // --- B1: loadConfig must sanitize a hand-edited/legacy/corrupt guestMode ---
+
+  function loadGuestMode(raw: unknown) {
+    const dir = mkdtempSync(join(tmpdir(), "tsmb-cfg-"));
+    const p = join(dir, "config.json");
+    writeFileSync(p, JSON.stringify(raw));
+    try {
+      return loadConfig(p).guestMode;
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }
+
+  describe("bots normalization", () => {
+    it("a numeric bots value falls back to the default \"all\" (no crash)", () => {
+      const gm = loadGuestMode({ guestMode: { bots: 5 } });
+      expect(gm.bots).toBe("all");
+    });
+    it("an array bots value is filtered to strings only", () => {
+      const gm = loadGuestMode({ guestMode: { bots: ["a", 2, "b"] } });
+      expect(gm.bots).toEqual(["a", "b"]);
+    });
+    it("the literal \"all\" is preserved", () => {
+      const gm = loadGuestMode({ guestMode: { bots: "all" } });
+      expect(gm.bots).toBe("all");
+    });
+  });
+
+  describe("permissions coercion", () => {
+    it("a non-boolean truthy flag is coerced to false; a real true stays true", () => {
+      const gm = loadGuestMode({ guestMode: { permissions: { skip: 1, playNext: true } } });
+      expect(gm.permissions.skip).toBe(false);
+      expect(gm.permissions.playNext).toBe(true);
+    });
+    it("a string permissions value yields defaults with no numeric index keys", () => {
+      const gm = loadGuestMode({ guestMode: { permissions: "hacked" } });
+      // 7 known flags present at their defaults
+      expect(gm.permissions).toEqual({
+        addToQueue: true, playNext: false, playNow: false,
+        skip: false, transport: false, removeClear: false, playMode: false,
+      });
+      // no garbage index keys leaked from spreading a string
+      expect((gm.permissions as unknown as Record<string, unknown>)["0"]).toBeUndefined();
+    });
+  });
+});

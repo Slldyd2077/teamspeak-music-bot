@@ -4,10 +4,11 @@ import cookieParser from "cookie-parser";
 import request from "supertest";
 import pino from "pino";
 import { createDatabase, type BotDatabase } from "../../data/database.js";
-import { createUserStore, type UserStore } from "../../data/users.js";
+import { createUserStore, GUEST_USER_ID, type UserStore } from "../../data/users.js";
 import { createSessionStore, type SessionStore } from "../../data/sessions.js";
 import { createAuditStore, type AuditStore } from "../../data/audit.js";
 import { createPermissionStore, type PermissionStore } from "../../data/permissions.js";
+import { getDefaultConfig } from "../../data/config.js";
 import { createRequireAuth } from "../middleware/requireAuth.js";
 import { createUsersRouter } from "./users.js";
 import { SESSION_COOKIE_NAME } from "../auth/validateSession.js";
@@ -17,7 +18,7 @@ function makeApp(botDb: BotDatabase, users: UserStore, sessions: SessionStore) {
   app.use(express.json());
   app.use(cookieParser());
   const permissions = createPermissionStore(botDb.db);
-  const requireAuth = createRequireAuth(sessions, permissions);
+  const requireAuth = createRequireAuth(sessions, permissions, () => getDefaultConfig().guestMode);
   const audit = createAuditStore(botDb.db);
   app.use("/api", requireAuth);
   app.use("/api/users", createUsersRouter(users, sessions, audit, pino({ level: "silent" }), permissions));
@@ -152,7 +153,7 @@ describe("users router", () => {
     const localApp = express();
     localApp.use(express.json());
     localApp.use(cookieParser());
-    localApp.use("/api", createRequireAuth(sessions, createPermissionStore(botDb.db)));
+    localApp.use("/api", createRequireAuth(sessions, createPermissionStore(botDb.db), () => getDefaultConfig().guestMode));
     localApp.use(
       "/api/users",
       createUsersRouter(users, sessions, brokenAudit, pino({ level: "silent" }), createPermissionStore(botDb.db))
@@ -340,5 +341,50 @@ describe("users router", () => {
       .set("Cookie", aliceCookie);
     expect(perms.status).toBe(200);
     expect(perms.body).toEqual({ capabilities: [], bots: [] });
+  });
+
+  // --- reserved guest principal is never mutable/visible via user mgmt -------
+  // The synthetic __guest__ row is seeded by createDatabase. findById has no
+  // role filter, so without the 404-guard these by-id handlers would operate
+  // on it (privilege-escalation / DoS / cred-login holes).
+  describe("reserved __guest__ principal is 404 on every by-id handler", () => {
+    it("DELETE /:id → 404 and the guest row survives", async () => {
+      const res = await request(app).delete(`/api/users/${GUEST_USER_ID}`).set("Cookie", aliceCookie);
+      expect(res.status).toBe(404);
+      expect(users.findById(GUEST_USER_ID)).not.toBeNull();
+      expect(users.findById(GUEST_USER_ID)!.role).toBe("guest");
+    });
+
+    it("PATCH /:id/role {role:'admin'} → 404 and the guest role is unchanged", async () => {
+      const res = await request(app)
+        .patch(`/api/users/${GUEST_USER_ID}/role`)
+        .set("Cookie", aliceCookie)
+        .send({ role: "admin" });
+      expect(res.status).toBe(404);
+      expect(users.findById(GUEST_USER_ID)!.role).toBe("guest");
+    });
+
+    it("POST /:id/reset-password → 404 (cannot give the guest a login)", async () => {
+      const res = await request(app)
+        .post(`/api/users/${GUEST_USER_ID}/reset-password`)
+        .set("Cookie", aliceCookie)
+        .send({ newPassword: "guest-new-pw" });
+      expect(res.status).toBe(404);
+    });
+
+    it("GET /:id/permissions → 404", async () => {
+      const res = await request(app)
+        .get(`/api/users/${GUEST_USER_ID}/permissions`)
+        .set("Cookie", aliceCookie);
+      expect(res.status).toBe(404);
+    });
+
+    it("PUT /:id/permissions → 404", async () => {
+      const res = await request(app)
+        .put(`/api/users/${GUEST_USER_ID}/permissions`)
+        .set("Cookie", aliceCookie)
+        .send({ capabilities: ["player.control"], bots: "all" });
+      expect(res.status).toBe(404);
+    });
   });
 });

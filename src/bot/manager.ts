@@ -7,7 +7,7 @@ import {
 import type { MusicProvider } from "../music/provider.js";
 import { YouTubeProvider } from "../music/youtube.js";
 import type { BotDatabase } from "../data/database.js";
-import type { BotConfig } from "../data/config.js";
+import { saveConfig, type BotConfig } from "../data/config.js";
 import type { Logger } from "../logger.js";
 
 import type { ServerProtocol } from "../ts-protocol/client.js";
@@ -79,6 +79,7 @@ export class BotManager extends EventEmitter {
   private logger: Logger;
   private avatarStore: AvatarStore;
   private permissions: PermissionStore;
+  private configPath: string;
 
   constructor(
     neteaseProvider: MusicProvider,
@@ -88,7 +89,8 @@ export class BotManager extends EventEmitter {
     config: BotConfig,
     logger: Logger,
     avatarStore: AvatarStore,
-    permissions: PermissionStore
+    permissions: PermissionStore,
+    configPath: string
   ) {
     super();
     this.neteaseProvider = neteaseProvider;
@@ -100,6 +102,7 @@ export class BotManager extends EventEmitter {
     this.logger = logger;
     this.avatarStore = avatarStore;
     this.permissions = permissions;
+    this.configPath = configPath;
   }
 
   async createBot(params: CreateBotParams): Promise<BotInstance> {
@@ -160,6 +163,11 @@ export class BotManager extends EventEmitter {
     }
     this.database.deleteBotInstance(id);
     this.permissions.pruneBot(id);
+    // Prune the deleted bot from the guest scope allow-list (mirrors permissions.pruneBot).
+    if (Array.isArray(this.config.guestMode.bots) && this.config.guestMode.bots.includes(id)) {
+      this.config.guestMode.bots = this.config.guestMode.bots.filter((b) => b !== id);
+      saveConfig(this.configPath, this.config);
+    }
     this.emit("botInstanceRemoved", id);
     this.logger.info({ botId: id }, "Bot instance removed");
   }

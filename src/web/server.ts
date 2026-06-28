@@ -6,7 +6,7 @@ import { WebSocketServer } from "ws";
 import type { BotManager } from "../bot/manager.js";
 import type { MusicProvider } from "../music/provider.js";
 import type { BotDatabase } from "../data/database.js";
-import type { BotConfig } from "../data/config.js";
+import type { BotConfig, GuestModeConfig } from "../data/config.js";
 import type { Logger } from "../logger.js";
 import type { CookieStore } from "../music/auth.js";
 import type { AvatarStore } from "../data/avatars.js";
@@ -25,6 +25,7 @@ import { createSessionStore } from "../data/sessions.js";
 import { createPermissionStore } from "../data/permissions.js";
 import { createRequireAuth } from "./middleware/requireAuth.js";
 import { requireAdmin } from "./middleware/requireAdmin.js";
+import { requireNotGuest } from "./middleware/requireNotGuest.js";
 import { csrfOriginCheck } from "./middleware/csrf.js";
 import { createRateLimit } from "./middleware/rateLimit.js";
 import { validateSessionFromHeaders } from "./auth/validateSession.js";
@@ -95,14 +96,19 @@ export function createWebServer(options: WebServerOptions): WebServer {
   app.use("/api/session/login", loginLimit);
   app.use("/api/session/setup", setupLimit);
 
-  app.use("/api/session", createSessionRouter(users, sessions, audit, logger, permissions));
+  app.use("/api/session", createSessionRouter(users, sessions, audit, logger, permissions, () => options.config.guestMode));
 
   // ─── Gates for everything else under /api ───────────────────────────────
-  const requireAuth = createRequireAuth(sessions, permissions);
+  const requireAuth = createRequireAuth(sessions, permissions, () => options.config.guestMode);
   app.use("/api", csrfOriginCheck);
   app.use("/api", requireAuth);
 
   // ─── Protected routes ───────────────────────────────────────────────────
+  // The bot router is mounted BEFORE setupWebSocket runs, but its /settings
+  // handler needs to trigger a guest-policy refresh on the (later-created) WS
+  // controller. Bridge the two with a mutable indirection that starts as a
+  // no-op and is wired to the real refreshGuestPolicy once the WS is set up.
+  let onGuestPolicyChanged: (cfg: GuestModeConfig) => void = () => {};
   app.use(
     "/api/bot",
     createBotRouter(
@@ -112,6 +118,7 @@ export function createWebServer(options: WebServerOptions): WebServer {
       logger,
       options.database,
       options.avatarStore,
+      (cfg) => onGuestPolicyChanged(cfg),
     )
   );
   app.use(
@@ -126,7 +133,7 @@ export function createWebServer(options: WebServerOptions): WebServer {
     "/api/auth",
     createAuthRouter(options.neteaseProvider, options.qqProvider, options.bilibiliProvider, logger, options.cookieStore)
   );
-  app.use("/api/favorites", createFavoritesRouter(options.database, logger));
+  app.use("/api/favorites", requireNotGuest, createFavoritesRouter(options.database, logger));
 
   // admin-only routes
   app.use("/api/users", requireAdmin, createUsersRouter(users, sessions, audit, logger, permissions));
@@ -175,12 +182,27 @@ export function createWebServer(options: WebServerOptions): WebServer {
       socket.destroy();
       return;
     }
+    // Guest sessions are only valid while guest mode is enabled.
+    if (result.role === "guest" && !options.config.guestMode.enabled) {
+      socket.write("HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\n");
+      socket.destroy();
+      return;
+    }
+    const guestBots = options.config.guestMode.bots;
+    const botScope: "all" | Set<string> =
+      result.role === "guest"
+        ? guestBots === "all" ? "all" : new Set(guestBots)
+        : "all";
     wss.handleUpgrade(req, socket, head, (ws) => {
-      (ws as unknown as { userId: string }).userId = result.userId;
+      const w = ws as unknown as { userId: string; isGuest: boolean; botScope: "all" | Set<string> };
+      w.userId = result.userId;
+      w.isGuest = result.role === "guest";
+      w.botScope = botScope;
       wss.emit("connection", ws, req);
     });
   });
-  const cleanupWs = setupWebSocket(wss, options.botManager, logger);
+  const controller = setupWebSocket(wss, options.botManager, logger);
+  onGuestPolicyChanged = controller.refreshGuestPolicy;
 
   // ─── Session cleanup interval ──────────────────────────────────────────
   let cleanupTimer: ReturnType<typeof setInterval> | null = null;
@@ -206,7 +228,7 @@ export function createWebServer(options: WebServerOptions): WebServer {
         clearInterval(cleanupTimer);
         cleanupTimer = null;
       }
-      cleanupWs();
+      controller.cleanup();
       wss.close();
       server.close();
     },

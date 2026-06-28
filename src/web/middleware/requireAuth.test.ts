@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import express from "express";
 import cookieParser from "cookie-parser";
 import request from "supertest";
@@ -24,7 +24,21 @@ describe("requireAuth middleware", () => {
 
     app = express();
     app.use(cookieParser());
-    app.use(createRequireAuth(sessions, permissions));
+    app.use(
+      createRequireAuth(sessions, permissions, () => ({
+        enabled: true,
+        bots: "all",
+        permissions: {
+          addToQueue: true,
+          playNext: true,
+          playNow: true,
+          skip: true,
+          transport: true,
+          removeClear: true,
+          playMode: true,
+        },
+      }))
+    );
     app.get("/protected", (req, res) => {
       res.json({ ok: true, user: (req as any).user });
     });
@@ -67,5 +81,35 @@ describe("requireAuth middleware", () => {
     const refreshed = arr.find((c) => c.startsWith(`${SESSION_COOKIE_NAME}=`));
     expect(refreshed).toBeDefined();
     expect(refreshed!).toMatch(/Max-Age=\d+/);
+  });
+
+  // A guest session is rejected (401) when guest mode is disabled.
+  it("rejects a guest session when guest mode is disabled", () => {
+    const sessions: any = { validateAndTouch: () => ({ userId: "__guest__", username: "游客", role: "guest" }) };
+    const permissions: any = { getCapabilities: () => [], getBotAccess: () => [] };
+    const getGuestConfig = () => ({ enabled: false, bots: "all" as const, permissions: {} as any });
+    const mw = createRequireAuth(sessions, permissions, getGuestConfig);
+    const req: any = { headers: { cookie: "tsmb_session=x" } };
+    const res: any = { statusCode: 0, cleared: false, clearCookie() { this.cleared = true; }, status(c: number) { this.statusCode = c; return this; }, json() { return this; }, cookie() {} };
+    const next = vi.fn();
+    mw(req, res, next);
+    expect(res.statusCode).toBe(401);
+    expect(next).not.toHaveBeenCalled();
+  });
+
+  it("attaches guest permissions when guest mode is enabled", () => {
+    const sessions: any = { validateAndTouch: () => ({ userId: "__guest__", username: "游客", role: "guest" }) };
+    const permissions: any = { getCapabilities: () => [], getBotAccess: () => [] };
+    const perms = { addToQueue: true, playNext: false, playNow: false, skip: false, transport: false, removeClear: false, playMode: false };
+    const getGuestConfig = () => ({ enabled: true, bots: ["bot1"], permissions: perms });
+    const mw = createRequireAuth(sessions, permissions, getGuestConfig);
+    const req: any = { headers: { cookie: "tsmb_session=x" }, secure: false };
+    const res: any = { status() { return this; }, json() { return this; }, cookie() {}, clearCookie() {} };
+    const next = vi.fn();
+    mw(req, res, next);
+    expect(next).toHaveBeenCalled();
+    expect(req.user.role).toBe("guest");
+    expect(req.user.guest.addToQueue).toBe(true);
+    expect(req.user.bots instanceof Set && req.user.bots.has("bot1")).toBe(true);
   });
 });

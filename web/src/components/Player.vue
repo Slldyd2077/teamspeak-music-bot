@@ -3,10 +3,10 @@
     <Queue :open="showQueue" @close="showQueue = false" />
 
     <div class="player-bar frosted-glass">
-      <!-- Progress bar (read-only display; seek interaction gated on player.control) -->
+      <!-- Progress bar (read-only display; seek interaction gated on transport / canTransport) -->
       <div
         class="progress-bar-container"
-        :class="{ 'no-seek': !canControl }"
+        :class="{ 'no-seek': !canTransport }"
         ref="progressBarRef"
         @click="onProgressClick"
         @mousemove="onProgressHover"
@@ -38,18 +38,18 @@
 
       <div class="player-center">
         <span class="time-display time-current">{{ formatTime(currentElapsed) }}</span>
-        <!-- Transport controls require player.control -->
-        <template v-if="canControl">
-          <button class="control-btn" @click="store.prev()">
+        <!-- Transport controls: per-button gating honoring guest flags -->
+        <template v-if="canControl || canTransport || canSkip || canModeCtl">
+          <button v-if="canControl" class="control-btn" @click="store.prev()">
             <Icon icon="mdi:skip-previous" />
           </button>
-          <button class="play-btn" @click="togglePlay">
+          <button v-if="canTransport" class="play-btn" @click="togglePlay">
             <Icon :icon="store.isPlaying ? 'mdi:pause' : 'mdi:play'" />
           </button>
-          <button class="control-btn" @click="store.next()">
+          <button v-if="canSkip" class="control-btn" @click="store.next()">
             <Icon icon="mdi:skip-next" />
           </button>
-          <button class="control-btn mode-btn" @click="cycleMode" :title="modeLabel">
+          <button v-if="canModeCtl" class="control-btn mode-btn" @click="cycleMode" :title="modeLabel">
             <Icon :icon="modeIcon" />
             <span class="mode-label">{{ modeLabel }}</span>
           </button>
@@ -58,8 +58,8 @@
       </div>
 
       <div class="player-right">
-        <!-- Volume requires player.control -->
-        <template v-if="canControl">
+        <!-- Volume gated on transport -->
+        <template v-if="canTransport">
           <Icon icon="mdi:volume-high" class="volume-icon" />
           <input
             type="range"
@@ -94,8 +94,11 @@ const route = useRoute();
 const router = useRouter();
 const showQueue = ref(false);
 
-const { can } = useSession();
+const { can, guestCan } = useSession();
 const canControl = computed(() => can('player.control'));
+const canTransport = computed(() => can('player.control') || guestCan('transport'));
+const canSkip = computed(() => can('player.control') || guestCan('skip'));
+const canModeCtl = computed(() => can('player.control') || guestCan('playMode'));
 
 const store = usePlayerStore();
 const activeBot = computed(() => store.activeBot);
@@ -144,7 +147,7 @@ function updateProgress() {
 }
 
 async function onProgressClick(e: MouseEvent) {
-  if (!canControl.value) return; // seek requires player.control
+  if (!canTransport.value) return; // seek gated on transport (canTransport)
   const bar = progressBarRef.value;
   if (!bar) return;
   const rect = bar.getBoundingClientRect();

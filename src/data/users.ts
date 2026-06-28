@@ -4,7 +4,13 @@ import bcrypt from "bcryptjs";
 
 const BCRYPT_ROUNDS = 12;
 
-export type UserRole = "admin" | "member";
+export type UserRole = "admin" | "member" | "guest";
+
+/** Reserved synthetic principal for login-less guest sessions. The username is
+ *  non-ASCII so it can never collide with an API-created account (which is
+ *  validated against ^[A-Za-z0-9_\-.]{3,32}$). */
+export const GUEST_USER_ID = "__guest__";
+export const GUEST_USERNAME = "游客";
 
 export interface UserRow {
   id: string;
@@ -39,7 +45,7 @@ export class UsernameTakenError extends Error {
 }
 
 export function createUserStore(db: Database.Database): UserStore {
-  const countStmt = db.prepare("SELECT COUNT(*) AS n FROM users");
+  const countStmt = db.prepare("SELECT COUNT(*) AS n FROM users WHERE role != 'guest'");
   const countAdminsStmt = db.prepare("SELECT COUNT(*) AS n FROM users WHERE role = 'admin'");
   const insertStmt = db.prepare(
     "INSERT INTO users (id, username, passwordHash, createdAt, updatedAt, role) VALUES (?, ?, ?, ?, ?, ?)"
@@ -57,7 +63,7 @@ export function createUserStore(db: Database.Database): UserStore {
     "UPDATE users SET role = ?, updatedAt = ? WHERE id = ?"
   );
   const listUsersStmt = db.prepare(
-    "SELECT id, username, createdAt, role FROM users ORDER BY createdAt ASC"
+    "SELECT id, username, createdAt, role FROM users WHERE role != 'guest' ORDER BY createdAt ASC"
   );
   const deleteUserStmt = db.prepare("DELETE FROM users WHERE id = ?");
 
@@ -131,6 +137,7 @@ export function createUserStore(db: Database.Database): UserStore {
       const tx = db.transaction(() => {
         const row = findByIdStmt.get(id) as UserRow | undefined;
         if (!row) return "not_found" as const;
+        if (row.role === "guest") return "not_found" as const; // reserved synthetic principal
         if (row.role === newRole) return "ok" as const; // no-op
         if (row.role === "admin" && newRole === "member") {
           const adminCount = (countAdminsStmt.get() as { n: number }).n;
@@ -155,6 +162,7 @@ export function createUserStore(db: Database.Database): UserStore {
       const tx = db.transaction(() => {
         const row = findByIdStmt.get(id) as UserRow | undefined;
         if (!row) return "not_found" as const;
+        if (row.role === "guest") return "not_found" as const; // reserved synthetic principal
         if (row.role === "admin") {
           const adminCount = (countAdminsStmt.get() as { n: number }).n;
           if (adminCount <= 1) return "would_orphan" as const;

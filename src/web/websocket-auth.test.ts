@@ -7,6 +7,7 @@ import { createDatabase, type BotDatabase } from "../data/database.js";
 import { createUserStore } from "../data/users.js";
 import { createSessionStore } from "../data/sessions.js";
 import { validateSessionFromHeaders, SESSION_COOKIE_NAME } from "./auth/validateSession.js";
+import { setupWebSocket } from "./websocket.js";
 
 function buildServer(sessions: ReturnType<typeof createSessionStore>) {
   const app = express();
@@ -70,5 +71,111 @@ describe("WebSocket auth at upgrade", () => {
     });
     expect(msg).toBe("hello");
     ws.close();
+  });
+});
+
+describe("WebSocket guest bot scope", () => {
+  it("guest init is filtered to the guest bot scope", () => {
+    const sent: any[] = [];
+    const fakeWs: any = {
+      readyState: 1,
+      isGuest: true,
+      botScope: new Set(["bot1"]),
+      send: (m: string) => sent.push(JSON.parse(m)),
+      on: () => {},
+    };
+    const fakeWss: any = {
+      on: (ev: string, cb: any) => {
+        if (ev === "connection") fakeWss._conn = cb;
+      },
+    };
+    const makeBot = (id: string) => ({
+      id,
+      getStatus: () => ({ id }),
+      getQueue: () => [],
+      on: () => {},
+      removeListener: () => {},
+    });
+    const botManager: any = {
+      getAllBots: () => [makeBot("bot1"), makeBot("bot2")],
+      on: () => {},
+      off: () => {},
+      removeListener: () => {},
+    };
+    const { cleanup } = setupWebSocket(fakeWss, botManager, {
+      debug() {},
+      error() {},
+      info() {},
+      warn() {},
+    } as any);
+    fakeWss._conn(fakeWs);
+    const init = sent.find((m) => m.type === "init");
+    expect(init.bots.map((b: any) => b.id)).toEqual(["bot1"]);
+    cleanup();
+  });
+});
+
+describe("WebSocket refreshGuestPolicy", () => {
+  function makeHarness() {
+    const clients: any[] = [];
+    const fakeWss: any = {
+      on: (ev: string, cb: any) => {
+        if (ev === "connection") fakeWss._conn = cb;
+      },
+    };
+    const botManager: any = {
+      getAllBots: () => [],
+      on: () => {},
+      off: () => {},
+      removeListener: () => {},
+    };
+    const logger = { debug() {}, error() {}, info() {}, warn() {} } as any;
+    const controller = setupWebSocket(fakeWss, botManager, logger);
+    // Connect fake sockets via the connection handler so they land in `clients`.
+    const connect = (ws: any) => {
+      clients.push(ws);
+      fakeWss._conn(ws);
+    };
+    return { controller, connect };
+  }
+
+  function makeFakeWs(opts: { isGuest: boolean; botScope?: "all" | Set<string> }) {
+    const closeCalls: Array<{ code?: number; reason?: string }> = [];
+    const ws: any = {
+      readyState: 1,
+      isGuest: opts.isGuest,
+      botScope: opts.botScope,
+      send: () => {},
+      on: () => {},
+      close: (code?: number, reason?: string) => closeCalls.push({ code, reason }),
+    };
+    return { ws, closeCalls };
+  }
+
+  it("disabling guest mode closes guest sockets but leaves non-guest sockets open", () => {
+    const { controller, connect } = makeHarness();
+    const guest = makeFakeWs({ isGuest: true, botScope: new Set(["bot1"]) });
+    const member = makeFakeWs({ isGuest: false, botScope: "all" });
+    connect(guest.ws);
+    connect(member.ws);
+
+    controller.refreshGuestPolicy({ enabled: false, bots: "all" });
+
+    expect(guest.closeCalls.length).toBe(1);
+    expect(guest.closeCalls[0].code).toBe(1008);
+    expect(member.closeCalls.length).toBe(0);
+  });
+
+  it("narrowing the guest scope live re-scopes open guest sockets", () => {
+    const { controller, connect } = makeHarness();
+    const guest = makeFakeWs({ isGuest: true, botScope: new Set(["bot1"]) });
+    connect(guest.ws);
+
+    controller.refreshGuestPolicy({ enabled: true, bots: ["bot2"] });
+
+    expect(guest.closeCalls.length).toBe(0);
+    expect(guest.ws.botScope instanceof Set).toBe(true);
+    expect(guest.ws.botScope.has("bot2")).toBe(true);
+    expect(guest.ws.botScope.has("bot1")).toBe(false);
   });
 });

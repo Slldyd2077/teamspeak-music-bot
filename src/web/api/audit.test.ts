@@ -7,6 +7,7 @@ import { createUserStore } from "../../data/users.js";
 import { createSessionStore } from "../../data/sessions.js";
 import { createAuditStore } from "../../data/audit.js";
 import { createPermissionStore } from "../../data/permissions.js";
+import { getDefaultConfig } from "../../data/config.js";
 import { createRequireAuth } from "../middleware/requireAuth.js";
 import { createAuditRouter } from "./audit.js";
 import { SESSION_COOKIE_NAME } from "../auth/validateSession.js";
@@ -34,7 +35,7 @@ describe("audit router", () => {
     app = express();
     app.use(express.json());
     app.use(cookieParser());
-    app.use("/api", createRequireAuth(sessions, permissions));
+    app.use("/api", createRequireAuth(sessions, permissions, () => getDefaultConfig().guestMode));
     app.use("/api/audit", createAuditRouter(audit));
   });
 

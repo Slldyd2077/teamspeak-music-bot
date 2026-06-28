@@ -88,3 +88,46 @@ describe("PermissionStore", () => {
     });
   });
 });
+
+import { GUEST_PERMISSION_FLAGS } from "./permissions.js";
+
+describe("resolvePermissionContext guest branch", () => {
+  const noStore = {
+    getCapabilities: () => [],
+    getBotAccess: () => [] as string[],
+    setPermissions: () => {},
+    pruneBot: () => {},
+  };
+
+  it("guest has no member capabilities and exposes the guest permissions + bots", () => {
+    const ctx = resolvePermissionContext("guest", "__guest__", noStore, {
+      bots: ["bot1"],
+      permissions: {
+        addToQueue: true, playNext: false, playNow: false,
+        skip: true, transport: false, removeClear: false, playMode: false,
+      },
+    });
+    expect([...ctx.capabilities]).toEqual([]);
+    expect(ctx.bots).toBeInstanceOf(Set);
+    expect((ctx.bots as Set<string>).has("bot1")).toBe(true);
+    expect(ctx.guest?.addToQueue).toBe(true);
+    expect(ctx.guest?.skip).toBe(true);
+  });
+
+  it("guest with bots:'all' resolves to 'all'", () => {
+    const ctx = resolvePermissionContext("guest", "__guest__", noStore, {
+      bots: "all",
+      permissions: {
+        addToQueue: true, playNext: false, playNow: false,
+        skip: false, transport: false, removeClear: false, playMode: false,
+      },
+    });
+    expect(ctx.bots).toBe("all");
+  });
+
+  it("exposes the 7 canonical flags", () => {
+    expect([...GUEST_PERMISSION_FLAGS].sort()).toEqual(
+      ["addToQueue", "playMode", "playNext", "playNow", "removeClear", "skip", "transport"].sort()
+    );
+  });
+});

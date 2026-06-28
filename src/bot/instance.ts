@@ -82,6 +82,7 @@ export class BotInstance extends EventEmitter {
   private lastSearchResults: Song[] = [];
   /** 当前曲实际播放时长（试听片段秒数或完整 duration）；resolveAndPlay 赋值。 */
   private effectiveDuration: number | undefined;
+  private playGate: Promise<unknown> = Promise.resolve();
 
   constructor(options: BotInstanceOptions) {
     super();
@@ -1055,6 +1056,14 @@ export class BotInstance extends EventEmitter {
     const pathMatch = input.match(/\/(\d+)/);
     if (pathMatch) return pathMatch[1];
     return input;
+  }
+
+  /** Serialize queue-mutation + play sequences so concurrent requests can't
+   *  interleave (audible track must match queue.currentIndex). */
+  runExclusive<T>(fn: () => Promise<T>): Promise<T> {
+    const next = this.playGate.then(fn, fn);
+    this.playGate = next.catch(() => {});
+    return next;
   }
 
   getStatus(): BotStatus {

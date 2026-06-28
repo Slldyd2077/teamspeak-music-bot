@@ -60,7 +60,7 @@ describe("bot router /settings", () => {
     app = express();
     app.use(express.json());
     app.use(cookieParser());
-    app.use("/api", createRequireAuth(sessions, createPermissionStore(botDb.db)));
+    app.use("/api", createRequireAuth(sessions, createPermissionStore(botDb.db), () => getDefaultConfig().guestMode));
     app.use(
       "/api/bot",
       createBotRouter(fakeManager, config, configPath, pino({ level: "silent" }), botDb, avatarStore),
@@ -157,5 +157,60 @@ describe("bot router /settings", () => {
     for (const bot of fakeBots) {
       expect(bot.autoPauseCalls).toEqual([]);
     }
+  });
+});
+
+describe("bot router /settings guest-mode gating + persistence", () => {
+  let tmpDir: string;
+  let configPath: string;
+  let config: BotConfig;
+  let botDb: BotDatabase;
+
+  beforeEach(() => {
+    botDb = createDatabase(":memory:");
+    tmpDir = mkdtempSync(join(tmpdir(), "botsettings-gm-"));
+    configPath = join(tmpDir, "config.json");
+    config = getDefaultConfig();
+  });
+
+  afterEach(() => {
+    botDb.close();
+    rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  /** Mounts createBotRouter with an injected req.user (no session/cookie). */
+  function mountBot(injectUser: () => unknown): express.Express {
+    const fakeManager = { getAllBots: () => [] } as unknown as BotManager;
+    const avatarStore = createAvatarStore(tmpDir);
+    const app = express();
+    app.use(express.json());
+    app.use((req, _res, next) => { (req as { user?: unknown }).user = injectUser(); next(); });
+    app.use(
+      "/api/bot",
+      createBotRouter(fakeManager, config, configPath, pino({ level: "silent" }), botDb, avatarStore),
+    );
+    return app;
+  }
+
+  it("GET /settings is 403 for guests and includes guestMode for admins", async () => {
+    const guestApp = mountBot(() => ({ role: "guest", guest: {} }));
+    expect((await request(guestApp).get("/api/bot/settings")).status).toBe(403);
+    const adminApp = mountBot(() => ({ role: "admin" }));
+    const res = await request(adminApp).get("/api/bot/settings");
+    expect(res.status).toBe(200);
+    expect(res.body.guestMode).toBeDefined();
+    expect(res.body.guestMode.enabled).toBe(false);
+  });
+
+  it("POST /settings persists a guestMode block", async () => {
+    const adminApp = mountBot(() => ({ role: "admin" }));
+    const res = await request(adminApp).post("/api/bot/settings").send({
+      guestMode: { enabled: true, bots: ["bot1"], permissions: { playNext: true } },
+    });
+    expect(res.status).toBe(200);
+    expect(res.body.guestMode.enabled).toBe(true);
+    expect(res.body.guestMode.bots).toEqual(["bot1"]);
+    expect(res.body.guestMode.permissions.playNext).toBe(true);
+    expect(res.body.guestMode.permissions.addToQueue).toBe(true); // untouched default
   });
 });

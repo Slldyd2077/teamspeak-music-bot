@@ -4,6 +4,7 @@ import { YouTubeProvider } from "../../music/youtube.js";
 import type { CookieStore } from "../../music/auth.js";
 import type { Logger } from "../../logger.js";
 import { requirePermission } from "../middleware/requirePermission.js";
+import { requireNotGuest } from "../middleware/requireNotGuest.js";
 
 export function createAuthRouter(
   neteaseProvider: MusicProvider,
@@ -23,7 +24,7 @@ export function createAuthRouter(
     return platform === "qq" ? qqProvider : neteaseProvider;
   }
 
-  router.get("/status", async (req, res) => {
+  router.get("/status", requireNotGuest, async (req, res) => {
     try {
       const platform = req.query.platform as string;
       const provider = getProvider(platform);
@@ -49,7 +50,7 @@ export function createAuthRouter(
     }
   });
 
-  router.get("/qrcode/status", async (req, res) => {
+  router.get("/qrcode/status", requireNotGuest, async (req, res) => {
     try {
       const { key, platform } = req.query;
       if (!key) {

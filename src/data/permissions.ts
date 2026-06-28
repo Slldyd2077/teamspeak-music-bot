@@ -21,6 +21,27 @@ export function isCapability(x: string): x is Capability {
 
 export type BotAccess = "all" | string[];
 
+export interface GuestPermissions {
+  addToQueue: boolean;
+  playNext: boolean;
+  playNow: boolean;
+  skip: boolean;
+  transport: boolean;
+  removeClear: boolean;
+  playMode: boolean;
+}
+
+export const GUEST_PERMISSION_FLAGS = [
+  "addToQueue",
+  "playNext",
+  "playNow",
+  "skip",
+  "transport",
+  "removeClear",
+  "playMode",
+] as const;
+export type GuestFlag = (typeof GUEST_PERMISSION_FLAGS)[number];
+
 export interface PermissionStore {
   getCapabilities(userId: string): Capability[];
   getBotAccess(userId: string): BotAccess;
@@ -71,15 +92,25 @@ export function createPermissionStore(db: Database.Database): PermissionStore {
 export interface PermissionContext {
   capabilities: Set<string>;
   bots: "all" | Set<string>;
+  guest?: GuestPermissions;
 }
 
 export function resolvePermissionContext(
-  role: "admin" | "member",
+  role: "admin" | "member" | "guest",
   userId: string,
-  store: PermissionStore
+  store: PermissionStore,
+  guest?: { bots: BotAccess; permissions: GuestPermissions }
 ): PermissionContext {
   if (role === "admin") {
     return { capabilities: new Set(CAPABILITIES), bots: "all" };
+  }
+  if (role === "guest") {
+    const bots = guest?.bots ?? [];
+    return {
+      capabilities: new Set<string>(),
+      bots: bots === "all" ? "all" : new Set(bots),
+      guest: guest?.permissions,
+    };
   }
   const access = store.getBotAccess(userId);
   return {

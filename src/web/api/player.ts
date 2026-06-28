@@ -4,7 +4,8 @@ import type { BotDatabase } from "../../data/database.js";
 import type { MusicProvider } from "../../music/provider.js";
 import type { Logger } from "../../logger.js";
 import { parseCommand } from "../../bot/commands.js";
-import { requirePermission, requireBotAccess } from "../middleware/requirePermission.js";
+import { requireBotAccess } from "../middleware/requirePermission.js";
+import { authorize } from "../middleware/authorize.js";
 
 export function createPlayerRouter(
   botManager: BotManager,
@@ -41,7 +42,7 @@ export function createPlayerRouter(
     return "";
   };
 
-  router.post("/:botId/play", requirePermission("player.control"), async (req, res) => {
+  router.post("/:botId/play", authorize({ capability: "player.control" }), async (req, res) => {
     try {
       const bot = (req as any).bot;
       const { query, platform } = req.body;
@@ -61,7 +62,7 @@ export function createPlayerRouter(
     }
   });
 
-  router.post("/:botId/add", requirePermission("player.queue"), async (req, res) => {
+  router.post("/:botId/add", authorize({ capability: "player.queue", guestFlag: "addToQueue" }), async (req, res) => {
     try {
       const bot = (req as any).bot;
       const { query, platform } = req.body;
@@ -88,14 +89,14 @@ export function createPlayerRouter(
     }
   };
 
-  router.post("/:botId/pause", requirePermission("player.control"), simpleCommand("!pause"));
-  router.post("/:botId/resume", requirePermission("player.control"), simpleCommand("!resume"));
-  router.post("/:botId/next", requirePermission("player.control"), simpleCommand("!next"));
-  router.post("/:botId/prev", requirePermission("player.control"), simpleCommand("!prev"));
-  router.post("/:botId/stop", requirePermission("player.control"), simpleCommand("!stop"));
-  router.post("/:botId/clear", requirePermission("player.queue"), simpleCommand("!clear"));
+  router.post("/:botId/pause", authorize({ capability: "player.control", guestFlag: "transport" }), simpleCommand("!pause"));
+  router.post("/:botId/resume", authorize({ capability: "player.control", guestFlag: "transport" }), simpleCommand("!resume"));
+  router.post("/:botId/next", authorize({ capability: "player.control", guestFlag: "skip" }), simpleCommand("!next"));
+  router.post("/:botId/prev", authorize({ capability: "player.control" }), simpleCommand("!prev"));
+  router.post("/:botId/stop", authorize({ capability: "player.control" }), simpleCommand("!stop"));
+  router.post("/:botId/clear", authorize({ capability: "player.queue", guestFlag: "removeClear" }), simpleCommand("!clear"));
 
-  router.post("/:botId/fm", requirePermission("player.control"), async (req, res) => {
+  router.post("/:botId/fm", authorize({ capability: "player.control", guestFlag: "playMode" }), async (req, res) => {
     try {
       const bot = (req as any).bot;
       const { platform } = req.body;
@@ -117,7 +118,7 @@ export function createPlayerRouter(
     }
   });
 
-  router.post("/:botId/volume", requirePermission("player.control"), async (req, res) => {
+  router.post("/:botId/volume", authorize({ capability: "player.control", guestFlag: "transport" }), async (req, res) => {
     try {
       const bot = (req as any).bot;
       const { volume } = req.body;
@@ -145,7 +146,7 @@ export function createPlayerRouter(
 
   const VALID_MODES = new Set(["seq", "loop", "random", "rloop"]);
 
-  router.post("/:botId/mode", requirePermission("player.control"), async (req, res) => {
+  router.post("/:botId/mode", authorize({ capability: "player.control", guestFlag: "playMode" }), async (req, res) => {
     try {
       const bot = (req as any).bot;
       const { mode } = req.body;
@@ -170,7 +171,7 @@ export function createPlayerRouter(
   });
 
   // Seek to position
-  router.post("/:botId/seek", requirePermission("player.control"), async (req, res) => {
+  router.post("/:botId/seek", authorize({ capability: "player.control", guestFlag: "transport" }), async (req, res) => {
     try {
       const bot = (req as any).bot;
       const { position } = req.body; // seconds
@@ -194,7 +195,7 @@ export function createPlayerRouter(
     res.json({ queue: bot.getQueue(), status: bot.getStatus() });
   });
 
-  router.delete("/:botId/queue/:index", requirePermission("player.queue"), async (req, res) => {
+  router.delete("/:botId/queue/:index", authorize({ capability: "player.queue", guestFlag: "removeClear" }), async (req, res) => {
     try {
       const bot = (req as any).bot;
       const cmd = parseCommand(`!remove ${req.params.index}`, "!")!;
@@ -206,7 +207,7 @@ export function createPlayerRouter(
   });
 
   // Jump to a specific index in the queue (without clearing it)
-  router.post("/:botId/play-at", requirePermission("player.control"), async (req, res) => {
+  router.post("/:botId/play-at", authorize({ capability: "player.control" }), async (req, res) => {
     try {
       const bot = (req as any).bot;
       const { index } = req.body;
@@ -214,33 +215,40 @@ export function createPlayerRouter(
         res.status(400).json({ error: "index is required" });
         return;
       }
-      const queue = bot.getQueueManager();
-      // Validate the index BEFORE stopping current playback — otherwise an
-      // invalid index silently kills the user's current song and leaves the
-      // queue idle.
-      if (index >= queue.size()) {
-        res.status(400).json({ error: "Invalid queue index" });
+      // Serialize the index-validation + stop/reset/playAt/resolveAndPlay so a
+      // concurrent request can't interleave between mutating the queue and
+      // starting playback (audible track must match queue.currentIndex).
+      const result = await bot.runExclusive(async () => {
+        const queue = bot.getQueueManager();
+        // Validate the index BEFORE stopping current playback — otherwise an
+        // invalid index silently kills the user's current song and leaves the
+        // queue idle.
+        if (index >= queue.size()) {
+          return { status: 400 as const, body: { error: "Invalid queue index" } };
+        }
+        bot.getPlayer().stop();
+        bot.getPlayer().resetFailures();
+        const song = queue.playAt(index);
+        if (!song) {
+          return { status: 400 as const, body: { error: "Invalid queue index" } };
+        }
+        const ok = await bot.resolveAndPlay(song);
+        if (!ok) {
+          return { body: { message: `Cannot play: ${song.name}` } };
+        }
+        return { body: { message: `Now playing: ${song.name} - ${song.artist}` } };
+      });
+      if (result.status) {
+        res.status(result.status).json(result.body);
         return;
       }
-      bot.getPlayer().stop();
-      bot.getPlayer().resetFailures();
-      const song = queue.playAt(index);
-      if (!song) {
-        res.status(400).json({ error: "Invalid queue index" });
-        return;
-      }
-      const ok = await bot.resolveAndPlay(song);
-      if (!ok) {
-        res.json({ message: `Cannot play: ${song.name}` });
-        return;
-      }
-      res.json({ message: `Now playing: ${song.name} - ${song.artist}` });
+      res.json(result.body);
     } catch (err) {
       res.status(500).json({ error: (err as Error).message });
     }
   });
 
-  router.post("/:botId/playlist", requirePermission("player.queue"), async (req, res) => {
+  router.post("/:botId/playlist", authorize({ capability: "player.queue" }), async (req, res) => {
     try {
       const bot = (req as any).bot;
       const { playlistId, platform } = req.body;
@@ -257,7 +265,7 @@ export function createPlayerRouter(
 
   // Play a playlist by ID — stores metadata only, resolves URL for first song
   // Respects current play mode (random = pick random first song)
-  router.post("/:botId/play-playlist", requirePermission("player.control"), async (req, res) => {
+  router.post("/:botId/play-playlist", authorize({ capability: "player.control" }), async (req, res) => {
     try {
       const bot = (req as any).bot;
       const { playlistId, platform } = req.body;
@@ -344,7 +352,7 @@ export function createPlayerRouter(
   });
 
   // Play an album by ID — mirrors play-playlist but calls getAlbumSongs
-  router.post("/:botId/play-album", requirePermission("player.control"), async (req, res) => {
+  router.post("/:botId/play-album", authorize({ capability: "player.control" }), async (req, res) => {
     try {
       const bot = (req as any).bot;
       const { albumId, platform } = req.body;
@@ -416,7 +424,7 @@ export function createPlayerRouter(
   });
 
   // Play a single song by ID — resolves URL on demand
-  router.post("/:botId/play-song", requirePermission("player.control"), async (req, res) => {
+  router.post("/:botId/play-song", authorize({ capability: "player.control" }), async (req, res) => {
     try {
       const bot = (req as any).bot;
       const { song } = req.body;
@@ -444,7 +452,7 @@ export function createPlayerRouter(
 
   // Insert a single song to play right after the current one.
   // If nothing is playing, behaves like /play-song (start immediately).
-  router.post("/:botId/play-next-song", requirePermission("player.control"), async (req, res) => {
+  router.post("/:botId/play-next-song", authorize({ capability: "player.control", guestFlag: "playNext" }), async (req, res) => {
     try {
       const bot = (req as any).bot;
       const { song } = req.body;
@@ -452,37 +460,43 @@ export function createPlayerRouter(
         res.status(400).json({ error: "song object with id and platform is required" });
         return;
       }
-      const queue = bot.getQueueManager();
-      const wasIdle = bot.getPlayer().getState() === "idle";
-      // Capture the slot addNext WILL insert at, before mutating the queue.
-      // addNext pushes when currentIndex<0 (slot = size); otherwise splices
-      // at currentIndex+1. Using size-1 after addNext was wrong when the
-      // queue had stale currentIndex>=0 while the player was idle (e.g.,
-      // after natural track end without queue.clear()).
-      const insertedAt =
-        queue.getCurrentIndex() < 0 ? queue.size() : queue.getCurrentIndex() + 1;
-      queue.addNext(song);
+      // Serialize the queue mutation + playback so concurrent requests can't
+      // interleave (audible track must match queue.currentIndex).
+      const body = await bot.runExclusive(async () => {
+        const queue = bot.getQueueManager();
+        const wasIdle = bot.getPlayer().getState() === "idle";
+        // Capture the slot addNext WILL insert at, before mutating the queue.
+        // addNext pushes when currentIndex<0 (slot = size); otherwise splices
+        // at currentIndex+1. Using size-1 after addNext was wrong when the
+        // queue had stale currentIndex>=0 while the player was idle (e.g.,
+        // after natural track end without queue.clear()).
+        const insertedAt =
+          queue.getCurrentIndex() < 0 ? queue.size() : queue.getCurrentIndex() + 1;
+        queue.addNext(song);
 
-      if (wasIdle) {
-        // Promote the just-added song to current and start it.
-        queue.playAt(insertedAt);
-        bot.getPlayer().resetFailures();
-        const ok = await bot.resolveAndPlay(queue.current()!);
-        if (!ok) {
-          res.json({ ok: false, message: `无法播放「${song.name || song.id}」（区域/版权限制）` });
-          return;
+        if (wasIdle) {
+          // Promote the just-added song to current and start it.
+          queue.playAt(insertedAt);
+          bot.getPlayer().resetFailures();
+          const ok = await bot.resolveAndPlay(queue.current()!);
+          if (!ok) {
+            return { ok: false, message: `无法播放「${song.name || song.id}」（区域/版权限制）` };
+          }
+          return { ok: true, message: `正在播放：${song.name || 'Unknown'} - ${song.artist || 'Unknown'}` };
         }
-        res.json({ ok: true, message: `正在播放：${song.name || 'Unknown'} - ${song.artist || 'Unknown'}` });
-        return;
-      }
 
-      res.json({ ok: true, message: `已加入下一首：${song.name || 'Unknown'} - ${song.artist || 'Unknown'}` });
+        return { ok: true, message: `已加入下一首：${song.name || 'Unknown'} - ${song.artist || 'Unknown'}` };
+      });
+      res.json(body);
     } catch (err) {
       res.status(500).json({ error: (err as Error).message });
     }
   });
 
-  router.post("/:botId/add-song", requirePermission("player.queue"), async (req, res) => {
+  // Play a song "now" without clearing the queue: insert after current, then
+  // promote to current and start it. Non-destructive (unlike /play-song which
+  // clears the whole queue) — this is the guest-safe "play now".
+  router.post("/:botId/play-now-song", authorize({ capability: "player.control", guestFlag: "playNow" }), async (req, res) => {
     try {
       const bot = (req as any).bot;
       const { song } = req.body;
@@ -490,27 +504,60 @@ export function createPlayerRouter(
         res.status(400).json({ error: "song object with id and platform is required" });
         return;
       }
-      const queue = bot.getQueueManager();
-      const wasIdle = bot.getPlayer().getState() === "idle";
-      queue.add(song);
-
-      // If nothing was playing, start this newly-added song immediately.
-      if (wasIdle) {
-        queue.playAt(queue.size() - 1);
+      // Serialize the insert-after-current + promote + playback so concurrent
+      // requests can't interleave (audible track must match queue.currentIndex).
+      const body = await bot.runExclusive(async () => {
+        const queue = bot.getQueueManager();
+        const insertedAt =
+          queue.getCurrentIndex() < 0 ? queue.size() : queue.getCurrentIndex() + 1;
+        queue.addNext(song);
+        queue.playAt(insertedAt);
         bot.getPlayer().resetFailures();
-        await bot.resolveAndPlay(queue.current()!);
-        res.json({ message: `Now playing: ${song.name || 'Unknown'} - ${song.artist || 'Unknown'}` });
+        const ok = await bot.resolveAndPlay(queue.current()!);
+        if (!ok) {
+          return { ok: false, message: `无法播放「${song.name || song.id}」（区域/版权限制）` };
+        }
+        return { ok: true, message: `正在播放：${song.name || "Unknown"} - ${song.artist || "Unknown"}` };
+      });
+      res.json(body);
+    } catch (err) {
+      res.status(500).json({ error: (err as Error).message });
+    }
+  });
+
+  router.post("/:botId/add-song", authorize({ capability: "player.queue", guestFlag: "addToQueue" }), async (req, res) => {
+    try {
+      const bot = (req as any).bot;
+      const { song } = req.body;
+      if (!song || !song.id || !song.platform) {
+        res.status(400).json({ error: "song object with id and platform is required" });
         return;
       }
+      // Serialize the queue mutation + (possible) playback so concurrent
+      // requests can't interleave (audible track must match queue.currentIndex).
+      const body = await bot.runExclusive(async () => {
+        const queue = bot.getQueueManager();
+        const wasIdle = bot.getPlayer().getState() === "idle";
+        queue.add(song);
 
-      res.json({ message: `Added to queue: ${song.name || 'Unknown'} - ${song.artist || 'Unknown'} (position ${queue.size()})` });
+        // If nothing was playing, start this newly-added song immediately.
+        if (wasIdle) {
+          queue.playAt(queue.size() - 1);
+          bot.getPlayer().resetFailures();
+          await bot.resolveAndPlay(queue.current()!);
+          return { message: `Now playing: ${song.name || 'Unknown'} - ${song.artist || 'Unknown'}` };
+        }
+
+        return { message: `Added to queue: ${song.name || 'Unknown'} - ${song.artist || 'Unknown'} (position ${queue.size()})` };
+      });
+      res.json(body);
     } catch (err) {
       res.status(500).json({ error: (err as Error).message });
     }
   });
 
   // Add a song to queue by ID — metadata only
-  router.post("/:botId/add-by-id", requirePermission("player.queue"), async (req, res) => {
+  router.post("/:botId/add-by-id", authorize({ capability: "player.queue", guestFlag: "addToQueue" }), async (req, res) => {
     try {
       const bot = (req as any).bot;
       const { songId, platform } = req.body;
@@ -548,7 +595,7 @@ export function createPlayerRouter(
     res.json(bot.getProfileManager().getConfig());
   });
 
-  router.put("/:botId/profile", requirePermission("bot.manage"), (req, res) => {
+  router.put("/:botId/profile", authorize({ capability: "bot.manage" }), (req, res) => {
     try {
       const bot = (req as any).bot;
       const pm = bot.getProfileManager();

@@ -4,7 +4,7 @@
       <h3 class="queue-title">播放队列</h3>
       <span class="queue-count">{{ botQueue.length }} 首</span>
       <button
-        v-if="botQueue.length > 0 && can('player.control')"
+        v-if="botQueue.length > 0 && (can('player.control') || guestCan('removeClear'))"
         class="clear-btn"
         @click="clearAndStop"
         title="清空队列并停止播放"
@@ -33,7 +33,7 @@
           <div class="queue-song-name">{{ song.name }}</div>
           <div class="queue-song-artist">{{ song.artist }}</div>
         </div>
-        <button v-if="can('player.queue')" class="remove-btn" @click="removeSong(i)" title="移除">
+        <button v-if="can('player.queue') || guestCan('removeClear')" class="remove-btn" @click="removeSong(i)" title="移除">
           <Icon icon="mdi:close" />
         </button>
       </div>
@@ -58,7 +58,7 @@ defineEmits<{
 }>();
 
 const store = usePlayerStore();
-const { can } = useSession();
+const { can, guestCan } = useSession();
 const botQueue = computed(() => store.queue);
 
 // Fetch queue when panel opens

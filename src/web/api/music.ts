@@ -3,6 +3,7 @@ import type { MusicProvider } from "../../music/provider.js";
 import { YouTubeProvider } from "../../music/youtube.js";
 import type { Logger } from "../../logger.js";
 import { requirePermission } from "../middleware/requirePermission.js";
+import { requireNotGuest } from "../middleware/requireNotGuest.js";
 
 export function createMusicRouter(
   neteaseProvider: MusicProvider,
@@ -127,7 +128,7 @@ export function createMusicRouter(
     }
   });
 
-  router.get("/recommend/songs", async (req, res) => {
+  router.get("/recommend/songs", requireNotGuest, async (req, res) => {
     try {
       const provider = getProvider(req.query.platform as string);
       if (!provider.getDailyRecommendSongs) {
@@ -142,7 +143,7 @@ export function createMusicRouter(
     }
   });
 
-  router.get("/personal/fm", async (req, res) => {
+  router.get("/personal/fm", requireNotGuest, async (req, res) => {
     try {
       const provider = getProvider(req.query.platform as string);
       if (!provider.getPersonalFm) {
@@ -157,7 +158,7 @@ export function createMusicRouter(
     }
   });
 
-  router.get("/user/playlists", async (req, res) => {
+  router.get("/user/playlists", requireNotGuest, async (req, res) => {
     try {
       const provider = getProvider(req.query.platform as string);
       if (!provider.getUserPlaylists) {
@@ -209,7 +210,7 @@ export function createMusicRouter(
   });
 
   // Get current quality
-  router.get("/quality", (_req, res) => {
+  router.get("/quality", requireNotGuest, (_req, res) => {
     res.json({
       netease: neteaseProvider.getQuality(),
       qq: qqProvider.getQuality(),

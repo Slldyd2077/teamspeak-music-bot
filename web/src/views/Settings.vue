@@ -455,6 +455,55 @@
       </label>
     </section>
 
+    <!-- Guest Mode (admin only) -->
+    <section v-if="session.isAdmin.value" class="settings-section">
+      <h2 class="section-title">游客模式</h2>
+      <p class="profile-section-hint">开启后，访客无需登录即可进入并点歌（默认关闭）。游客永远无法查看或修改设置。下面逐项决定游客可用的能力。</p>
+
+      <label class="profile-toggle behavior-toggle">
+        <div class="profile-toggle-text">
+          <div class="profile-toggle-label">允许游客访问</div>
+          <div class="profile-toggle-hint">登录页会出现「以游客身份进入」。关闭后所有游客会话立即失效。</div>
+        </div>
+        <input v-model="guestMode.enabled" type="checkbox" class="profile-toggle-switch" />
+      </label>
+
+      <div v-if="guestMode.enabled" class="perm-group">
+        <div class="perm-group-title">游客权限</div>
+        <div class="perm-checks">
+          <label v-for="f in GUEST_FLAGS" :key="f.token" class="perm-check">
+            <input type="checkbox" v-model="guestMode.permissions[f.token]" />
+            {{ f.label }}
+          </label>
+        </div>
+      </div>
+
+      <div v-if="guestMode.enabled" class="perm-group">
+        <div class="perm-group-title">可控制的机器人</div>
+        <label class="perm-check">
+          <input type="checkbox" v-model="guestMode.botsAll" />
+          全部机器人
+        </label>
+        <div v-if="!guestMode.botsAll" class="perm-checks perm-bots">
+          <label v-for="bot in store.bots" :key="bot.id" class="perm-check">
+            <input
+              type="checkbox"
+              :checked="guestMode.selectedBotIds.includes(bot.id)"
+              @change="toggleGuestBot(bot.id, ($event.target as HTMLInputElement).checked)"
+            />
+            {{ bot.name }}
+          </label>
+          <span v-if="store.bots.length === 0" class="user-empty">还没有机器人。</span>
+        </div>
+      </div>
+
+      <div class="form-actions">
+        <button class="btn-primary" :disabled="guestSaving" @click="saveGuestMode">
+          {{ guestSaving ? '保存中…' : '保存' }}
+        </button>
+      </div>
+    </section>
+
     <!-- Bot Profile (TeamSpeak Behavior) -->
     <section v-if="can('bot.manage')" class="settings-section">
       <h2 class="section-title">机器人 Profile（TeamSpeak 行为）</h2>
@@ -977,6 +1026,7 @@ async function loadIdleTimeout() {
     const res = await axios.get('/api/bot/settings');
     idleTimeout.value = res.data.idleTimeoutMinutes ?? 0;
     autoPauseOnEmpty.value = res.data.autoPauseOnEmpty ?? false;
+    applyGuestModeFromServer(res.data.guestMode);
   } catch { /* ignore */ }
 }
 
@@ -990,6 +1040,56 @@ async function saveAutoPause() {
   try {
     await axios.post('/api/bot/settings', { autoPauseOnEmpty: autoPauseOnEmpty.value });
   } catch { /* ignore */ }
+}
+
+// --- Guest mode (admin only) ---
+const GUEST_FLAGS: { token: string; label: string }[] = [
+  { token: 'addToQueue', label: '添加到队列末尾' },
+  { token: 'playNext', label: '添加到下一首' },
+  { token: 'playNow', label: '立即播放（不清空队列）' },
+  { token: 'skip', label: '跳过当前歌曲' },
+  { token: 'transport', label: '暂停/继续/进度/音量' },
+  { token: 'removeClear', label: '移除/清空队列' },
+  { token: 'playMode', label: '切换播放模式 / FM' },
+];
+const guestMode = reactive<{ enabled: boolean; botsAll: boolean; selectedBotIds: string[]; permissions: Record<string, boolean> }>({
+  enabled: false,
+  botsAll: true,
+  selectedBotIds: [],
+  permissions: { addToQueue: true, playNext: false, playNow: false, skip: false, transport: false, removeClear: false, playMode: false },
+});
+const guestSaving = ref(false);
+
+function applyGuestModeFromServer(gm: any) {
+  if (!gm) return;
+  guestMode.enabled = Boolean(gm.enabled);
+  guestMode.botsAll = gm.bots === 'all';
+  guestMode.selectedBotIds = Array.isArray(gm.bots) ? [...gm.bots] : [];
+  for (const f of GUEST_FLAGS) {
+    guestMode.permissions[f.token] = Boolean(gm.permissions?.[f.token]);
+  }
+}
+
+function toggleGuestBot(id: string, checked: boolean) {
+  const has = guestMode.selectedBotIds.includes(id);
+  if (checked && !has) guestMode.selectedBotIds.push(id);
+  else if (!checked && has) guestMode.selectedBotIds = guestMode.selectedBotIds.filter((b) => b !== id);
+}
+
+async function saveGuestMode() {
+  guestSaving.value = true;
+  try {
+    const res = await axios.post('/api/bot/settings', {
+      guestMode: {
+        enabled: guestMode.enabled,
+        bots: guestMode.botsAll ? 'all' : [...guestMode.selectedBotIds],
+        permissions: { ...guestMode.permissions },
+      },
+    });
+    applyGuestModeFromServer(res.data?.guestMode);
+  } catch { /* ignore */ } finally {
+    guestSaving.value = false;
+  }
 }
 
 // --- Bot Profile config ---

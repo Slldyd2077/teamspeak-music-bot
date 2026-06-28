@@ -1,5 +1,13 @@
 import { readFileSync, writeFileSync, mkdirSync, existsSync, copyFileSync, rmSync } from "node:fs";
 import { dirname } from "node:path";
+import type { BotAccess, GuestPermissions } from "./permissions.js";
+import { GUEST_PERMISSION_FLAGS } from "./permissions.js";
+
+export interface GuestModeConfig {
+  enabled: boolean;
+  bots: BotAccess; // "all" | string[]
+  permissions: GuestPermissions;
+}
 
 export interface BotConfig {
   webPort: number;
@@ -22,6 +30,7 @@ export interface BotConfig {
   // (nginx/Caddy/Cloudflare). Required for correct protocol/host detection
   // behind HTTPS-terminating proxies.
   trustProxy: boolean;
+  guestMode: GuestModeConfig;
 }
 
 export function getDefaultConfig(): BotConfig {
@@ -43,6 +52,19 @@ export function getDefaultConfig(): BotConfig {
     idleTimeoutMinutes: 0,
     publicUrl: "",
     trustProxy: false,
+    guestMode: {
+      enabled: false,
+      bots: "all",
+      permissions: {
+        addToQueue: true,
+        playNext: false,
+        playNow: false,
+        skip: false,
+        transport: false,
+        removeClear: false,
+        playMode: false,
+      },
+    },
   };
 }
 
@@ -51,7 +73,42 @@ export function loadConfig(path: string): BotConfig {
   try {
     const raw = readFileSync(path, "utf-8");
     const partial = JSON.parse(raw) as Partial<BotConfig>;
-    return { ...defaults, ...partial };
+
+    // Normalize/sanitize guestMode on load. The WRITE path (POST /api/bot/settings)
+    // sanitizes too, but a hand-edited/legacy/corrupt config.json reaches the gate
+    // directly — so coerce it here as well, mirroring that write-path logic.
+    const partialGm = (partial.guestMode ?? {}) as Partial<GuestModeConfig>;
+    const gm: GuestModeConfig = {
+      ...defaults.guestMode,
+      ...partialGm,
+      // bots → "all" | string[]; anything else falls back to the default ("all").
+      bots:
+        partialGm.bots === "all"
+          ? "all"
+          : Array.isArray(partialGm.bots)
+            ? partialGm.bots.filter((id): id is string => typeof id === "string")
+            : defaults.guestMode.bots,
+      // permissions → defaults, then spread ONLY a plain object, then strict-coerce
+      // each known flag to a boolean (drops index keys + non-boolean values).
+      permissions: { ...defaults.guestMode.permissions },
+    };
+    const partialPerms = partialGm.permissions;
+    if (
+      partialPerms !== null &&
+      typeof partialPerms === "object" &&
+      !Array.isArray(partialPerms)
+    ) {
+      Object.assign(gm.permissions, partialPerms);
+    }
+    for (const f of GUEST_PERMISSION_FLAGS) {
+      gm.permissions[f] = gm.permissions[f] === true;
+    }
+
+    return {
+      ...defaults,
+      ...partial,
+      guestMode: gm,
+    };
   } catch {
     return defaults;
   }

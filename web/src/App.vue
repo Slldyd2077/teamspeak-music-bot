@@ -19,22 +19,22 @@
         <div class="m-player-artist">{{ currentSong.artist }}</div>
       </div>
       <div class="m-player-controls" @click.stop>
-        <button class="m-player-btn" @click="playerStore.prev()">
+        <button v-if="can('player.control')" class="m-player-btn" @click="playerStore.prev()">
           <Icon icon="mdi:skip-previous" />
         </button>
-        <button class="m-player-btn" @click="playerStore.isPlaying ? playerStore.pause() : playerStore.resume()">
+        <button v-if="canTransport" class="m-player-btn" @click="playerStore.isPlaying ? playerStore.pause() : playerStore.resume()">
           <Icon :icon="playerStore.isPlaying ? 'mdi:pause' : 'mdi:play'" />
         </button>
-        <button class="m-player-btn" @click="playerStore.next()">
+        <button v-if="canSkip" class="m-player-btn" @click="playerStore.next()">
           <Icon icon="mdi:skip-next" />
         </button>
-        <button class="m-player-btn" @click="cycleMobileMode">
+        <button v-if="canModeCtl" class="m-player-btn" @click="cycleMobileMode">
           <Icon :icon="mobileModeIcon" />
         </button>
         <button class="m-player-btn" @click="toggleMobileQueue">
           <Icon icon="mdi:playlist-music" />
         </button>
-        <button class="m-player-btn" @click="toggleMobileVolume">
+        <button v-if="canTransport" class="m-player-btn" @click="toggleMobileVolume">
           <Icon icon="mdi:volume-high" />
         </button>
       </div>
@@ -66,7 +66,7 @@
         <Icon icon="mdi:music-box-multiple" class="tab-icon" />
         <span class="tab-label">音乐库</span>
       </RouterLink>
-      <RouterLink to="/settings" class="m-tab" :class="{ active: route.path.startsWith('/settings') }">
+      <RouterLink v-if="!session.isGuest.value" to="/settings" class="m-tab" :class="{ active: route.path.startsWith('/settings') }">
         <Icon icon="mdi:cog" class="tab-icon" />
         <span class="tab-label">设置</span>
       </RouterLink>
@@ -80,6 +80,7 @@ import { useRoute, useRouter } from 'vue-router';
 import { Icon } from '@iconify/vue';
 import { usePlayerStore } from './stores/player.js';
 import { useWebSocket } from './composables/useWebSocket.js';
+import { useSession } from './composables/useSession.js';
 import Navbar from './components/Navbar.vue';
 import Player from './components/Player.vue';
 import CoverArt from './components/CoverArt.vue';
@@ -87,6 +88,12 @@ import Toast from './components/Toast.vue';
 import Queue from './components/Queue.vue';
 
 const playerStore = usePlayerStore();
+const session = useSession();
+const { can, guestCan } = session;
+// Mobile mini-player transport gating — mirrors components/Player.vue.
+const canTransport = computed(() => can('player.control') || guestCan('transport'));
+const canSkip = computed(() => can('player.control') || guestCan('skip'));
+const canModeCtl = computed(() => can('player.control') || guestCan('playMode'));
 const theme = computed(() => playerStore.theme);
 const route = useRoute();
 const router = useRouter();
