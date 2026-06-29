@@ -7,7 +7,7 @@ import { createDatabase, type BotDatabase } from "../data/database.js";
 import { createPermissionStore } from "../data/permissions.js";
 import { getDefaultConfig, loadConfig, saveConfig, type BotConfig } from "../data/config.js";
 import type { Logger } from "../logger.js";
-import type { MusicProvider } from "../music/provider.js";
+import type { CookieStore } from "../music/auth.js";
 import type { AvatarStore } from "../data/avatars.js";
 
 // removeBot only calls logger.info; provide the full shape it could touch.
@@ -36,9 +36,9 @@ describe("BotManager.removeBot — guest scope pruning", () => {
     const permissions = createPermissionStore(db.db);
     saveConfig(configPath, config);
     return new BotManager(
-      {} as unknown as MusicProvider,
-      {} as unknown as MusicProvider,
-      {} as unknown as MusicProvider,
+      { save() {}, load() { return ""; } } as unknown as CookieStore,
+      "http://netease.test",
+      "http://qq.test",
       db,
       config,
       stubLogger,

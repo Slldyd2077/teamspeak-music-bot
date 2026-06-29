@@ -1,0 +1,5 @@
+# 方案 A：基于本地已有的官方镜像，覆盖后端 dist 为含 vip 字段的 fork 编译产物。
+# 不依赖 docker.io（base 镜像本地已存在），仅 COPY 编译好的 dist。
+# 用法：docker build -f Dockerfile.vip -t tsmusicbot-vip:latest .
+FROM ghcr.io/zhangtianyao1/teamspeak-music-bot:latest
+COPY dist/ /app/dist/

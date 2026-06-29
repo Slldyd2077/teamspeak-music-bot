@@ -1,35 +1,40 @@
 import { Router } from "express";
 import type { MusicProvider } from "../../music/provider.js";
 import { YouTubeProvider } from "../../music/youtube.js";
-import type { CookieStore } from "../../music/auth.js";
+import type { Platform } from "../../music/auth.js";
+import type { BotManager } from "../../bot/manager.js";
 import type { Logger } from "../../logger.js";
 import { requirePermission } from "../middleware/requirePermission.js";
 import { requireNotGuest } from "../middleware/requireNotGuest.js";
 
 export function createAuthRouter(
-  neteaseProvider: MusicProvider,
-  qqProvider: MusicProvider,
-  bilibiliProvider: MusicProvider,
-  logger: Logger,
-  cookieStore?: CookieStore
+  botManager: BotManager,
+  logger: Logger
 ): Router {
   const router = Router();
-  // YouTube is auth-less; we only use this instance so /auth/status can
-  // report whether yt-dlp is actually installed (loggedIn=false otherwise).
+  // YouTube 无 cookie；仅用于 /status 上报 yt-dlp 是否安装
   const youtubeProvider: MusicProvider = new YouTubeProvider();
 
-  function getProvider(platform?: string): MusicProvider {
-    if (platform === "bilibili") return bilibiliProvider;
+  const platOf = (p?: string): Platform =>
+    p === "qq" ? "qq" : p === "bilibili" ? "bilibili" : "netease";
+
+  /** 取某 bot 的平台 provider（per-bot cookie）。botId 必需。 */
+  function providerOf(platform: string | undefined, botId?: string): MusicProvider {
     if (platform === "youtube") return youtubeProvider;
-    return platform === "qq" ? qqProvider : neteaseProvider;
+    const plat = platOf(platform);
+    if (!botId) throw new Error("botId is required for platform auth");
+    const provider = botManager.getProvider(botId, plat);
+    if (!provider) throw new Error(`bot ${botId} not found or has no provider`);
+    return provider;
   }
 
   router.get("/status", requireNotGuest, async (req, res) => {
     try {
       const platform = req.query.platform as string;
-      const provider = getProvider(platform);
+      const botId = req.query.botId as string | undefined;
+      const provider = providerOf(platform, botId);
       const status = await provider.getAuthStatus();
-      logger.debug({ platform, status }, "Auth status check");
+      logger.debug({ platform, botId, status }, "Auth status check");
       res.json({ platform: provider.platform, ...status });
     } catch (err) {
       logger.error({ err }, "Auth status check failed");
@@ -39,10 +44,10 @@ export function createAuthRouter(
 
   router.post("/qrcode", requirePermission("platform.auth"), async (req, res) => {
     try {
-      const { platform } = req.body;
-      const provider = getProvider(platform);
+      const { platform, botId } = req.body;
+      const provider = providerOf(platform, botId);
       const qr = await provider.getQrCode();
-      logger.info({ platform, key: qr.key }, "QR code generated");
+      logger.info({ platform, botId, key: qr.key }, "QR code generated");
       res.json(qr);
     } catch (err) {
       logger.error({ err }, "QR code generation failed");
@@ -52,23 +57,21 @@ export function createAuthRouter(
 
   router.get("/qrcode/status", requireNotGuest, async (req, res) => {
     try {
-      const { key, platform } = req.query;
+      const { key, platform, botId } = req.query;
       if (!key) {
         res.status(400).json({ error: "key is required" });
         return;
       }
-      const provider = getProvider(platform as string);
+      const provider = providerOf(platform as string, botId as string | undefined);
       const status = await provider.checkQrCodeStatus(key as string);
-      logger.info({ platform, status, key }, "QR status check");
+      logger.info({ platform, botId, status, key }, "QR status check");
 
-      // When confirmed, persist cookie
+      // 确认后持久化 cookie 到该 bot（per-bot）
       if (status === "confirmed") {
         const cookie = provider.getCookie();
-        const plat = (platform as string) === "bilibili" ? "bilibili" as const
-          : (platform as string) === "qq" ? "qq" as const : "netease" as const;
-        if (cookie && cookieStore) {
-          cookieStore.save(plat, cookie);
-          logger.info({ platform: plat }, "Cookie persisted to disk");
+        if (cookie) {
+          botManager.saveBotCookie(botId as string, platOf(platform as string), cookie);
+          logger.info({ platform, botId }, "Cookie persisted for bot");
         }
       }
 
@@ -81,18 +84,17 @@ export function createAuthRouter(
 
   router.post("/sms/send", requirePermission("platform.auth"), async (req, res) => {
     try {
-      const { phone } = req.body;
+      const { phone, botId } = req.body;
       if (!phone) {
         res.status(400).json({ error: "phone is required" });
         return;
       }
-      if (!neteaseProvider.sendSmsCode) {
-        res
-          .status(400)
-          .json({ error: "SMS login not supported for this platform" });
+      const provider = providerOf("netease", botId);
+      if (!provider.sendSmsCode) {
+        res.status(400).json({ error: "SMS login not supported for this platform" });
         return;
       }
-      const success = await neteaseProvider.sendSmsCode(phone);
+      const success = await provider.sendSmsCode(phone);
       res.json({ success });
     } catch (err) {
       res.status(500).json({ error: (err as Error).message });
@@ -101,18 +103,19 @@ export function createAuthRouter(
 
   router.post("/sms/verify", requirePermission("platform.auth"), async (req, res) => {
     try {
-      const { phone, code } = req.body;
+      const { phone, code, botId } = req.body;
       if (!phone || !code) {
         res.status(400).json({ error: "phone and code are required" });
         return;
       }
-      if (!neteaseProvider.loginWithSms) {
+      const provider = providerOf("netease", botId);
+      if (!provider.loginWithSms) {
         res.status(400).json({ error: "SMS login not supported" });
         return;
       }
-      const success = await neteaseProvider.loginWithSms(phone, code);
-      if (success && cookieStore) {
-        cookieStore.save("netease", neteaseProvider.getCookie());
+      const success = await provider.loginWithSms(phone, code);
+      if (success) {
+        botManager.saveBotCookie(botId, "netease", provider.getCookie());
       }
       res.json({ success });
     } catch (err) {
@@ -121,26 +124,22 @@ export function createAuthRouter(
   });
 
   router.post("/cookie", requirePermission("platform.auth"), (req, res) => {
-    const { platform, cookie } = req.body;
+    const { platform, cookie, botId } = req.body;
     if (!cookie) {
       res.status(400).json({ error: "cookie is required" });
       return;
     }
-    // YouTube has no cookie concept — reject instead of falling through and
-    // clobbering the NetEase cookie entry.
-    if (platform === "youtube") {
-      res
-        .status(400)
-        .json({ error: "YouTube does not use cookies (uses yt-dlp binary)" });
+    if (!botId) {
+      res.status(400).json({ error: "botId is required" });
       return;
     }
-    const provider = getProvider(platform);
-    provider.setCookie(cookie);
-    const plat = platform === "bilibili" ? "bilibili" as const
-      : platform === "qq" ? "qq" as const : "netease" as const;
-    if (cookieStore) {
-      cookieStore.save(plat, cookie);
+    // YouTube 无 cookie 概念
+    if (platform === "youtube") {
+      res.status(400).json({ error: "YouTube does not use cookies (uses yt-dlp binary)" });
+      return;
     }
+    // 持久化到该 bot + 刷新其内存 provider
+    botManager.saveBotCookie(botId, platOf(platform), cookie);
     res.json({ success: true });
   });
 

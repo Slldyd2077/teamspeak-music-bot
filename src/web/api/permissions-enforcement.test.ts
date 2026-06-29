@@ -30,6 +30,7 @@ function makeFakeBot(id: string) {
 
 function makeBotManager() {
   const bot = makeFakeBot(ALLOWED_BOT);
+  const provider = makeProvider();
   return {
     getBot: (id: string) => (id === ALLOWED_BOT ? bot : undefined),
     getAllBots: () => [bot],
@@ -39,6 +40,9 @@ function makeBotManager() {
     removeBot: async () => {},
     startBot: async () => {},
     stopBot: () => {},
+    getProvider: () => provider,
+    saveBotCookie: () => {},
+    getBotCookie: () => "",
   } as any;
 }
 
@@ -63,7 +67,6 @@ function makeApp(user: any) {
   app.use((req, _res, next) => { (req as any).user = user; next(); });
 
   const botManager = makeBotManager();
-  const provider = makeProvider();
 
   app.use("/api/player", createPlayerRouter(botManager, logger));
   app.use(
@@ -77,8 +80,8 @@ function makeApp(user: any) {
       { read: () => null, write: () => "x", remove: () => {} } as any,
     ),
   );
-  app.use("/api/auth", createAuthRouter(provider, provider, provider, logger));
-  app.use("/api/music", createMusicRouter(provider, provider, provider, logger));
+  app.use("/api/auth", createAuthRouter(botManager, logger));
+  app.use("/api/music", createMusicRouter(botManager, "http://n.test", "http://q.test", logger));
 
   return app;
 }

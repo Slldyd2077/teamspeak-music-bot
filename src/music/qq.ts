@@ -13,32 +13,11 @@ import type {
 } from "./provider.js";
 import { parseLyrics } from "./netease.js";
 
-// Primary search client: u.y.qq.com/cgi-bin/musicu.fcg (JSON sub-request
-// batch). Was broken ca. 2026-05 due to two upstream API changes:
-//   1. searchid param must NOT be present (causes all lists to be empty)
-//   2. num_per_page must be >= 10 (lower values return empty)
-// Both fixes applied per https://github.com/ZHANGTIANYAO1/teamspeak-music-bot/issues/61
-const qqMusicuApi = axios.create({
-  baseURL: "https://u.y.qq.com",
-  timeout: 10000,
-  headers: { referer: "https://y.qq.com" },
-});
-
-// Fallback search client: c.y.qq.com/soso/fcgi-bin/client_search_cp (classic
-// endpoint, song + album only, no playlist support).
-const qqSearchApi = axios.create({
-  baseURL: "https://c.y.qq.com",
-  timeout: 10000,
-  headers: { referer: "https://y.qq.com" },
-});
-
-// Direct client for c.y.qq.com endpoints (collected playlists / favorites).
-// The bundled qq-music-api wrapper doesn't expose these endpoints.
-const qqFavApi = axios.create({
-  baseURL: "https://c.y.qq.com",
-  timeout: 10000,
-  headers: { referer: "https://y.qq.com/" },
-});
+// QQ 直连 axios 客户端：per-bot 实例化（在构造函数创建），cookie 各自隔离。
+//   musicuApi: u.y.qq.com musicu.fcg（搜索 / Radar，带 directCookieHeaders）
+//   searchApi: c.y.qq.com client_search_cp（fallback 搜索）
+//   favApi:    c.y.qq.com 收藏歌单（带 Cookie header）
+// 历史 bug 备注：musicu.fcg 搜索 searchid 不可带、num_per_page>=10（issue #61）。
 
 export function mapQqSongs(raw: any[] | null | undefined): Song[] {
   if (!Array.isArray(raw)) return [];
@@ -102,6 +81,9 @@ function computeGtk(pSkey: string): number {
 export class QQMusicProvider implements MusicProvider {
   readonly platform = "qq" as const;
   private api: AxiosInstance;
+  private musicuApi: AxiosInstance;
+  private searchApi: AxiosInstance;
+  private favApi: AxiosInstance;
   private cookie = "";
   private quality = "exhigh";
   private radarPage = 1;
@@ -110,6 +92,22 @@ export class QQMusicProvider implements MusicProvider {
     this.api = axios.create({
       baseURL: baseUrl,
       timeout: 10000,
+    });
+    // per-bot 直连客户端（cookie 隔离；每个 bot 实例各自一套）
+    this.musicuApi = axios.create({
+      baseURL: "https://u.y.qq.com",
+      timeout: 10000,
+      headers: { referer: "https://y.qq.com" },
+    });
+    this.searchApi = axios.create({
+      baseURL: "https://c.y.qq.com",
+      timeout: 10000,
+      headers: { referer: "https://y.qq.com" },
+    });
+    this.favApi = axios.create({
+      baseURL: "https://c.y.qq.com",
+      timeout: 10000,
+      headers: { referer: "https://y.qq.com/" },
     });
   }
 
@@ -190,7 +188,7 @@ export class QQMusicProvider implements MusicProvider {
           param: { query, num_per_page: 10, search_type: 3 },
         },
       });
-      const res = await qqMusicuApi.get("/cgi-bin/musicu.fcg", {
+      const res = await this.musicuApi.get("/cgi-bin/musicu.fcg", {
         params: { format: "json", data: reqData },
       });
 
@@ -241,8 +239,8 @@ export class QQMusicProvider implements MusicProvider {
     };
 
     const [songRes, albumRes] = await Promise.allSettled([
-      qqSearchApi.get("/soso/fcgi-bin/client_search_cp", { params: songParams }),
-      qqSearchApi.get("/soso/fcgi-bin/client_search_cp", { params: albumParams }),
+      this.searchApi.get("/soso/fcgi-bin/client_search_cp", { params: songParams }),
+      this.searchApi.get("/soso/fcgi-bin/client_search_cp", { params: albumParams }),
     ]);
 
     const songList: any[] =
@@ -550,7 +548,7 @@ export class QQMusicProvider implements MusicProvider {
   private async getRadarRecommendSongs(): Promise<Song[]> {
     try {
       const page = this.radarPage;
-      const res = await qqMusicuApi.post(
+      const res = await this.musicuApi.post(
         "/cgi-bin/musicu.fcg",
         this.buildMusicuPayload(
           "music.recommend.TrackRelationServer",
@@ -579,7 +577,7 @@ export class QQMusicProvider implements MusicProvider {
 
   private async getGuessRecommendSongs(): Promise<Song[]> {
     try {
-      const res = await qqMusicuApi.post(
+      const res = await this.musicuApi.post(
         "/cgi-bin/musicu.fcg",
         this.buildMusicuPayload(
           "music.radioProxy.MbTrackRadioSvr",
@@ -653,7 +651,7 @@ export class QQMusicProvider implements MusicProvider {
       for (let page = 0; page < MAX_PAGES; page++) {
         const sin = page * PAGE_SIZE;
         const ein = sin + PAGE_SIZE - 1;
-        const res = await qqFavApi.get("/fav/fcgi-bin/fcg_get_profile_order_asset.fcg", {
+        const res = await this.favApi.get("/fav/fcgi-bin/fcg_get_profile_order_asset.fcg", {
           params: {
             ct: 20,
             cid: 205360956,

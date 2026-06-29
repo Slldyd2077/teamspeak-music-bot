@@ -144,6 +144,18 @@ export class BotProfileManager {
     Object.assign(this.config, partial);
   }
 
+  /**
+   * Re-apply the current profile state to TeamSpeak using the stored
+   * currentSong. Called after a config change (e.g. avatar/nickname toggled
+   * via the profile API) so the change takes effect immediately instead of
+   * waiting for the next song change. Cheap when idle (song=null restores
+   * defaults, no cover download); re-downloads the cover only when a song is
+   * playing and avatar was just re-enabled.
+   */
+  resync(): Promise<void> {
+    return this.onSongChange(this.currentSong);
+  }
+
   // --- Internal update methods ---
 
   private async updateAvatar(coverUrl: string | null, gen: number): Promise<void> {

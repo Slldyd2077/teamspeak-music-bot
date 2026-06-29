@@ -1,23 +1,52 @@
 import { Router } from "express";
 import type { MusicProvider } from "../../music/provider.js";
+import { NeteaseProvider } from "../../music/netease.js";
+import { QQMusicProvider } from "../../music/qq.js";
+import { BiliBiliProvider } from "../../music/bilibili.js";
 import { YouTubeProvider } from "../../music/youtube.js";
+import type { Platform } from "../../music/auth.js";
+import type { BotManager } from "../../bot/manager.js";
 import type { Logger } from "../../logger.js";
 import { requirePermission } from "../middleware/requirePermission.js";
 import { requireNotGuest } from "../middleware/requireNotGuest.js";
 
+interface ProviderSet {
+  netease: MusicProvider;
+  qq: MusicProvider;
+  bilibili: MusicProvider;
+}
+
 export function createMusicRouter(
-  neteaseProvider: MusicProvider,
-  qqProvider: MusicProvider,
-  bilibiliProvider: MusicProvider,
+  botManager: BotManager,
+  neteaseBaseUrl: string,
+  qqBaseUrl: string,
   logger: Logger
 ): Router {
   const router = Router();
   const youtubeProvider: MusicProvider = new YouTubeProvider();
+  // 默认匿名 provider 集合（无 botId 时用，无 cookie）：搜索等不需登录态的请求
+  const defaultSet: ProviderSet = {
+    netease: new NeteaseProvider(neteaseBaseUrl),
+    qq: new QQMusicProvider(qqBaseUrl),
+    bilibili: new BiliBiliProvider(),
+  };
 
-  function getProvider(platform?: string): MusicProvider {
-    if (platform === "bilibili") return bilibiliProvider;
+  const platOf = (p?: string): Platform =>
+    p === "qq" ? "qq" : p === "bilibili" ? "bilibili" : "netease";
+
+  /** 取 bot 的 provider 集合（带该 bot cookie）；无 botId 用默认匿名集合。 */
+  function setFor(botId?: string): ProviderSet {
+    if (!botId) return defaultSet;
+    return {
+      netease: botManager.getProvider(botId, "netease") ?? defaultSet.netease,
+      qq: botManager.getProvider(botId, "qq") ?? defaultSet.qq,
+      bilibili: botManager.getProvider(botId, "bilibili") ?? defaultSet.bilibili,
+    };
+  }
+
+  function getProvider(platform: string, botId?: string): MusicProvider {
     if (platform === "youtube") return youtubeProvider;
-    return platform === "qq" ? qqProvider : neteaseProvider;
+    return setFor(botId)[platOf(platform)];
   }
 
   router.get("/search", async (req, res) => {
@@ -27,11 +56,9 @@ export function createMusicRouter(
         res.status(400).json({ error: "q (query) is required" });
         return;
       }
-      const provider = getProvider(platform as string);
-      const result = await provider.search(
-        q as string,
-        parseInt(limit as string) || 20
-      );
+      const botId = req.query.botId as string | undefined;
+      const provider = getProvider(platform as string, botId);
+      const result = await provider.search(q as string, parseInt(limit as string) || 20);
       res.json(result);
     } catch (err) {
       logger.error({ err }, "Search failed");
@@ -46,11 +73,13 @@ export function createMusicRouter(
         res.status(400).json({ error: "q (query) is required" });
         return;
       }
+      const botId = req.query.botId as string | undefined;
+      const set = setFor(botId);
       const parsedLimit = parseInt(limit as string) || 20;
       const [neteaseResult, qqResult, bilibiliResult] = await Promise.allSettled([
-        neteaseProvider.search(q as string, parsedLimit),
-        qqProvider.search(q as string, parsedLimit),
-        bilibiliProvider.search(q as string, parsedLimit),
+        set.netease.search(q as string, parsedLimit),
+        set.qq.search(q as string, parsedLimit),
+        set.bilibili.search(q as string, parsedLimit),
       ]);
 
       const songs = [
@@ -76,7 +105,8 @@ export function createMusicRouter(
 
   router.get("/song/:id", async (req, res) => {
     try {
-      const provider = getProvider(req.query.platform as string);
+      const botId = req.query.botId as string | undefined;
+      const provider = getProvider(req.query.platform as string, botId);
       const song = await provider.getSongDetail(req.params.id);
       if (!song) {
         res.status(404).json({ error: "Song not found" });
@@ -90,7 +120,8 @@ export function createMusicRouter(
 
   router.get("/playlist/:id", async (req, res) => {
     try {
-      const provider = getProvider(req.query.platform as string);
+      const botId = req.query.botId as string | undefined;
+      const provider = getProvider(req.query.platform as string, botId);
       const songs = await provider.getPlaylistSongs(req.params.id);
       res.json({ songs });
     } catch (err) {
@@ -100,7 +131,8 @@ export function createMusicRouter(
 
   router.get("/recommend/playlists", async (req, res) => {
     try {
-      const provider = getProvider(req.query.platform as string);
+      const botId = req.query.botId as string | undefined;
+      const provider = getProvider(req.query.platform as string, botId);
       const playlists = await provider.getRecommendPlaylists();
       res.json({ playlists });
     } catch (err) {
@@ -110,7 +142,8 @@ export function createMusicRouter(
 
   router.get("/album/:id", async (req, res) => {
     try {
-      const provider = getProvider(req.query.platform as string);
+      const botId = req.query.botId as string | undefined;
+      const provider = getProvider(req.query.platform as string, botId);
       const songs = await provider.getAlbumSongs(req.params.id);
       res.json({ songs });
     } catch (err) {
@@ -120,7 +153,8 @@ export function createMusicRouter(
 
   router.get("/lyrics/:id", async (req, res) => {
     try {
-      const provider = getProvider(req.query.platform as string);
+      const botId = req.query.botId as string | undefined;
+      const provider = getProvider(req.query.platform as string, botId);
       const lyrics = await provider.getLyrics(req.params.id);
       res.json({ lyrics });
     } catch (err) {
@@ -130,7 +164,8 @@ export function createMusicRouter(
 
   router.get("/recommend/songs", requireNotGuest, async (req, res) => {
     try {
-      const provider = getProvider(req.query.platform as string);
+      const botId = req.query.botId as string | undefined;
+      const provider = getProvider(req.query.platform as string, botId);
       if (!provider.getDailyRecommendSongs) {
         res.status(501).json({ error: "Not supported by this provider" });
         return;
@@ -145,7 +180,8 @@ export function createMusicRouter(
 
   router.get("/personal/fm", requireNotGuest, async (req, res) => {
     try {
-      const provider = getProvider(req.query.platform as string);
+      const botId = req.query.botId as string | undefined;
+      const provider = getProvider(req.query.platform as string, botId);
       if (!provider.getPersonalFm) {
         res.status(501).json({ error: "Not supported by this provider" });
         return;
@@ -160,7 +196,8 @@ export function createMusicRouter(
 
   router.get("/user/playlists", requireNotGuest, async (req, res) => {
     try {
-      const provider = getProvider(req.query.platform as string);
+      const botId = req.query.botId as string | undefined;
+      const provider = getProvider(req.query.platform as string, botId);
       if (!provider.getUserPlaylists) {
         res.status(501).json({ error: "Not supported by this provider" });
         return;
@@ -175,7 +212,8 @@ export function createMusicRouter(
 
   router.get("/playlist/:id/detail", async (req, res) => {
     try {
-      const provider = getProvider(req.query.platform as string);
+      const botId = req.query.botId as string | undefined;
+      const provider = getProvider(req.query.platform as string, botId);
       if (!provider.getPlaylistDetail) {
         res.status(501).json({ error: "Not supported by this provider" });
         return;
@@ -192,10 +230,11 @@ export function createMusicRouter(
     }
   });
 
-  // B站热门视频
+  // B站热门视频（匿名可用）
   router.get("/bilibili/popular", async (req, res) => {
     try {
-      const provider = bilibiliProvider as any;
+      const botId = req.query.botId as string | undefined;
+      const provider = setFor(botId).bilibili as any;
       if (provider.getPopularVideos) {
         const limit = parseInt(req.query.limit as string) || 20;
         const songs = await provider.getPopularVideos(limit);
@@ -209,31 +248,24 @@ export function createMusicRouter(
     }
   });
 
-  // Get current quality
+  // 音质（用默认 provider 集合；PowerfulTS 不使用此端点）
   router.get("/quality", requireNotGuest, (_req, res) => {
     res.json({
-      netease: neteaseProvider.getQuality(),
-      qq: qqProvider.getQuality(),
-      bilibili: bilibiliProvider.getQuality(),
+      netease: defaultSet.netease.getQuality(),
+      qq: defaultSet.qq.getQuality(),
+      bilibili: defaultSet.bilibili.getQuality(),
     });
   });
 
-  // Set quality
   router.post("/quality", requirePermission("quality"), (req, res) => {
     const { quality, platform } = req.body;
     if (!quality) {
       res.status(400).json({ error: "quality is required" });
       return;
     }
-    if (!platform || platform === "netease") {
-      neteaseProvider.setQuality(quality);
-    }
-    if (!platform || platform === "qq") {
-      qqProvider.setQuality(quality);
-    }
-    if (!platform || platform === "bilibili") {
-      bilibiliProvider.setQuality(quality);
-    }
+    if (!platform || platform === "netease") defaultSet.netease.setQuality(quality);
+    if (!platform || platform === "qq") defaultSet.qq.setQuality(quality);
+    if (!platform || platform === "bilibili") defaultSet.bilibili.setQuality(quality);
     logger.info({ quality, platform }, "Audio quality changed");
     res.json({ success: true, quality });
   });

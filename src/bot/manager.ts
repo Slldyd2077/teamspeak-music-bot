@@ -5,7 +5,11 @@ import {
   type BotInstanceOptions,
 } from "./instance.js";
 import type { MusicProvider } from "../music/provider.js";
+import { NeteaseProvider } from "../music/netease.js";
+import { QQMusicProvider } from "../music/qq.js";
+import { BiliBiliProvider } from "../music/bilibili.js";
 import { YouTubeProvider } from "../music/youtube.js";
+import type { CookieStore, Platform } from "../music/auth.js";
 import type { BotDatabase } from "../data/database.js";
 import { saveConfig, type BotConfig } from "../data/config.js";
 import type { Logger } from "../logger.js";
@@ -13,6 +17,14 @@ import type { Logger } from "../logger.js";
 import type { ServerProtocol } from "../ts-protocol/client.js";
 import type { AvatarStore } from "../data/avatars.js";
 import type { PermissionStore } from "../data/permissions.js";
+
+/** 某 bot 的 provider 集合（per-bot 实例，cookie 各自隔离）。 */
+interface ProviderSet {
+  netease: MusicProvider;
+  qq: MusicProvider;
+  bilibili: MusicProvider;
+  youtube: MusicProvider;
+}
 
 /**
  * Run bot.connect() with a hard deadline. If the handshake hangs (e.g. the
@@ -70,9 +82,11 @@ export interface CreateBotParams {
 
 export class BotManager extends EventEmitter {
   private bots = new Map<string, BotInstance>();
-  private neteaseProvider: MusicProvider;
-  private qqProvider: MusicProvider;
-  private bilibiliProvider: MusicProvider;
+  /** per-bot provider 池：每个 bot 实例各自的 provider（cookie 隔离） */
+  private providers = new Map<string, ProviderSet>();
+  private cookieStore: CookieStore;
+  private neteaseBaseUrl: string;
+  private qqBaseUrl: string;
   private youtubeProvider: MusicProvider;
   private database: BotDatabase;
   private config: BotConfig;
@@ -82,9 +96,9 @@ export class BotManager extends EventEmitter {
   private configPath: string;
 
   constructor(
-    neteaseProvider: MusicProvider,
-    qqProvider: MusicProvider,
-    bilibiliProvider: MusicProvider,
+    cookieStore: CookieStore,
+    neteaseBaseUrl: string,
+    qqBaseUrl: string,
     database: BotDatabase,
     config: BotConfig,
     logger: Logger,
@@ -93,9 +107,9 @@ export class BotManager extends EventEmitter {
     configPath: string
   ) {
     super();
-    this.neteaseProvider = neteaseProvider;
-    this.qqProvider = qqProvider;
-    this.bilibiliProvider = bilibiliProvider;
+    this.cookieStore = cookieStore;
+    this.neteaseBaseUrl = neteaseBaseUrl;
+    this.qqBaseUrl = qqBaseUrl;
     this.youtubeProvider = new YouTubeProvider();
     this.database = database;
     this.config = config;
@@ -105,8 +119,52 @@ export class BotManager extends EventEmitter {
     this.configPath = configPath;
   }
 
+  /** 为 bot 创建独立 provider 集合 + 加载该 bot 的平台 cookie。 */
+  private createProviders(botId: string): ProviderSet {
+    const netease = new NeteaseProvider(this.neteaseBaseUrl);
+    const qq = new QQMusicProvider(this.qqBaseUrl);
+    const bilibili = new BiliBiliProvider();
+    const nc = this.cookieStore.load(botId, "netease"); if (nc) netease.setCookie(nc);
+    const qc = this.cookieStore.load(botId, "qq"); if (qc) qq.setCookie(qc);
+    const bc = this.cookieStore.load(botId, "bilibili"); if (bc) bilibili.setCookie(bc);
+    const set: ProviderSet = { netease, qq, bilibili, youtube: this.youtubeProvider };
+    this.providers.set(botId, set);
+    return set;
+  }
+
+  /** 取 bot 的 provider 集合（不存在则创建）。 */
+  private getProviders(botId: string): ProviderSet {
+    return this.providers.get(botId) ?? this.createProviders(botId);
+  }
+
+  /** web API：取某 bot 某 platform 的 provider（平台登录/我的音乐用）。 */
+  getProvider(botId: string, platform: Platform): MusicProvider | undefined {
+    const set = this.providers.get(botId);
+    if (!set) return undefined;
+    if (platform === "qq") return set.qq;
+    if (platform === "bilibili") return set.bilibili;
+    return set.netease;
+  }
+
+  /** web API：平台登录确认后，持久化 cookie 并刷新该 bot 的 provider。 */
+  saveBotCookie(botId: string, platform: Platform, cookie: string): void {
+    if (!cookie) return;
+    this.cookieStore.save(botId, platform, cookie);
+    const set = this.providers.get(botId);
+    if (!set) return;
+    if (platform === "netease") set.netease.setCookie(cookie);
+    else if (platform === "qq") set.qq.setCookie(cookie);
+    else set.bilibili.setCookie(cookie);
+  }
+
+  /** web API：取某 bot 的某平台 cookie（手动设置 cookie 端点用）。 */
+  getBotCookie(botId: string, platform: Platform): string {
+    return this.cookieStore.load(botId, platform);
+  }
+
   async createBot(params: CreateBotParams): Promise<BotInstance> {
     const id = crypto.randomUUID();
+    const providers = this.createProviders(id);
 
     const bot = new BotInstance({
       id,
@@ -123,10 +181,10 @@ export class BotManager extends EventEmitter {
         serverProtocol: params.serverProtocol,
         ts6ApiKey: params.ts6ApiKey,
       },
-      neteaseProvider: this.neteaseProvider,
-      qqProvider: this.qqProvider,
-      bilibiliProvider: this.bilibiliProvider,
-      youtubeProvider: this.youtubeProvider,
+      neteaseProvider: providers.netease,
+      qqProvider: providers.qq,
+      bilibiliProvider: providers.bilibili,
+      youtubeProvider: providers.youtube,
       database: this.database,
       config: this.config,
       logger: this.logger,
@@ -161,6 +219,7 @@ export class BotManager extends EventEmitter {
       bot.disconnect();
       this.bots.delete(id);
     }
+    this.providers.delete(id);
     this.database.deleteBotInstance(id);
     this.permissions.pruneBot(id);
     // Prune the deleted bot from the guest scope allow-list (mirrors permissions.pruneBot).
@@ -229,6 +288,7 @@ export class BotManager extends EventEmitter {
     // Reload config from database so updated settings (channel, nickname, etc.) take effect
     const saved = this.database.getBotInstances().find((i) => i.id === id);
     if (saved) {
+      const providers = this.getProviders(saved.id);
       const proto = saved.serverProtocol as "ts3" | "ts6" | "" | undefined;
       const bot = new BotInstance({
         id: saved.id,
@@ -249,10 +309,10 @@ export class BotManager extends EventEmitter {
           serverProtocol: proto === "ts3" || proto === "ts6" ? proto : undefined,
           ts6ApiKey: saved.ts6ApiKey || undefined,
         },
-        neteaseProvider: this.neteaseProvider,
-        qqProvider: this.qqProvider,
-        bilibiliProvider: this.bilibiliProvider,
-        youtubeProvider: this.youtubeProvider,
+        neteaseProvider: providers.netease,
+        qqProvider: providers.qq,
+        bilibiliProvider: providers.bilibili,
+        youtubeProvider: providers.youtube,
         database: this.database,
         config: this.config,
         logger: this.logger,
@@ -284,6 +344,7 @@ export class BotManager extends EventEmitter {
   async loadSavedBots(): Promise<void> {
     const savedInstances = this.database.getBotInstances();
     for (const saved of savedInstances) {
+      const providers = this.getProviders(saved.id);
       const proto = saved.serverProtocol as "ts3" | "ts6" | "" | undefined;
       const bot = new BotInstance({
         id: saved.id,
@@ -301,10 +362,10 @@ export class BotManager extends EventEmitter {
           serverProtocol: proto === "ts3" || proto === "ts6" ? proto : undefined,
           ts6ApiKey: saved.ts6ApiKey || undefined,
         },
-        neteaseProvider: this.neteaseProvider,
-        qqProvider: this.qqProvider,
-        bilibiliProvider: this.bilibiliProvider,
-        youtubeProvider: this.youtubeProvider,
+        neteaseProvider: providers.netease,
+        qqProvider: providers.qq,
+        bilibiliProvider: providers.bilibili,
+        youtubeProvider: providers.youtube,
         database: this.database,
         config: this.config,
         logger: this.logger,
@@ -358,5 +419,6 @@ export class BotManager extends EventEmitter {
       bot.disconnect();
     }
     this.bots.clear();
+    this.providers.clear();
   }
 }

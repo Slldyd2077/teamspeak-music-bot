@@ -1,12 +1,10 @@
 import path from "node:path";
+import fs from "node:fs";
 import { fileURLToPath } from "node:url";
 import { loadConfig, saveConfig, migrateLegacyConfig } from "./data/config.js";
 import { createDatabase } from "./data/database.js";
 import { createLogger } from "./logger.js";
 import { createApiServerManager } from "./music/api-server.js";
-import { NeteaseProvider } from "./music/netease.js";
-import { QQMusicProvider } from "./music/qq.js";
-import { BiliBiliProvider } from "./music/bilibili.js";
 import { createCookieStore } from "./music/auth.js";
 import { createAvatarStore } from "./data/avatars.js";
 import { createPermissionStore } from "./data/permissions.js";
@@ -26,6 +24,27 @@ const LOG_DIR = path.join(DATA_DIR, "logs");
 const COOKIE_DIR = path.join(DATA_DIR, "cookies");
 const AVATAR_DIR = path.join(DATA_DIR, "avatars");
 const STATIC_DIR = path.join(ROOT_DIR, "web", "dist");
+
+/**
+ * 一次性迁移：旧版全局 cookie（{cookieDir}/{platform}.json）搬到第一个 bot 名下
+ * （{cookieDir}/{botId}/{platform}.json），兼容单租户历史数据。仅在旧文件存在
+ * 且目标不存在时移动，幂等。必须在 loadSavedBots（createProviders 读 cookie）之前跑。
+ */
+function migrateLegacyCookies(db: { getBotInstances(): { id: string }[] }, cookieDir: string, logger: { info(...args: unknown[]): void }): void {
+  const instances = db.getBotInstances();
+  if (instances.length === 0) return;
+  const firstBotId = instances[0].id;
+  for (const platform of ["netease", "qq", "bilibili"]) {
+    const oldPath = path.join(cookieDir, `${platform}.json`);
+    const newDir = path.join(cookieDir, firstBotId);
+    const newPath = path.join(newDir, `${platform}.json`);
+    if (fs.existsSync(oldPath) && !fs.existsSync(newPath)) {
+      fs.mkdirSync(newDir, { recursive: true });
+      fs.renameSync(oldPath, newPath);
+      logger.info({ platform, botId: firstBotId }, "Migrated legacy global cookie to bot");
+    }
+  }
+}
 
 async function main() {
   // Migrate a pre-#86 root-level config.json into the data dir so existing
@@ -51,25 +70,15 @@ async function main() {
   );
   await apiServer.start();
 
-  const neteaseProvider = new NeteaseProvider(apiServer.getNeteaseBaseUrl());
-  const qqProvider = new QQMusicProvider(apiServer.getQQMusicBaseUrl());
-  const bilibiliProvider = new BiliBiliProvider();
-
   const cookieStore = createCookieStore(COOKIE_DIR);
   const avatarStore = createAvatarStore(AVATAR_DIR);
-  const neteaseCookie = cookieStore.load("netease");
-  if (neteaseCookie) neteaseProvider.setCookie(neteaseCookie);
-  const qqCookie = cookieStore.load("qq");
-  if (qqCookie) qqProvider.setCookie(qqCookie);
-  const bilibiliCookie = cookieStore.load("bilibili");
-  if (bilibiliCookie) bilibiliProvider.setCookie(bilibiliCookie);
 
   const permissions = createPermissionStore(db.db);
 
   const botManager = new BotManager(
-    neteaseProvider,
-    qqProvider,
-    bilibiliProvider,
+    cookieStore,
+    apiServer.getNeteaseBaseUrl(),
+    apiServer.getQQMusicBaseUrl(),
     db,
     config,
     logger,
@@ -77,20 +86,20 @@ async function main() {
     permissions,
     CONFIG_PATH
   );
+  // 一次性迁移：旧全局 cookie（{platform}.json）→ 第一个 bot（兼容单租户历史数据）
+  migrateLegacyCookies(db, COOKIE_DIR, logger);
   await botManager.loadSavedBots();
 
   const webServer = createWebServer({
     port: config.webPort,
     botManager,
-    neteaseProvider,
-    qqProvider,
-    bilibiliProvider,
+    neteaseBaseUrl: apiServer.getNeteaseBaseUrl(),
+    qqBaseUrl: apiServer.getQQMusicBaseUrl(),
     database: db,
     avatarStore,
     config,
     configPath: CONFIG_PATH,
     logger,
-    cookieStore,
     staticDir: STATIC_DIR,
   });
   await webServer.start();

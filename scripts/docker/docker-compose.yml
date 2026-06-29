@@ -10,16 +10,12 @@
 
 services:
   tsmusicbot:
-    image: ghcr.io/zhangtianyao1/teamspeak-music-bot:latest
+    # 切回官方镜像：把下行换回 ghcr.io/zhangtianyao1/teamspeak-music-bot:latest
+    image: tsmusicbot-vip:latest
     container_name: tsmusicbot
-    # Use host network so the bot can reach TS3 server on LAN
-    # If your TS3 server is on the same machine, this is required
-    network_mode: host
-    # If you prefer port mapping instead of host network, comment out
-    # network_mode and uncomment ports:
-    # ports:
-    #   - "3000:3000"     # WebUI
-    #   - "9987:9987/udp" # TS3 voice (only if TS3 server is in another container)
+    # Windows: host network not supported, use port mapping
+    ports:
+      - "3000:3000"     # WebUI
     volumes:
       - tsmusicbot-data:/app/data
     restart: unless-stopped

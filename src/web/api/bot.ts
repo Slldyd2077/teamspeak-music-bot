@@ -3,7 +3,7 @@ import type { BotManager } from "../../bot/manager.js";
 import type { BotConfig, GuestModeConfig } from "../../data/config.js";
 import { saveConfig } from "../../data/config.js";
 import type { Logger } from "../../logger.js";
-import type { BotDatabase } from "../../data/database.js";
+import type { BotDatabase, ProfileConfig } from "../../data/database.js";
 import type { AvatarStore } from "../../data/avatars.js";
 import { requirePermission, requireBotAccess } from "../middleware/requirePermission.js";
 import { requireNotGuest } from "../middleware/requireNotGuest.js";
@@ -36,6 +36,7 @@ export function createBotRouter(
     res.json({
       idleTimeoutMinutes: config.idleTimeoutMinutes ?? 0,
       autoPauseOnEmpty: config.autoPauseOnEmpty,
+      adminGroups: config.adminGroups ?? [],
       guestMode: config.guestMode,
     });
   });
@@ -43,7 +44,7 @@ export function createBotRouter(
   // POST /api/bot/settings — 保存全局 bot 行为设置 (gated: changing global bot
   // behavior is a bot.manage operation, consistent with PR #80's permission model)
   router.post("/settings", requirePermission("bot.manage"), (req, res) => {
-    const { idleTimeoutMinutes, autoPauseOnEmpty, guestMode } = req.body;
+    const { idleTimeoutMinutes, autoPauseOnEmpty, guestMode, adminGroups } = req.body;
 
     const hasIdle = idleTimeoutMinutes !== undefined;
     if (hasIdle && (typeof idleTimeoutMinutes !== "number" || idleTimeoutMinutes < 0)) {
@@ -74,6 +75,13 @@ export function createBotRouter(
       }
     }
 
+    if (Array.isArray(adminGroups)) {
+      config.adminGroups = adminGroups.filter(
+        (g: unknown): g is number =>
+          typeof g === "number" && Number.isInteger(g) && g >= 0,
+      );
+    }
+
     saveConfig(configPath, config);
 
     // Guest-mode changed: tear down / re-scope in-flight guest WS sockets so a
@@ -92,6 +100,7 @@ export function createBotRouter(
     res.json({
       idleTimeoutMinutes: config.idleTimeoutMinutes ?? 0,
       autoPauseOnEmpty: config.autoPauseOnEmpty,
+      adminGroups: config.adminGroups ?? [],
       guestMode: config.guestMode,
     });
   });
@@ -116,6 +125,57 @@ export function createBotRouter(
     // consumes channel/server passwords.
     const { ts6ApiKey: _ts6ApiKey, identity: _identity, ...safe } = saved as unknown as Record<string, unknown>;
     res.json(safe);
+  });
+
+  // Whitelisted ProfileConfig keys — anything outside this set is dropped.
+  const PROFILE_KEYS: readonly (keyof ProfileConfig)[] = [
+    "avatarEnabled",
+    "descriptionEnabled",
+    "nicknameEnabled",
+    "awayStatusEnabled",
+    "channelDescEnabled",
+    "nowPlayingMsgEnabled",
+  ];
+
+  const botExists = (id: string): boolean =>
+    !!botManager.getBot(id) || botDb.getBotInstances().some((b) => b.id === id);
+
+  // GET /:id/profile — per-bot profile switches (avatar/nickname/description/away/...).
+  router.get("/:id/profile", requirePermission("bot.manage"), requireBotAccess("id"), (req, res) => {
+    if (!botExists(req.params.id)) {
+      res.status(404).json({ error: "Bot not found" });
+      return;
+    }
+    res.json(botDb.getProfileConfig(req.params.id));
+  });
+
+  // PUT /:id/profile — update per-bot profile switches. Only boolean values for
+  // known keys are applied (mirrors config.ts's strict guestMode coercion);
+  // live bot instances resync immediately so toggles take effect now, not on
+  // the next song.
+  router.put("/:id/profile", requirePermission("bot.manage"), requireBotAccess("id"), async (req, res) => {
+    if (!botExists(req.params.id)) {
+      res.status(404).json({ error: "Bot not found" });
+      return;
+    }
+    const merged: ProfileConfig = { ...botDb.getProfileConfig(req.params.id) };
+    const body = (req.body ?? {}) as Record<string, unknown>;
+    for (const key of PROFILE_KEYS) {
+      if (typeof body[key] === "boolean") merged[key] = body[key] as boolean;
+    }
+    try {
+      botDb.saveProfileConfig(req.params.id, merged);
+      const bot = botManager.getBot(req.params.id);
+      if (bot) {
+        bot.getProfileManager().updateConfig(merged);
+        await bot.getProfileManager().resync();
+      }
+    } catch (err) {
+      logger.error({ err, botId: req.params.id }, "Failed to save/apply profile config");
+      res.status(500).json({ error: "Failed to save profile config" });
+      return;
+    }
+    res.json(merged);
   });
 
   router.get("/:id/avatar", requirePermission("bot.manage"), requireBotAccess("id"), (req, res) => {
