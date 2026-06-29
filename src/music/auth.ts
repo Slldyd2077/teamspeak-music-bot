@@ -10,6 +10,7 @@ export type Platform = "netease" | "qq" | "bilibili";
 export interface CookieStore {
   save(botId: string, platform: Platform, cookie: string): void;
   load(botId: string, platform: Platform): string;
+  delete(botId: string, platform: Platform): void;
 }
 
 export function createCookieStore(cookieDir: string): CookieStore {
@@ -42,6 +43,18 @@ export function createCookieStore(cookieDir: string): CookieStore {
         return data.cookie ?? "";
       } catch {
         return "";
+      }
+    },
+
+    delete(botId, platform): void {
+      if (!botId || /[\\/]/.test(botId)) return;
+      const fp = filePath(botId, platform);
+      if (fs.existsSync(fp)) {
+        try {
+          fs.unlinkSync(fp);
+        } catch {
+          /* 文件已不存在或无法删除，忽略 */
+        }
       }
     },
   };

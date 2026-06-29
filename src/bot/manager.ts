@@ -162,6 +162,17 @@ export class BotManager extends EventEmitter {
     return this.cookieStore.load(botId, platform);
   }
 
+  /** web API：清除某 bot 的某平台 cookie（退出登录）。删文件 + 清内存 provider。 */
+  clearBotCookie(botId: string, platform: Platform): void {
+    this.cookieStore.delete(botId, platform);
+    const set = this.providers.get(botId);
+    if (set) {
+      if (platform === "netease") set.netease.setCookie("");
+      else if (platform === "qq") set.qq.setCookie("");
+      else set.bilibili.setCookie("");
+    }
+  }
+
   async createBot(params: CreateBotParams): Promise<BotInstance> {
     const id = crypto.randomUUID();
     const providers = this.createProviders(id);

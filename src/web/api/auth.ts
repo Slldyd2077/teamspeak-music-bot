@@ -143,5 +143,22 @@ export function createAuthRouter(
     res.json({ success: true });
   });
 
+  // 退出登录：清除该 bot 的某平台 cookie（删文件 + 清内存 provider）
+  router.delete("/cookie", requirePermission("platform.auth"), (req, res) => {
+    const platform = req.query.platform as string | undefined;
+    const botId = req.query.botId as string | undefined;
+    if (!botId) {
+      res.status(400).json({ error: "botId is required" });
+      return;
+    }
+    if (platform === "youtube") {
+      res.status(400).json({ error: "YouTube does not use cookies" });
+      return;
+    }
+    botManager.clearBotCookie(botId, platOf(platform));
+    logger.info({ platform, botId }, "Platform cookie cleared (logout)");
+    res.json({ success: true });
+  });
+
   return router;
 }
