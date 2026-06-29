@@ -7,6 +7,7 @@ import type {
   MusicProvider,
   Song,
   SongWithUrl,
+  SongUrlResult,
   Playlist,
   Album,
   SearchResult,
@@ -134,7 +135,7 @@ export class YouTubeProvider implements MusicProvider {
     }
   }
 
-  async getSongUrl(songId: string): Promise<string | null> {
+  async getSongUrl(songId: string): Promise<SongUrlResult | null> {
     try {
       const url = `https://www.youtube.com/watch?v=${songId}`;
       const raw = await runYtDlp([
@@ -146,7 +147,7 @@ export class YouTubeProvider implements MusicProvider {
         "--quiet",
       ], 45_000);
       const audioUrl = raw.trim().split("\n")[0];
-      return audioUrl || null;
+      return audioUrl ? { url: audioUrl } : null;
     } catch {
       return null;
     }

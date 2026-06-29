@@ -3,6 +3,7 @@ import axios, { type AxiosInstance } from "axios";
 import type {
   MusicProvider,
   Song,
+  SongUrlResult,
   Playlist,
   LyricLine,
   SearchResult,
@@ -231,7 +232,7 @@ export class BiliBiliProvider implements MusicProvider {
     return this.cidCache.get(bvid) ?? null;
   }
 
-  async getSongUrl(songId: string, _quality?: string): Promise<string | null> {
+  async getSongUrl(songId: string, _quality?: string): Promise<SongUrlResult | null> {
     const cid = await this.getCid(songId);
     if (!cid) return null;
 
@@ -253,7 +254,8 @@ export class BiliBiliProvider implements MusicProvider {
         (b.bandwidth ?? 0) > (a.bandwidth ?? 0) ? b : a
       );
 
-      return best.baseUrl ?? best.base_url ?? null;
+      const biliUrl = best.baseUrl ?? best.base_url;
+      return biliUrl ? { url: biliUrl } : null;
     } catch {
       return null;
     }

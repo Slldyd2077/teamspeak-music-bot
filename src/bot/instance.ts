@@ -52,6 +52,8 @@ export interface BotStatus {
   volume: number;
   playMode: PlayMode;
   elapsed: number; // ground truth elapsed seconds from frame count
+  /** 当前曲实际播放时长（秒）。试听片段=试听秒数；完整曲=duration。缺失时前端回退 currentSong.duration。 */
+  effectiveDuration?: number;
 }
 
 export class BotInstance extends EventEmitter {
@@ -81,6 +83,8 @@ export class BotInstance extends EventEmitter {
   private fmProvider: MusicProvider | null = null;
   /** Results of the most recent !search, for "#N" selection (issue #90). */
   private lastSearchResults: Song[] = [];
+  /** 当前曲实际播放时长（试听片段秒数或完整 duration）；resolveAndPlay 赋值。 */
+  private effectiveDuration: number | undefined;
   private playGate: Promise<unknown> = Promise.resolve();
 
   constructor(options: BotInstanceOptions) {
@@ -508,8 +512,8 @@ export class BotInstance extends EventEmitter {
     this.voteSkipUsers.clear();
     const provider = this.getProviderFor(song.platform);
     try {
-      const url = await provider.getSongUrl(song.id);
-      if (!url) {
+      const result = await provider.getSongUrl(song.id);
+      if (!result?.url) {
         this.logger.warn({ songId: song.id, name: song.name }, "No URL available, skipping");
         return false;
       }
@@ -525,8 +529,10 @@ export class BotInstance extends EventEmitter {
         );
         return false;
       }
-      song.url = url;
-      this.player.play(url, 0, song.duration);
+      song.url = result.url;
+      // 试听片段用试听时长（让 player nearEnd 正确触发自动切歌）；完整曲回退 song.duration
+      this.effectiveDuration = result.trialDuration ?? song.duration;
+      this.player.play(result.url, 0, this.effectiveDuration);
       // Fresh playback (re)start — clear auto-pause so a later occupancy
       // change won't try to "resume" a track the user already restarted.
       this.autoPaused = false;
@@ -1119,6 +1125,7 @@ export class BotInstance extends EventEmitter {
       volume: this.player.getVolume(),
       playMode: this.queue.getMode(),
       elapsed: this.player.getElapsed(),
+      effectiveDuration: this.effectiveDuration,
     };
   }
 

@@ -6,10 +6,20 @@ export interface Song {
   duration: number; // seconds
   coverUrl: string;
   platform: "netease" | "qq" | "bilibili" | "youtube";
+  /** VIP / copyright-restricted: non-VIP users can only play a trial fragment
+   *  (NetEase fee=1 VIP / fee=4 album-only, or QQ pay.payplay/paytrackprice=1). */
+  vip?: boolean;
 }
 
 export interface SongWithUrl extends Song {
   url: string;
+}
+
+/** getSongUrl 解析结果。trialDuration 缺省 = 完整可播放（VIP 账号 / 免费曲）。 */
+export interface SongUrlResult {
+  url: string;
+  /** 试听片段时长（秒）。VIP/免费曲为 undefined → 调用方回退完整 duration。 */
+  trialDuration?: number;
 }
 
 export interface Playlist {
@@ -65,7 +75,7 @@ export interface MusicProvider {
   readonly platform: "netease" | "qq" | "bilibili" | "youtube";
 
   search(query: string, limit?: number): Promise<SearchResult>;
-  getSongUrl(songId: string, quality?: string): Promise<string | null>;
+  getSongUrl(songId: string, quality?: string): Promise<SongUrlResult | null>;
   setQuality(quality: string): void;
   getQuality(): string;
   getSongDetail(songId: string): Promise<Song | null>;

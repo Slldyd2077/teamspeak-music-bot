@@ -2,6 +2,7 @@ import axios, { type AxiosInstance } from "axios";
 import type {
   MusicProvider,
   Song,
+  SongUrlResult,
   Playlist,
   PlaylistDetail,
   LyricLine,
@@ -53,8 +54,21 @@ export function mapQqSongs(raw: any[] | null | undefined): Song[] {
         ? `https://y.gtimg.cn/music/photo_new/T002R300x300M000${albumMid}.jpg`
         : "",
       platform: "qq" as const,
+      vip: s.pay?.payplay === 1 || s.pay?.paytrackprice === 1 || false,
     };
   }).filter((s) => s.id);
+}
+
+/** 解析 QQ 试听标记 → 试听秒数；非试听（VIP/免费）返回 undefined。
+ *  字段 isTryout===1 / tryout===true + tryBegin/tryEnd；容忍 begin/start 别名 + 毫秒兜底。 */
+export function parseQqTrial(playUrl: any): number | undefined {
+  if (!playUrl || typeof playUrl !== "object") return undefined;
+  if (playUrl.isTryout !== 1 && playUrl.tryout !== true) return undefined;
+  const begin = Number(playUrl.tryBegin ?? playUrl.begin ?? playUrl.start ?? 0);
+  const end = Number(playUrl.tryEnd ?? playUrl.end);
+  if (!Number.isFinite(end) || end <= begin) return undefined;
+  const secs = end > 1000 ? (end - begin) / 1000 : end - begin;
+  return Math.round(secs);
 }
 
 export function mapQqAlbums(raw: any[] | null | undefined): Album[] {
@@ -247,13 +261,13 @@ export class QQMusicProvider implements MusicProvider {
     return { songs, playlists: [], albums };
   }
 
-  async getSongUrl(songId: string, quality?: string): Promise<string | null> {
+  async getSongUrl(songId: string, quality?: string): Promise<SongUrlResult | null> {
     try {
       const res = await this.api.get("/getMusicPlay", {
         params: { songmid: songId, quality: quality ?? this.quality, ...this.cookieParams },
       });
       const playUrl = res.data?.data?.playUrl?.[songId];
-      if (playUrl?.url) return playUrl.url;
+      if (playUrl?.url) return { url: playUrl.url, trialDuration: parseQqTrial(playUrl) };
     } catch {
       // try with songid
       try {
@@ -261,7 +275,7 @@ export class QQMusicProvider implements MusicProvider {
           params: { songid: songId, quality: quality ?? this.quality, ...this.cookieParams },
         });
         const playUrl = res.data?.data?.playUrl?.[songId];
-        if (playUrl?.url) return playUrl.url;
+        if (playUrl?.url) return { url: playUrl.url, trialDuration: parseQqTrial(playUrl) };
       } catch {
         // ignore
       }
@@ -520,6 +534,7 @@ export class QQMusicProvider implements MusicProvider {
           ? `https://y.gtimg.cn/music/photo_new/T002R300x300M000${s.album.mid}.jpg`
           : "",
         platform: "qq",
+        vip: s.pay?.payplay === 1 || s.pay?.paytrackprice === 1 || false,
       }));
     } catch {
       return [];
