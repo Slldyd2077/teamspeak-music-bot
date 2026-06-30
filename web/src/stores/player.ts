@@ -10,7 +10,7 @@ export interface Song {
   album: string;
   duration: number;
   coverUrl: string;
-  platform: 'netease' | 'qq' | 'bilibili' | 'youtube' | 'local';
+  platform: 'netease' | 'qq' | 'bilibili' | 'youtube' | 'local' | 'kugou';
 }
 
 export type Source = 'netease' | 'qq';

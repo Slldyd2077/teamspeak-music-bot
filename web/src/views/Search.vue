@@ -73,6 +73,11 @@
           @click="selectedSource = 'bilibili'"
         >B站</button>
         <button
+          class="source-btn"
+          :class="{ active: selectedSource === 'kugou' }"
+          @click="selectedSource = 'kugou'"
+        >酷狗</button>
+        <button
           v-if="hasLocalSongs"
           class="source-btn"
           :class="{ active: selectedSource === 'local' }"
@@ -89,7 +94,7 @@
           单曲<span class="tab-count">{{ filteredSongs.length }}</span>
         </button>
         <button
-          v-if="selectedSource !== 'bilibili' && selectedSource !== 'local'"
+          v-if="selectedSource !== 'bilibili' && selectedSource !== 'local' && selectedSource !== 'kugou'"
           class="tab"
           :class="{ active: activeTab === 'albums' }"
           @click="activeTab = 'albums'"
@@ -97,7 +102,7 @@
           专辑<span class="tab-count">{{ filteredAlbums.length }}</span>
         </button>
         <button
-          v-if="selectedSource !== 'bilibili' && selectedSource !== 'local'"
+          v-if="selectedSource !== 'bilibili' && selectedSource !== 'local' && selectedSource !== 'kugou'"
           class="tab"
           :class="{ active: activeTab === 'playlists' }"
           @click="activeTab = 'playlists'"
@@ -182,12 +187,12 @@ const router = useRouter();
 
 const SOURCE_STORAGE_KEY = 'search-source';
 
-type SearchSource = 'netease' | 'qq' | 'bilibili' | 'local';
+type SearchSource = 'netease' | 'qq' | 'bilibili' | 'local' | 'kugou';
 
 function loadSource(): SearchSource {
   try {
     const stored = localStorage.getItem(SOURCE_STORAGE_KEY);
-    if (stored === 'netease' || stored === 'qq' || stored === 'bilibili' || stored === 'local') return stored;
+    if (stored === 'netease' || stored === 'qq' || stored === 'bilibili' || stored === 'local' || stored === 'kugou') return stored;
   } catch { /* localStorage blocked */ }
   return 'netease';
 }
@@ -232,7 +237,7 @@ watch(selectedSource, (src) => {
 
 // B站 / 本地上传没有专辑和歌单页签，切换时强制回到单曲。
 watch(selectedSource, (src) => {
-  if ((src === 'bilibili' || src === 'local') && activeTab.value !== 'songs') {
+  if ((src === 'bilibili' || src === 'local' || src === 'kugou') && activeTab.value !== 'songs') {
     activeTab.value = 'songs';
   }
 });
@@ -351,6 +356,7 @@ function badgeLabel(platform: string): string {
   if (platform === 'bilibili') return 'B站';
   if (platform === 'youtube') return 'YouTube';
   if (platform === 'local') return '本地';
+  if (platform === 'kugou') return '酷狗';
   return '网易云';
 }
 
@@ -359,6 +365,7 @@ function badgeClass(platform: string): string {
   if (platform === 'bilibili') return 'badge-bilibili';
   if (platform === 'youtube') return 'badge-youtube';
   if (platform === 'local') return 'badge-local';
+  if (platform === 'kugou') return 'badge-kugou';
   return 'badge-netease';
 }
 
@@ -643,6 +650,11 @@ onMounted(() => {
 .badge-local {
   background: var(--color-primary-10);
   color: var(--color-primary);
+}
+
+.badge-kugou {
+  background: var(--brand-kugou-12);
+  color: var(--brand-kugou);
 }
 
 .fav-badge {

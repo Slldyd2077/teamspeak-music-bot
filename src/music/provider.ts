@@ -5,7 +5,7 @@ export interface Song {
   album: string;
   duration: number; // seconds
   coverUrl: string;
-  platform: "netease" | "qq" | "bilibili" | "youtube" | "local";
+  platform: "netease" | "qq" | "bilibili" | "youtube" | "local" | "kugou";
   /** VIP / copyright-restricted: non-VIP users can only play a trial fragment
    *  (NetEase fee=1 VIP / fee=4 album-only, or QQ pay.payplay/paytrackprice=1). */
   vip?: boolean;
@@ -27,7 +27,7 @@ export interface Playlist {
   name: string;
   coverUrl: string;
   songCount: number;
-  platform: "netease" | "qq" | "bilibili" | "youtube" | "local";
+  platform: "netease" | "qq" | "bilibili" | "youtube" | "local" | "kugou";
 }
 
 export interface PlaylistDetail {
@@ -44,7 +44,7 @@ export interface Album {
   artist: string;
   coverUrl: string;
   songCount: number;
-  platform: "netease" | "qq" | "bilibili" | "youtube" | "local";
+  platform: "netease" | "qq" | "bilibili" | "youtube" | "local" | "kugou";
 }
 
 export interface LyricLine {
@@ -72,7 +72,7 @@ export interface AuthStatus {
 }
 
 export interface MusicProvider {
-  readonly platform: "netease" | "qq" | "bilibili" | "youtube" | "local";
+  readonly platform: "netease" | "qq" | "bilibili" | "youtube" | "local" | "kugou";
 
   search(query: string, limit?: number): Promise<SearchResult>;
   getSongUrl(songId: string, quality?: string): Promise<SongUrlResult | null>;

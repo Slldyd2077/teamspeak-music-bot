@@ -36,6 +36,7 @@ export interface BotInstanceOptions {
   bilibiliProvider: MusicProvider;
   youtubeProvider: MusicProvider;
   localProvider?: MusicProvider;
+  kugouProvider?: MusicProvider;
   database: BotDatabase;
   config: BotConfig;
   logger: Logger;
@@ -69,6 +70,7 @@ export class BotInstance extends EventEmitter {
   private bilibiliProvider: MusicProvider;
   private youtubeProvider: MusicProvider;
   private localProvider: MusicProvider;
+  private kugouProvider: MusicProvider;
   private database: BotDatabase;
   private config: BotConfig;
   private logger: Logger;
@@ -98,6 +100,7 @@ export class BotInstance extends EventEmitter {
     this.bilibiliProvider = options.bilibiliProvider;
     this.youtubeProvider = options.youtubeProvider;
     this.localProvider = options.localProvider ?? options.neteaseProvider;
+    this.kugouProvider = options.kugouProvider ?? options.neteaseProvider;
     this.database = options.database;
     this.config = options.config;
     this.logger = options.logger.child({ botId: this.id });
@@ -524,10 +527,11 @@ export class BotInstance extends EventEmitter {
     }
   }
 
-  getProviderFor(platform: "netease" | "qq" | "bilibili" | "youtube" | "local"): MusicProvider {
+  getProviderFor(platform: "netease" | "qq" | "bilibili" | "youtube" | "local" | "kugou"): MusicProvider {
     if (platform === "bilibili") return this.bilibiliProvider;
     if (platform === "youtube") return this.youtubeProvider;
     if (platform === "local") return this.localProvider;
+    if (platform === "kugou") return this.kugouProvider;
     return platform === "qq" ? this.qqProvider : this.neteaseProvider;
   }
 
@@ -540,6 +544,7 @@ export class BotInstance extends EventEmitter {
     if (flags.has("b")) return this.bilibiliProvider;
     if (flags.has("q")) return this.qqProvider;
     if (flags.has("y")) return this.youtubeProvider;
+    if (flags.has("k")) return this.kugouProvider;
     return this.neteaseProvider;
   }
 
