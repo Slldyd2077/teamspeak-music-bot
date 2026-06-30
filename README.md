@@ -461,7 +461,7 @@ teamspeak-music-bot/
 | **音频处理** | FFmpeg (ffmpeg-static 内置), @discordjs/opus |
 | **TS 协议** | @honeybbq/teamspeak-client（完整客户端协议）+ 自研 TS6 协议适配层 |
 | **网易云 API** | NeteaseCloudMusicApi |
-| **QQ 音乐 API** | @sansenjian/qq-music-api |
+| **QQ 音乐 API** | @sansenjian/qq-music-api（锁定 `~2.4.0`，需 Node ≥ 20.17） |
 | **哔哩哔哩** | BiliBili Web API（搜索、DASH 音频流、QR 登录） |
 | **酷狗音乐** | 酷狗公开 API（直连，无 npm 依赖 / 无内嵌服务；请求签名 / KRC 歌词解码 / 设备注册移植自 MIT 的 MakcRe/KuGouMusicApi，改用 Node 内置 crypto + zlib） |
 | **前端框架** | Vue 3, Vite 5, Pinia, Vue Router 4 |
@@ -577,6 +577,12 @@ A：可以。在设置页面创建多个实例，分别连接不同的 TS 服务
 
 **Q：端口 3200 被占用？**
 A：QQ 音乐 API 启动时自动监听 3200 端口。如果之前的进程还在运行，程序会自动复用。如需重启可手动结束 `node` 进程。
+
+**Q：QQ 音乐二维码不弹 / 扫码登录失败 / cookie 无法使用？**
+A：通常是内置的 QQ 音乐 API 服务没起来——它一旦没监听 3200 端口，机器人去取二维码就会拿到 `ECONNREFUSED 127.0.0.1:3200`，于是二维码不显示，登录和 cookie 也全失效。先看日志里 QQ API 的启动报错：
+- 报 `ERR_REQUIRE_ESM`：装到了不兼容的 `@sansenjian/qq-music-api` 版本。本项目把它锁在 **`~2.4.0`**（需要 **Node ≥ 20.17 / 22.9**）；务必用 `npm ci` 或 `npm install` 让版本与锁文件一致，**不要**手动 `npm update` 把它升级或降级到不兼容的中间版本（2.3.0/2.3.1 是纯 ESM、会触发此错）。
+- 报 Node 版本不满足：升级 Node 到 ≥ 20.17，或将该依赖降到 `~2.2.10`（无此 Node 要求）后重装。
+修好版本后重新 `npm install && npm run build` 并重启即可。
 
 **Q：播放歌曲时报 FFmpeg EACCES 错误？**
 A：`ffmpeg-static` 内置的 FFmpeg 二进制文件缺少执行权限。程序已自动尝试修复，如果仍然失败，请手动执行：

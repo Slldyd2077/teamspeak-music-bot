@@ -17,7 +17,7 @@
     "@discordjs/opus": "^0.10.0",
     "@honeybbq/teamspeak-client": "^0.2.1",
     "@koa/router": "^15.4.0",
-    "@sansenjian/qq-music-api": "^2.2.10",
+    "@sansenjian/qq-music-api": "~2.4.0",
     "axios": "^1.14.0",
     "bcryptjs": "^2.4.3",
     "better-sqlite3": "^12.8.0",
