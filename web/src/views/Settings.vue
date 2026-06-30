@@ -969,13 +969,15 @@ async function startQrLogin(platform: string) {
     if (qrImg) {
       qr.dataUrl = qrImg;
     } else {
+      // QR codes must be dark-on-light to stay scannable. Do NOT invert the
+      // colours for the dark theme: many in-app scanners (notably the Kugou
+      // music app) cannot decode a light-on-dark QR, so a themed code looks
+      // fine on screen but silently fails to scan. The white quiet-zone frames
+      // it cleanly in dark mode anyway.
       qr.dataUrl = await QRCode.toDataURL(qrUrl, {
         width: 200,
         margin: 2,
-        color: {
-          dark: store.theme === 'dark' ? '#ffffff' : '#000000',
-          light: store.theme === 'dark' ? '#2a2a2a' : '#ffffff',
-        },
+        color: { dark: '#000000', light: '#ffffff' },
       });
     }
 
