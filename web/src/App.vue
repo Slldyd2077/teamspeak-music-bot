@@ -118,8 +118,10 @@ let mobileRaf: number | null = null;
 
 function updateMobileProgress() {
   const duration = currentSong.value?.duration ?? 0;
+  // liveElapsed() recomputes each frame; the cached `elapsed` getter would
+  // leave the mobile bar frozen between server pushes (#107).
   mobileProgressPct.value = duration > 0
-    ? Math.min((playerStore.elapsed / duration) * 100, 100)
+    ? Math.min((playerStore.liveElapsed() / duration) * 100, 100)
     : 0;
   mobileRaf = requestAnimationFrame(updateMobileProgress);
 }

@@ -136,7 +136,9 @@ function scrollToActiveLine(idx: number) {
 
 function syncLyrics() {
   if (!store.isPlaying || lines.value.length === 0) return;
-  const elapsed = store.elapsed;
+  // liveElapsed() (action) is recomputed now; the cached `elapsed` getter only
+  // refreshed on server pushes, leaving highlights ~half a line behind (#107).
+  const elapsed = store.liveElapsed();
   const idx = findActiveLine(elapsed);
   // Only update when the active line actually changes
   if (idx !== activeLine.value && idx >= 0) {

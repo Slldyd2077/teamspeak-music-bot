@@ -135,8 +135,9 @@ function formatTime(seconds: number): string {
 }
 
 function updateProgress() {
-  // Use store.elapsed which interpolates from server ground truth
-  currentElapsed.value = store.elapsed;
+  // liveElapsed() (an action, not the cached `elapsed` getter) re-interpolates
+  // from the server anchor on every frame so the clock ticks each second (#107).
+  currentElapsed.value = store.liveElapsed();
 
   const duration = currentSong.value?.duration ?? 0;
   progressPercent.value = duration > 0

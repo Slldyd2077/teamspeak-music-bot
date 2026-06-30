@@ -47,7 +47,7 @@ export interface FavoritePlaylist {
   createdAt: string;
 }
 
-interface TimingState {
+export interface TimingState {
   serverElapsed: number;
   serverSyncTime: number;
   wasPlaying: boolean;
@@ -57,6 +57,33 @@ const HOME_CACHE_TTL = 5 * 60 * 1000;
 
 function defaultTiming(): TimingState {
   return { serverElapsed: 0, serverSyncTime: 0, wasPlaying: false };
+}
+
+/**
+ * Interpolate the live elapsed seconds from the last server anchor.
+ *
+ * This is a PURE function (its only time source is `Date.now()`), deliberately
+ * kept OUT of the Pinia getter so it can be called fresh every animation frame.
+ * The `elapsed` getter is a Vue `computed` and caches its result until a
+ * REACTIVE dependency changes — but `Date.now()` is not reactive, so a getter
+ * only re-runs on a WebSocket push / server poll (every few seconds). Reading
+ * the getter from a requestAnimationFrame loop therefore returns a frozen value
+ * and the clock appears to jump ~3s at a time (issue #107). Per-frame consumers
+ * must call this helper (via the `liveElapsed` action) instead.
+ */
+export function interpolateElapsed(
+  timing: TimingState,
+  isPaused: boolean,
+  maxDuration: number,
+): number {
+  // No live anchor yet, or paused: report the frozen server position.
+  if (!timing.wasPlaying || timing.serverSyncTime === 0 || isPaused) {
+    return Math.min(timing.serverElapsed, maxDuration);
+  }
+  return Math.min(
+    timing.serverElapsed + (Date.now() - timing.serverSyncTime) / 1000,
+    maxDuration,
+  );
 }
 
 export const usePlayerStore = defineStore('player', {
@@ -111,15 +138,19 @@ export const usePlayerStore = defineStore('player', {
       if (!botId) return [];
       return this.queues[botId] ?? [];
     },
-    /** Interpolated elapsed for the active bot */
+    /**
+     * Interpolated elapsed for the active bot. NOTE: as a Pinia getter this is
+     * a Vue `computed` and is CACHED — it only re-runs when a reactive
+     * dependency changes, so it does NOT tick every second on its own. Use it
+     * for one-off reactive reads; per-frame consumers (progress bar, lyrics)
+     * must call the `liveElapsed` action so the clock advances smoothly (#107).
+     */
     elapsed(): number {
       const botId = this.activeBotId ?? this.bots[0]?.id;
       if (!botId || !this.activeBot?.currentSong) return 0;
       const timing = this.timings[botId] ?? defaultTiming();
       const maxDuration = this.activeBot.currentSong.duration || Infinity;
-      if (!timing.wasPlaying || timing.serverSyncTime === 0) return Math.min(timing.serverElapsed, maxDuration);
-      if (this.isPaused) return Math.min(timing.serverElapsed, maxDuration);
-      return Math.min(timing.serverElapsed + (Date.now() - timing.serverSyncTime) / 1000, maxDuration);
+      return interpolateElapsed(timing, this.isPaused, maxDuration);
     },
     /** Sources that are currently logged in. Order: netease before qq. */
     availableSources(): Source[] {
@@ -131,6 +162,21 @@ export const usePlayerStore = defineStore('player', {
   },
 
   actions: {
+    /**
+     * Live elapsed seconds for the active bot, recomputed on every call. Unlike
+     * the `elapsed` getter (a cached computed), this is an action, so it is NOT
+     * memoised — call it from requestAnimationFrame / interval loops so the
+     * progress bar and lyrics advance every frame instead of jumping on each
+     * server push (#107).
+     */
+    liveElapsed(): number {
+      const botId = this.activeBotId ?? this.bots[0]?.id;
+      if (!botId || !this.activeBot?.currentSong) return 0;
+      const timing = this.timings[botId] ?? defaultTiming();
+      const maxDuration = this.activeBot.currentSong.duration || Infinity;
+      return interpolateElapsed(timing, this.isPaused, maxDuration);
+    },
+
     _getTiming(botId: string): TimingState {
       if (!this.timings[botId]) {
         this.timings[botId] = defaultTiming();
@@ -403,9 +449,10 @@ export const usePlayerStore = defineStore('player', {
 
     async pause() {
       if (!this.activeBotId) return;
-      // Freeze elapsed at current interpolated value
+      // Freeze elapsed at the current LIVE interpolated value. Using the cached
+      // `elapsed` getter here could snapshot a value up to a few seconds stale.
       this._setTiming(this.activeBotId, {
-        serverElapsed: this.elapsed,
+        serverElapsed: this.liveElapsed(),
         wasPlaying: false,
       });
       await axios.post(`/api/player/${this.activeBotId}/pause`);
