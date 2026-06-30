@@ -28,7 +28,7 @@
     "koa": "^3.2.0",
     "koa-bodyparser": "^4.4.1",
     "koa-static": "^5.0.0",
-    "NeteaseCloudMusicApi": "^4.30.0",
+    "NeteaseCloudMusicApi": "~4.32.0",
     "pino": "^10.3.1",
     "ts3-nodejs-library": "^3.5.1",
     "tweetnacl": "^1.0.3",
