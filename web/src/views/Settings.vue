@@ -377,6 +377,76 @@
           <button class="btn-primary btn-save" @click="saveCookie('bilibili')">保存Cookie</button>
         </div>
       </div>
+
+      <!-- Kugou -->
+      <div class="account-card">
+        <div class="account-header">
+          <Icon icon="mdi:music-circle-outline" class="account-icon kugou-icon" />
+          <div class="account-info">
+            <div class="account-name">酷狗音乐</div>
+            <div class="account-status" :class="{ logged: kugouAuth.loggedIn }">
+              {{ kugouAuth.loggedIn ? `已登录: ${kugouAuth.nickname}` : '未登录' }}
+            </div>
+          </div>
+        </div>
+
+        <div class="login-methods">
+          <button
+            class="login-btn"
+            :class="{ active: kugouLoginMode === 'qr' }"
+            @click="startQrLogin('kugou')"
+            :disabled="kugouQr.loading"
+          >
+            <Icon icon="mdi:qrcode" />
+            扫码登录
+          </button>
+          <button
+            class="login-btn"
+            :class="{ active: kugouLoginMode === 'cookie' }"
+            @click="kugouLoginMode = 'cookie'"
+          >
+            <Icon icon="mdi:cookie" />
+            Cookie登录
+          </button>
+        </div>
+
+        <!-- QR Code -->
+        <div v-if="kugouLoginMode === 'qr'" class="qr-section">
+          <div v-if="kugouQr.loading" class="qr-loading">
+            <Icon icon="mdi:loading" class="spin" />
+            生成二维码中...
+          </div>
+          <div v-else-if="kugouQr.dataUrl" class="qr-wrap">
+            <img :src="kugouQr.dataUrl" class="qr-image" alt="QR Code" />
+            <div class="qr-status" :class="kugouQr.status">
+              <template v-if="kugouQr.status === 'waiting'">
+                <Icon icon="mdi:cellphone" /> 请使用酷狗音乐APP扫码
+              </template>
+              <template v-else-if="kugouQr.status === 'scanned'">
+                <Icon icon="mdi:check" /> 已扫码，请在手机上确认
+              </template>
+              <template v-else-if="kugouQr.status === 'confirmed'">
+                <Icon icon="mdi:check-circle" /> 登录成功!
+              </template>
+              <template v-else-if="kugouQr.status === 'expired'">
+                <Icon icon="mdi:refresh" /> 二维码已过期
+                <button class="btn-link" @click="startQrLogin('kugou')">重新生成</button>
+              </template>
+            </div>
+          </div>
+        </div>
+
+        <!-- Cookie -->
+        <div v-if="kugouLoginMode === 'cookie'" class="cookie-section">
+          <textarea
+            v-model="kugouCookie"
+            class="textarea"
+            placeholder="粘贴酷狗Cookie (token=...; userid=...)..."
+            rows="3"
+          />
+          <button class="btn-primary btn-save" @click="saveCookie('kugou')">保存Cookie</button>
+        </div>
+      </div>
     </section>
 
     <!-- Audio Quality requires quality -->
@@ -792,6 +862,7 @@ const editForm = reactive({
 const neteaseCookie = ref('');
 const qqCookie = ref('');
 const bilibiliCookie = ref('');
+const kugouCookie = ref('');
 const commandPrefix = ref('!');
 
 // Audio quality
@@ -823,11 +894,13 @@ async function setQuality(q: string) {
 const neteaseLoginMode = ref<'qr' | 'cookie' | null>(null);
 const qqLoginMode = ref<'qr' | 'cookie' | null>(null);
 const bilibiliLoginMode = ref<'qr' | 'cookie' | null>(null);
+const kugouLoginMode = ref<'qr' | 'cookie' | null>(null);
 
 // Auth status
 const neteaseAuth = reactive({ loggedIn: false, nickname: '', avatarUrl: '' });
 const qqAuth = reactive({ loggedIn: false, nickname: '', avatarUrl: '' });
 const bilibiliAuth = reactive({ loggedIn: false, nickname: '', avatarUrl: '' });
+const kugouAuth = reactive({ loggedIn: false, nickname: '', avatarUrl: '' });
 
 // QR state
 interface QrState {
@@ -847,22 +920,28 @@ const qqQr = reactive<QrState>({
 const bilibiliQr = reactive<QrState>({
   loading: false, dataUrl: '', key: '', status: 'waiting', pollTimer: null,
 });
+const kugouQr = reactive<QrState>({
+  loading: false, dataUrl: '', key: '', status: 'waiting', pollTimer: null,
+});
 
 function getQrState(platform: string): QrState {
   if (platform === 'bilibili') return bilibiliQr;
+  if (platform === 'kugou') return kugouQr;
   return platform === 'netease' ? neteaseQr : qqQr;
 }
 
 async function checkAuthStatus() {
   try {
-    const [nRes, qRes, bRes] = await Promise.all([
+    const [nRes, qRes, bRes, kRes] = await Promise.all([
       axios.get('/api/auth/status', { params: { platform: 'netease' } }),
       axios.get('/api/auth/status', { params: { platform: 'qq' } }),
       axios.get('/api/auth/status', { params: { platform: 'bilibili' } }),
+      axios.get('/api/auth/status', { params: { platform: 'kugou' } }),
     ]);
     Object.assign(neteaseAuth, nRes.data);
     Object.assign(qqAuth, qRes.data);
     Object.assign(bilibiliAuth, bRes.data);
+    Object.assign(kugouAuth, kRes.data);
   } catch {
     // API not ready
   }
@@ -872,6 +951,7 @@ async function startQrLogin(platform: string) {
   const qr = getQrState(platform);
   if (platform === 'netease') neteaseLoginMode.value = 'qr';
   else if (platform === 'bilibili') bilibiliLoginMode.value = 'qr';
+  else if (platform === 'kugou') kugouLoginMode.value = 'qr';
   else qqLoginMode.value = 'qr';
 
   // Stop existing poll
@@ -889,13 +969,15 @@ async function startQrLogin(platform: string) {
     if (qrImg) {
       qr.dataUrl = qrImg;
     } else {
+      // QR codes must be dark-on-light to stay scannable. Do NOT invert the
+      // colours for the dark theme: many in-app scanners (notably the Kugou
+      // music app) cannot decode a light-on-dark QR, so a themed code looks
+      // fine on screen but silently fails to scan. The white quiet-zone frames
+      // it cleanly in dark mode anyway.
       qr.dataUrl = await QRCode.toDataURL(qrUrl, {
         width: 200,
         margin: 2,
-        color: {
-          dark: store.theme === 'dark' ? '#ffffff' : '#000000',
-          light: store.theme === 'dark' ? '#2a2a2a' : '#ffffff',
-        },
+        color: { dark: '#000000', light: '#ffffff' },
       });
     }
 
@@ -1032,7 +1114,9 @@ async function toggleBot(botId: string, connected: boolean) {
 }
 
 async function saveCookie(platform: string) {
-  const cookie = platform === 'bilibili' ? bilibiliCookie.value : platform === 'netease' ? neteaseCookie.value : qqCookie.value;
+  const cookie = platform === 'bilibili' ? bilibiliCookie.value
+    : platform === 'kugou' ? kugouCookie.value
+    : platform === 'netease' ? neteaseCookie.value : qqCookie.value;
   if (!cookie) return;
   try {
     await axios.post('/api/auth/cookie', { platform, cookie });
@@ -1557,6 +1641,7 @@ onUnmounted(() => {
   if (neteaseQr.pollTimer) clearInterval(neteaseQr.pollTimer);
   if (qqQr.pollTimer) clearInterval(qqQr.pollTimer);
   if (bilibiliQr.pollTimer) clearInterval(bilibiliQr.pollTimer);
+  if (kugouQr.pollTimer) clearInterval(kugouQr.pollTimer);
 });
 </script>
 
@@ -1697,6 +1782,10 @@ onUnmounted(() => {
 
   &.bilibili-icon {
     color: var(--brand-bilibili);
+  }
+
+  &.kugou-icon {
+    color: var(--brand-kugou);
   }
 }
 

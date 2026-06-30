@@ -11,7 +11,8 @@ export function createAuthRouter(
   qqProvider: MusicProvider,
   bilibiliProvider: MusicProvider,
   logger: Logger,
-  cookieStore?: CookieStore
+  cookieStore?: CookieStore,
+  kugouProvider?: MusicProvider
 ): Router {
   const router = Router();
   // YouTube is auth-less; we only use this instance so /auth/status can
@@ -21,6 +22,7 @@ export function createAuthRouter(
   function getProvider(platform?: string): MusicProvider {
     if (platform === "bilibili") return bilibiliProvider;
     if (platform === "youtube") return youtubeProvider;
+    if (platform === "kugou" && kugouProvider) return kugouProvider;
     return platform === "qq" ? qqProvider : neteaseProvider;
   }
 
@@ -65,6 +67,7 @@ export function createAuthRouter(
       if (status === "confirmed") {
         const cookie = provider.getCookie();
         const plat = (platform as string) === "bilibili" ? "bilibili" as const
+          : (platform as string) === "kugou" ? "kugou" as const
           : (platform as string) === "qq" ? "qq" as const : "netease" as const;
         if (cookie && cookieStore) {
           cookieStore.save(plat, cookie);
@@ -137,6 +140,7 @@ export function createAuthRouter(
     const provider = getProvider(platform);
     provider.setCookie(cookie);
     const plat = platform === "bilibili" ? "bilibili" as const
+      : platform === "kugou" ? "kugou" as const
       : platform === "qq" ? "qq" as const : "netease" as const;
     if (cookieStore) {
       cookieStore.save(plat, cookie);

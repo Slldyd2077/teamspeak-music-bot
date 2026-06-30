@@ -65,8 +65,12 @@
             type="range"
             min="0"
             max="100"
-            :value="activeBot?.volume ?? 75"
+            :value="volumeDisplay"
+            @input="onVolumeInput"
             @change="onVolumeChange"
+            @pointerup="onVolumeRelease"
+            @pointercancel="onVolumeRelease"
+            @blur="onVolumeRelease"
             class="volume-slider"
           />
         </template>
@@ -87,6 +91,7 @@ import { Icon } from '@iconify/vue';
 import { useRoute, useRouter } from 'vue-router';
 import { usePlayerStore } from '../stores/player.js';
 import { useSession } from '../composables/useSession.js';
+import { useDecoupledSlider } from '../composables/useDecoupledSlider.js';
 import CoverArt from './CoverArt.vue';
 import Queue from './Queue.vue';
 
@@ -185,10 +190,17 @@ function togglePlay() {
   }
 }
 
-function onVolumeChange(e: Event) {
-  const target = e.target as HTMLInputElement;
-  store.setVolume(parseInt(target.value));
-}
+// Volume slider is decoupled from the per-frame rAF re-render so dragging the
+// thumb isn't reset every frame (#111). See useDecoupledSlider.
+const {
+  display: volumeDisplay,
+  onInput: onVolumeInput,
+  onChange: onVolumeChange,
+  onRelease: onVolumeRelease,
+} = useDecoupledSlider(
+  () => activeBot.value?.volume,
+  (v) => store.setVolume(v)
+);
 
 const modeOrder = ['seq', 'loop', 'random', 'rloop'] as const;
 const modeIcons: Record<string, string> = {

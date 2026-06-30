@@ -13,7 +13,8 @@ export function createMusicRouter(
   bilibiliProvider: MusicProvider,
   logger: Logger,
   localProvider?: MusicProvider,
-  config?: BotConfig
+  config?: BotConfig,
+  kugouProvider?: MusicProvider
 ): Router {
   const router = Router();
   const youtubeProvider: MusicProvider = new YouTubeProvider();
@@ -26,6 +27,7 @@ export function createMusicRouter(
     if (platform === "bilibili") return bilibiliProvider;
     if (platform === "youtube") return youtubeProvider;
     if (platform === "local" && localProvider) return localProvider;
+    if (platform === "kugou" && kugouProvider) return kugouProvider;
     return platform === "qq" ? qqProvider : neteaseProvider;
   }
 
@@ -111,11 +113,12 @@ export function createMusicRouter(
         return;
       }
       const parsedLimit = parseInt(limit as string) || 20;
-      const [neteaseResult, qqResult, bilibiliResult, localResult] = await Promise.allSettled([
+      const [neteaseResult, qqResult, bilibiliResult, localResult, kugouResult] = await Promise.allSettled([
         neteaseProvider.search(q as string, parsedLimit),
         qqProvider.search(q as string, parsedLimit),
         bilibiliProvider.search(q as string, parsedLimit),
         localProvider && isLocalAudioEnabled() ? localProvider.search(q as string, parsedLimit) : Promise.resolve({ songs: [], albums: [], playlists: [] }),
+        kugouProvider ? kugouProvider.search(q as string, parsedLimit) : Promise.resolve({ songs: [], albums: [], playlists: [] }),
       ]);
 
       const songs = [
@@ -123,6 +126,7 @@ export function createMusicRouter(
         ...(qqResult.status === "fulfilled" ? qqResult.value.songs : []),
         ...(bilibiliResult.status === "fulfilled" ? bilibiliResult.value.songs : []),
         ...(localResult.status === "fulfilled" ? localResult.value.songs : []),
+        ...(kugouResult.status === "fulfilled" ? kugouResult.value.songs : []),
       ];
       const albums = [
         ...(neteaseResult.status === "fulfilled" ? neteaseResult.value.albums : []),
@@ -286,6 +290,7 @@ export function createMusicRouter(
       qq: qqProvider.getQuality(),
       bilibili: bilibiliProvider.getQuality(),
       local: localProvider?.getQuality() ?? "original",
+      kugou: kugouProvider?.getQuality() ?? "128",
     });
   });
 
@@ -304,6 +309,9 @@ export function createMusicRouter(
     }
     if (!platform || platform === "bilibili") {
       bilibiliProvider.setQuality(quality);
+    }
+    if ((!platform || platform === "kugou") && kugouProvider) {
+      kugouProvider.setQuality(quality);
     }
     logger.info({ quality, platform }, "Audio quality changed");
     res.json({ success: true, quality });

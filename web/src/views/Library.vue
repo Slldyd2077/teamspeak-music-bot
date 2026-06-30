@@ -28,7 +28,7 @@
       <h2 class="section-title">
         我的歌单
         <span v-if="currentUserPlaylists.length > 0" class="section-count">{{ currentUserPlaylists.length }}</span>
-        <SourceTabs v-model="userSource" :sources="userAvailable" />
+        <SourceTabs :model-value="userSourceSafe" @update:model-value="userSource = $event" :sources="userAvailable" />
       </h2>
       <div class="playlist-grid">
         <RouterLink

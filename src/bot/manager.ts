@@ -75,6 +75,7 @@ export class BotManager extends EventEmitter {
   private bilibiliProvider: MusicProvider;
   private youtubeProvider: MusicProvider;
   private localProvider: MusicProvider;
+  private kugouProvider: MusicProvider;
   private database: BotDatabase;
   private config: BotConfig;
   private logger: Logger;
@@ -92,7 +93,8 @@ export class BotManager extends EventEmitter {
     avatarStore: AvatarStore,
     permissions: PermissionStore,
     configPath: string,
-    localProvider?: MusicProvider
+    localProvider?: MusicProvider,
+    kugouProvider?: MusicProvider
   ) {
     super();
     this.neteaseProvider = neteaseProvider;
@@ -100,6 +102,7 @@ export class BotManager extends EventEmitter {
     this.bilibiliProvider = bilibiliProvider;
     this.youtubeProvider = new YouTubeProvider();
     this.localProvider = localProvider ?? neteaseProvider;
+    this.kugouProvider = kugouProvider ?? neteaseProvider;
     // Let the local provider see which uploads are still referenced by any
     // bot's queue, so it never deletes a file another queue/bot still needs.
     const referenceable = this.localProvider as Partial<{
@@ -137,6 +140,7 @@ export class BotManager extends EventEmitter {
       bilibiliProvider: this.bilibiliProvider,
       youtubeProvider: this.youtubeProvider,
       localProvider: this.localProvider,
+      kugouProvider: this.kugouProvider,
       database: this.database,
       config: this.config,
       logger: this.logger,
@@ -276,6 +280,7 @@ export class BotManager extends EventEmitter {
         bilibiliProvider: this.bilibiliProvider,
         youtubeProvider: this.youtubeProvider,
         localProvider: this.localProvider,
+        kugouProvider: this.kugouProvider,
         database: this.database,
         config: this.config,
         logger: this.logger,
@@ -329,6 +334,7 @@ export class BotManager extends EventEmitter {
         bilibiliProvider: this.bilibiliProvider,
         youtubeProvider: this.youtubeProvider,
         localProvider: this.localProvider,
+        kugouProvider: this.kugouProvider,
         database: this.database,
         config: this.config,
         logger: this.logger,

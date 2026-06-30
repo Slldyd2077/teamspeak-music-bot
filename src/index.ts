@@ -8,6 +8,7 @@ import { NeteaseProvider } from "./music/netease.js";
 import { QQMusicProvider } from "./music/qq.js";
 import { BiliBiliProvider } from "./music/bilibili.js";
 import { LocalMusicProvider } from "./music/local.js";
+import { KugouProvider } from "./music/kugou.js";
 import { createCookieStore } from "./music/auth.js";
 import { createAvatarStore } from "./data/avatars.js";
 import { createPermissionStore } from "./data/permissions.js";
@@ -57,6 +58,7 @@ async function main() {
   const qqProvider = new QQMusicProvider(apiServer.getQQMusicBaseUrl());
   const bilibiliProvider = new BiliBiliProvider();
   const localProvider = new LocalMusicProvider(LOCAL_AUDIO_DIR);
+  const kugouProvider = new KugouProvider();
 
   const cookieStore = createCookieStore(COOKIE_DIR);
   const avatarStore = createAvatarStore(AVATAR_DIR);
@@ -66,6 +68,8 @@ async function main() {
   if (qqCookie) qqProvider.setCookie(qqCookie);
   const bilibiliCookie = cookieStore.load("bilibili");
   if (bilibiliCookie) bilibiliProvider.setCookie(bilibiliCookie);
+  const kugouCookie = cookieStore.load("kugou");
+  if (kugouCookie) kugouProvider.setCookie(kugouCookie);
 
   const permissions = createPermissionStore(db.db);
 
@@ -79,7 +83,8 @@ async function main() {
     avatarStore,
     permissions,
     CONFIG_PATH,
-    localProvider
+    localProvider,
+    kugouProvider
   );
   await botManager.loadSavedBots();
 
@@ -90,6 +95,7 @@ async function main() {
     qqProvider,
     bilibiliProvider,
     localProvider,
+    kugouProvider,
     database: db,
     avatarStore,
     config,

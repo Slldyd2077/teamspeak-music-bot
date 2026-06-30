@@ -39,6 +39,7 @@ export function createPlayerRouter(
     if (platform === "bilibili") return "-b";
     if (platform === "qq") return "-q";
     if (platform === "youtube") return "-y";
+    if (platform === "kugou") return "-k";
     return "";
   };
 
@@ -115,7 +116,7 @@ export function createPlayerRouter(
         return;
       }
       const provider = bot.getProviderFor(
-        platform === "bilibili" || platform === "qq" || platform === "youtube" || platform === "local"
+        platform === "bilibili" || platform === "qq" || platform === "youtube" || platform === "local" || platform === "kugou"
           ? platform
           : "netease"
       );
@@ -290,7 +291,7 @@ export function createPlayerRouter(
       // Use the bot's own provider lookup — it already knows about youtube,
       // which the router's constructor params did not.
       const provider = bot.getProviderFor(
-        platform === "bilibili" || platform === "qq" || platform === "youtube" || platform === "local"
+        platform === "bilibili" || platform === "qq" || platform === "youtube" || platform === "local" || platform === "kugou"
           ? platform
           : "netease"
       );
@@ -383,7 +384,7 @@ export function createPlayerRouter(
         return;
       }
       const provider = bot.getProviderFor(
-        platform === "bilibili" || platform === "qq" || platform === "youtube" || platform === "local"
+        platform === "bilibili" || platform === "qq" || platform === "youtube" || platform === "local" || platform === "kugou"
           ? platform
           : "netease"
       );
@@ -614,7 +615,7 @@ export function createPlayerRouter(
         return;
       }
       const provider = bot.getProviderFor(
-        platform === "bilibili" || platform === "qq" || platform === "youtube" || platform === "local"
+        platform === "bilibili" || platform === "qq" || platform === "youtube" || platform === "local" || platform === "kugou"
           ? platform
           : "netease"
       );

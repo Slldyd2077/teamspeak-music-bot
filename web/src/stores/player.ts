@@ -10,10 +10,10 @@ export interface Song {
   album: string;
   duration: number;
   coverUrl: string;
-  platform: 'netease' | 'qq' | 'bilibili' | 'youtube' | 'local';
+  platform: 'netease' | 'qq' | 'bilibili' | 'youtube' | 'local' | 'kugou';
 }
 
-export type Source = 'netease' | 'qq';
+export type Source = 'netease' | 'qq' | 'kugou';
 
 export interface BotStatus {
   id: string;
@@ -100,11 +100,11 @@ export const usePlayerStore = defineStore('player', {
     theme: 'dark' as 'dark' | 'light',
 
     // Home page cache, split by source
-    recommendPlaylists: { netease: [] as PlaylistItem[], qq: [] as PlaylistItem[] },
-    dailySongs:         { netease: [] as Song[],         qq: [] as Song[] },
-    userPlaylists:      { netease: [] as PlaylistItem[], qq: [] as PlaylistItem[] },
+    recommendPlaylists: { netease: [] as PlaylistItem[], qq: [] as PlaylistItem[], kugou: [] as PlaylistItem[] },
+    dailySongs:         { netease: [] as Song[],         qq: [] as Song[],         kugou: [] as Song[] },
+    userPlaylists:      { netease: [] as PlaylistItem[], qq: [] as PlaylistItem[], kugou: [] as PlaylistItem[] },
     bilibiliPopular: [] as Song[],
-    authStatus: { netease: false, qq: false },
+    authStatus: { netease: false, qq: false, kugou: false },
     lastFetchTime: 0,
 
     // Favorited playlists (fetched from server, isolated per WebUI user)
@@ -157,6 +157,7 @@ export const usePlayerStore = defineStore('player', {
       const s: Source[] = [];
       if (this.authStatus.netease) s.push('netease');
       if (this.authStatus.qq) s.push('qq');
+      if (this.authStatus.kugou) s.push('kugou');
       return s;
     },
   },
@@ -571,18 +572,23 @@ export const usePlayerStore = defineStore('player', {
       // Always check auth status first — if it changed since the cached
       // fetch (e.g., user logged in/out as a different account), the
       // cached playlists belong to a different user and we MUST refetch.
-      const [neAuthRes, qqAuthRes] = await Promise.allSettled([
+      const [neAuthRes, qqAuthRes, kugouAuthRes] = await Promise.allSettled([
         axios.get('/api/auth/status', { params: { platform: 'netease' } }),
         axios.get('/api/auth/status', { params: { platform: 'qq' } }),
+        axios.get('/api/auth/status', { params: { platform: 'kugou' } }),
       ]);
       const newAuth = {
         netease: neAuthRes.status === 'fulfilled' && !!neAuthRes.value.data?.loggedIn,
         qq:      qqAuthRes.status === 'fulfilled' && !!qqAuthRes.value.data?.loggedIn,
+        kugou:   kugouAuthRes.status === 'fulfilled' && !!kugouAuthRes.value.data?.loggedIn,
       };
       const authChanged =
-        newAuth.netease !== this.authStatus.netease || newAuth.qq !== this.authStatus.qq;
+        newAuth.netease !== this.authStatus.netease ||
+        newAuth.qq !== this.authStatus.qq ||
+        newAuth.kugou !== this.authStatus.kugou;
       this.authStatus.netease = newAuth.netease;
       this.authStatus.qq = newAuth.qq;
+      this.authStatus.kugou = newAuth.kugou;
 
       // Favorites are user-local and cheap; always refresh them, even on a
       // home-data cache hit, so hearts stay correct across tabs/sessions.
@@ -621,15 +627,30 @@ export const usePlayerStore = defineStore('player', {
             Promise.resolve(emptyPlaylists),
           ];
 
+      // 4. Kugou data: every section (incl. recommend playlists) needs login,
+      // so gate all three on auth like QQ.
+      const kugouPromises = this.authStatus.kugou
+        ? [
+            axios.get('/api/music/recommend/playlists', { params: { platform: 'kugou' } }),
+            axios.get('/api/music/recommend/songs',     { params: { platform: 'kugou' } }),
+            axios.get('/api/music/user/playlists',      { params: { platform: 'kugou' } }),
+          ]
+        : [
+            Promise.resolve(emptyPlaylists),
+            Promise.resolve(emptySongs),
+            Promise.resolve(emptyPlaylists),
+          ];
+
       const biliPromise = axios.get('/api/music/bilibili/popular?limit=12');
 
       const results = await Promise.allSettled([
         ...neteasePromises,
         ...qqPromises,
+        ...kugouPromises,
         biliPromise,
       ]);
 
-      const [neRecPL, neDaily, neUserPL, qqRecPL, qqDaily, qqUserPL, bili] = results;
+      const [neRecPL, neDaily, neUserPL, qqRecPL, qqDaily, qqUserPL, kgRecPL, kgDaily, kgUserPL, bili] = results;
 
       this.recommendPlaylists.netease =
         neRecPL.status === 'fulfilled' ? (neRecPL.value.data.playlists ?? []) : [];
@@ -643,6 +664,12 @@ export const usePlayerStore = defineStore('player', {
         qqDaily.status === 'fulfilled' ? (qqDaily.value.data.songs ?? []) : [];
       this.userPlaylists.qq =
         qqUserPL.status === 'fulfilled' ? (qqUserPL.value.data.playlists ?? []) : [];
+      this.recommendPlaylists.kugou =
+        kgRecPL.status === 'fulfilled' ? (kgRecPL.value.data.playlists ?? []) : [];
+      this.dailySongs.kugou =
+        kgDaily.status === 'fulfilled' ? (kgDaily.value.data.songs ?? []) : [];
+      this.userPlaylists.kugou =
+        kgUserPL.status === 'fulfilled' ? (kgUserPL.value.data.playlists ?? []) : [];
       // bilibili popular: keep previous value on failure (it's an anonymous endpoint
       // unrelated to user auth state, and stale popular results are harmless)
       if (bili.status === 'fulfilled') {
@@ -654,7 +681,9 @@ export const usePlayerStore = defineStore('player', {
       // cached for 5 minutes, otherwise the user has to hard-reload to
       // recover when connectivity returns.
       const authOk =
-        neAuthRes.status === 'fulfilled' || qqAuthRes.status === 'fulfilled';
+        neAuthRes.status === 'fulfilled' ||
+        qqAuthRes.status === 'fulfilled' ||
+        kugouAuthRes.status === 'fulfilled';
       if (authOk) {
         this.lastFetchTime = Date.now();
       }
