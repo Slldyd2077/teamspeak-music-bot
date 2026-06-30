@@ -100,6 +100,12 @@ export class BotManager extends EventEmitter {
     this.bilibiliProvider = bilibiliProvider;
     this.youtubeProvider = new YouTubeProvider();
     this.localProvider = localProvider ?? neteaseProvider;
+    // Let the local provider see which uploads are still referenced by any
+    // bot's queue, so it never deletes a file another queue/bot still needs.
+    const referenceable = this.localProvider as Partial<{
+      setInUseResolver: (resolver: () => Set<string>) => void;
+    }>;
+    referenceable.setInUseResolver?.(() => this.getReferencedLocalSongIds());
     this.database = database;
     this.config = config;
     this.logger = logger;
@@ -212,6 +218,18 @@ export class BotManager extends EventEmitter {
 
   getAllBots(): BotInstance[] {
     return Array.from(this.bots.values());
+  }
+
+  /** Local upload ids still referenced by any bot's queue. The local provider
+   *  uses this to avoid deleting a file another queue/bot is still using. */
+  getReferencedLocalSongIds(): Set<string> {
+    const ids = new Set<string>();
+    for (const bot of this.bots.values()) {
+      for (const song of bot.getQueueManager().list()) {
+        if (song.platform === "local") ids.add(song.id);
+      }
+    }
+    return ids;
   }
 
   async startBot(id: string): Promise<void> {

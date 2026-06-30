@@ -297,7 +297,6 @@ export function createPlayerRouter(
 
       // Stop current playback
       bot.getPlayer().stop();
-      bot.cleanupQueuedLocalSongs?.("queue_replaced");
       bot.getPlayer().resetFailures();
 
       const songs = await provider.getPlaylistSongs(playlistId);
@@ -330,11 +329,14 @@ export function createPlayerRouter(
       }
 
       const queue = bot.getQueueManager();
-      bot.cleanupQueuedLocalSongs?.("queue_replaced");
       queue.clear();
       for (const song of queueable) {
         queue.add({ ...song, platform: provider.platform });
       }
+      // Sweep AFTER the queue is rebuilt: the previous queue's local uploads are
+      // released and deleted, but an empty/failed playlist (early return above)
+      // leaves the previous queue — and its files — intact.
+      bot.cleanupQueuedLocalSongs?.("queue_replaced");
 
       // Use queue.play() for sequential, or pick random index for random modes
       const mode = queue.getMode();
@@ -388,7 +390,6 @@ export function createPlayerRouter(
 
       // Stop current playback
       bot.getPlayer().stop();
-      bot.cleanupQueuedLocalSongs?.("queue_replaced");
       bot.getPlayer().resetFailures();
 
       const songs = await provider.getAlbumSongs(albumId);
@@ -414,11 +415,12 @@ export function createPlayerRouter(
       }
 
       const queue = bot.getQueueManager();
-      bot.cleanupQueuedLocalSongs?.("queue_replaced");
       queue.clear();
       for (const song of queueable) {
         queue.add({ ...song, platform: provider.platform });
       }
+      // Sweep AFTER the queue is rebuilt (see play-playlist).
+      bot.cleanupQueuedLocalSongs?.("queue_replaced");
 
       const mode = queue.getMode();
       let first;
@@ -464,13 +466,15 @@ export function createPlayerRouter(
       }
       const queue = bot.getQueueManager();
       bot.getPlayer().stop();
-      bot.cleanupQueuedLocalSongs?.("queue_replaced");
       queue.clear();
       queue.add(song);
       queue.play();
 
       bot.getPlayer().resetFailures();
       const ok = await bot.resolveAndPlay(queue.current()!);
+      // Sweep AFTER the new song is queued+resolved, so replaying a local song
+      // that was still in the queue doesn't delete the file we're about to play.
+      bot.cleanupQueuedLocalSongs?.("queue_replaced");
       if (!ok) {
         res.json({ ok: false, message: `无法播放「${song.name || song.id}」（区域/版权限制）` });
         return;
