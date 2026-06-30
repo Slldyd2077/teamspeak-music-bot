@@ -654,7 +654,7 @@ export class BotInstance extends EventEmitter {
 
   private async cmdSearch(cmd: ParsedCommand): Promise<string> {
     const p = this.config.commandPrefix;
-    if (!cmd.args) return `Usage: ${p}search <name> [-q|-b|-y]`;
+    if (!cmd.args) return `Usage: ${p}search <name> [-q|-k|-b|-y]`;
     const provider = this.getProvider(cmd.flags);
     const result = await provider.search(cmd.args, 8);
     if (result.songs.length === 0) return `No results found for: ${cmd.args}`;
