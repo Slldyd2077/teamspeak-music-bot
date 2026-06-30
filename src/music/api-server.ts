@@ -14,6 +14,32 @@ export interface ApiServerManager {
   getQQMusicBaseUrl(): string;
 }
 
+/**
+ * Classify a QQ Music API (@sansenjian/qq-music-api) startup failure into
+ * actionable operator guidance, or null when it isn't a recognised
+ * dependency/runtime mismatch. Exported for testing.
+ *
+ * Background: the package became ESM in 2.3.x. A loose `^` range could pull an
+ * ESM-only build (2.3.0/2.3.1) that throws ERR_REQUIRE_ESM, or a 2.4.x build
+ * that needs Node >=20.17 — either way the embedded server never binds, so
+ * every QQ request fails downstream with ECONNREFUSED on the API port.
+ */
+export function describeQqApiStartupError(err: unknown): string | null {
+  const e = (err ?? {}) as { code?: string; message?: string };
+  const code = String(e.code ?? "");
+  const msg = String(e.message ?? "");
+  if (code === "ERR_REQUIRE_ESM" || /ERR_REQUIRE_ESM|require\(\) of ES ?Module/i.test(msg)) {
+    return (
+      "an incompatible @sansenjian/qq-music-api build is installed (ERR_REQUIRE_ESM). " +
+      "Pin it to ~2.4.0 (needs Node >=20.17) or ~2.2.10 in package.json, then reinstall"
+    );
+  }
+  if (/Unsupported engine|EBADENGINE|requires Node|Node\.js version/i.test(msg)) {
+    return "@sansenjian/qq-music-api 2.4.x requires Node >=20.17 (or >=22.9) — upgrade Node, or pin the package to ~2.2.10";
+  }
+  return null;
+}
+
 function isPortFree(port: number): Promise<boolean> {
   return new Promise((resolve) => {
     const server = net.createServer();
@@ -100,10 +126,18 @@ export function createApiServerManager(
           }
         }
       } catch (err) {
-        logger.warn(
-          { err },
-          "QQ Music API not available — QQ Music features may be limited"
-        );
+        const hint = describeQqApiStartupError(err);
+        if (hint) {
+          logger.error(
+            { err },
+            `QQ Music API failed to start — ${hint}. QQ features (search/play/login) will be unavailable until fixed; port ${options.qqMusicPort} is down.`
+          );
+        } else {
+          logger.warn(
+            { err },
+            "QQ Music API not available — QQ Music features may be limited"
+          );
+        }
       }
     },
 
