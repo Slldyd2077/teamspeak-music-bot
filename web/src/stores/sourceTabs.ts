@@ -28,7 +28,7 @@ function readAll(): Partial<Record<TabKey, Source>> {
 export function loadTabSource(key: TabKey, fallback: Source = 'netease'): Source {
   const all = readAll();
   const v = all[key];
-  return v === 'netease' || v === 'qq' ? v : fallback;
+  return v === 'netease' || v === 'qq' || v === 'kugou' ? v : fallback;
 }
 
 export function saveTabSource(key: TabKey, value: Source): void {

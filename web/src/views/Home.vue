@@ -41,13 +41,23 @@
         </div>
         <Icon icon="mdi:play-circle" class="fm-play-icon" />
       </div>
+      <div v-if="store.authStatus.kugou" class="fm-card hover-scale" @click="playFm('kugou')">
+        <div class="fm-icon-wrapper kugou">
+          <Icon icon="mdi:radio-tower" class="fm-icon" />
+        </div>
+        <div class="fm-info">
+          <div class="fm-title">酷狗私人电台</div>
+          <div class="fm-desc">个性化推荐歌曲流</div>
+        </div>
+        <Icon icon="mdi:play-circle" class="fm-play-icon" />
+      </div>
     </section>
 
     <!-- 每日推荐 -->
     <section class="section" v-if="dailyAvailable.length > 0">
       <h2 class="section-title">
         每日推荐
-        <SourceTabs v-model="dailySource" :sources="dailyAvailable" />
+        <SourceTabs :model-value="dailySourceSafe" @update:model-value="dailySource = $event" :sources="dailyAvailable" />
       </h2>
       <div class="daily-grid">
         <div
@@ -67,7 +77,7 @@
     <section class="section" v-if="recommendAvailable.length > 0">
       <h2 class="section-title">
         推荐歌单
-        <SourceTabs v-model="recommendSource" :sources="recommendAvailable" />
+        <SourceTabs :model-value="recommendSourceSafe" @update:model-value="recommendSource = $event" :sources="recommendAvailable" />
       </h2>
       <div class="playlist-grid">
         <RouterLink
@@ -108,7 +118,7 @@
       <h2 class="section-title">
         我的歌单
         <span v-if="currentUserPlaylists.length > 0" class="section-count">{{ currentUserPlaylists.length }}</span>
-        <SourceTabs v-model="userSource" :sources="userAvailable" />
+        <SourceTabs :model-value="userSourceSafe" @update:model-value="userSource = $event" :sources="userAvailable" />
       </h2>
       <div class="playlist-grid">
         <RouterLink
@@ -173,6 +183,7 @@ const userPlaylistsExpanded = ref(false);
 const recommendAvailable = computed<Source[]>(() => {
   const s: Source[] = ['netease'];
   if (store.authStatus.qq) s.push('qq');
+  if (store.authStatus.kugou) s.push('kugou');
   return s;
 });
 const dailyAvailable = computed<Source[]>(() => store.availableSources);
@@ -357,6 +368,10 @@ onMounted(() => {
 
   &.qq {
     background: linear-gradient(135deg, var(--brand-qq), #17a2b8);
+  }
+
+  &.kugou {
+    background: linear-gradient(135deg, var(--brand-kugou), #1d7fd1);
   }
 }
 

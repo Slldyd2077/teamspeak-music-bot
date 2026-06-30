@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { mapKugouSong, mapKugouSongs, mapKugouAlbums, krcToLrc } from "./kugou.js";
+import { mapKugouSong, mapKugouSongs, mapKugouAlbums, mapKugouPlaylist, mapKugouPlaylists, krcToLrc } from "./kugou.js";
 import { parseLyrics } from "./netease.js";
 
 describe("mapKugouSongs", () => {
@@ -96,5 +96,100 @@ describe("mapKugouAlbums", () => {
     expect(album.name).toBe("叶惠美");
     expect(album.coverUrl).toBe("https://imge.kugou.com/x/240/abc.jpg");
     expect(album.songCount).toBe(11);
+  });
+});
+
+describe("mapKugouSong — playlist (get_other_list_file) shape", () => {
+  it("splits the combined `name` and uses `mixsongid` as the audio id", () => {
+    // Shape captured live from /pubsongs/v2/get_other_list_file_nofilt (我喜欢).
+    // The combined "歌手 - 歌名" is in `name`; there is no separate songname.
+    const raw = {
+      name: "KOKIA - ありがとう… (谢谢…)",
+      hash: "E9A08A98614DD992F11A68A5E5F1C79F",
+      album_id: "1491689",
+      mixsongid: 37533796,
+      timelen: 248528, // ms
+      cover: "http://imge.kugou.com/stdmusic/{size}/20210113/x.jpg",
+    };
+    const song = mapKugouSong(raw);
+    expect(song.artist).toBe("KOKIA");
+    expect(song.name).toBe("ありがとう… (谢谢…)");
+    // hash lowercased | mixsongid | album_id — so getSongUrl can resolve it.
+    expect(song.id).toBe("e9a08a98614dd992f11a68a5e5f1c79f|37533796|1491689");
+    expect(song.duration).toBe(249); // timelen ms → s
+    expect(song.coverUrl).toBe("https://imge.kugou.com/stdmusic/240/20210113/x.jpg");
+  });
+});
+
+describe("mapKugouSong — cover art per endpoint", () => {
+  it("reads `sizable_cover` (daily/FM shape) and resolves {size}→240, http→https", () => {
+    const song = mapKugouSong({
+      hash: "abc",
+      songname: "x",
+      duration: 200,
+      sizable_cover: "http://imge.kugou.com/stdmusic/{size}/y.jpg",
+    });
+    expect(song.coverUrl).toBe("https://imge.kugou.com/stdmusic/240/y.jpg");
+  });
+
+  it("falls back to `trans_param.union_cover` (search shape, no top-level cover)", () => {
+    const song = mapKugouSong({
+      hash: "abc",
+      songname: "x",
+      duration: 200,
+      trans_param: { union_cover: "http://imge.kugou.com/stdmusic/{size}/z.jpg" },
+    });
+    expect(song.coverUrl).toBe("https://imge.kugou.com/stdmusic/240/z.jpg");
+  });
+
+  it("returns an empty coverUrl when no cover field is present", () => {
+    expect(mapKugouSong({ hash: "abc", songname: "x", duration: 200 }).coverUrl).toBe("");
+  });
+
+  it("skips an empty-string cover field (Kugou returns '') and uses the next non-empty source", () => {
+    const song = mapKugouSong({
+      hash: "abc",
+      songname: "x",
+      duration: 200,
+      sizable_cover: "", // present but empty — must NOT mask the real cover below
+      trans_param: { union_cover: "http://imge.kugou.com/stdmusic/{size}/z.jpg" },
+    });
+    expect(song.coverUrl).toBe("https://imge.kugou.com/stdmusic/240/z.jpg");
+  });
+});
+
+describe("mapKugouPlaylists", () => {
+  it("maps the user-playlist shape (/v7/get_all_list info), keying id on global_collection_id", () => {
+    // Shape captured live from /v7/get_all_list (我喜欢).
+    const [pl] = mapKugouPlaylists([
+      { name: "我喜欢", count: 7, global_collection_id: "collection_3_2526507197_2_0", listid: 2, type: 0 },
+    ]);
+    expect(pl.platform).toBe("kugou");
+    expect(pl.name).toBe("我喜欢");
+    expect(pl.songCount).toBe(7);
+    // Must be the global_collection_id — the only id getPlaylistSongs can open.
+    expect(pl.id).toBe("collection_3_2526507197_2_0");
+  });
+
+  it("maps the recommend shape (/v2/special_recommend), preferring global_collection_id over specialid", () => {
+    // Shape captured live from /v2/special_recommend special_list.
+    const pl = mapKugouPlaylist({
+      specialname: "米津玄师：蒙着眼睛也能炸翻全场",
+      specialid: 1154672,
+      global_collection_id: "collection_1_1029965246_1154672_0",
+      pic: "http://imge.kugou.com/specialimg/{size}/a.jpg",
+      percount: 0,
+    });
+    expect(pl.id).toBe("collection_1_1029965246_1154672_0");
+    expect(pl.name).toBe("米津玄师：蒙着眼睛也能炸翻全场");
+    expect(pl.coverUrl).toBe("https://imge.kugou.com/specialimg/240/a.jpg");
+  });
+
+  it("drops entries whose only id is a non-openable specialid/listid (not a global_collection_id)", () => {
+    // getPlaylistSongs can only open a global_collection_id, so a numeric
+    // specialid/listid would be a dead id — such entries must be dropped.
+    expect(mapKugouPlaylists([{ specialname: "x", specialid: 1154672, listid: 9 }])).toHaveLength(0);
+    expect(mapKugouPlaylists([{ name: "no id" }])).toHaveLength(0);
+    expect(mapKugouPlaylists(undefined)).toEqual([]);
   });
 });

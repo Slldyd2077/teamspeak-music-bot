@@ -24,6 +24,7 @@ import type { Source } from '../stores/player.js';
 const LABELS: Record<Source, string> = {
   netease: '网易云',
   qq: 'QQ',
+  kugou: '酷狗',
 };
 
 defineProps<{

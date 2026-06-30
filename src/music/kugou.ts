@@ -234,6 +234,19 @@ interface KugouRawSong {
   duration?: number;
   Duration?: number;
   timelen?: number;
+  // Playlist (/pubsongs/.../get_other_list_file) shape: a single combined
+  // "歌手 - 歌名" lives in `name`, with `mixsongid`/`audio_id` as the audio id.
+  name?: string;
+  mixsongid?: number | string;
+  audio_id?: number | string;
+  albuminfo?: { name?: string };
+  // Cover art lives in different fields per endpoint: `sizable_cover` (daily/FM,
+  // a `{size}` template), `cover` (playlist), or `trans_param.union_cover`
+  // (search). All may carry a `{size}` placeholder that fixCover() resolves.
+  sizable_cover?: string;
+  album_sizable_cover?: string;
+  cover?: string;
+  trans_param?: { union_cover?: string };
 }
 
 /** Split a Kugou "歌手 - 歌名" filename into {artist,name} when needed. */
@@ -255,11 +268,15 @@ export function mapKugouSong(raw: KugouNestedTrack): Song {
   const audioInfo = raw.audio_info ?? {};
   // Handle both the flat search shape and the nested album/playlist/FM shape.
   const hash = String(raw.hash ?? raw.FileHash ?? audioInfo.hash ?? "").toLowerCase();
-  const albumAudioId = raw.album_audio_id ?? raw.MixSongID ?? base.album_audio_id ?? 0;
+  const albumAudioId = raw.album_audio_id ?? raw.MixSongID ?? raw.mixsongid ?? raw.audio_id ?? base.album_audio_id ?? 0;
   const albumId = raw.album_id ?? raw.AlbumID ?? base.album_id ?? 0;
-  const fallback = splitFilename(raw.filename ?? raw.FileName ?? "");
-  const name = (raw.songname ?? raw.SongName ?? base.audio_name ?? fallback.name ?? "").toString().trim();
-  const artist = (raw.singername ?? raw.SingerName ?? base.author_name ?? fallback.artist ?? "").toString().trim();
+  // The playlist endpoint packs "歌手 - 歌名" into `name` (no separate
+  // songname/singername), so treat it like `filename` and split it.
+  const fallback = splitFilename(raw.filename ?? raw.FileName ?? raw.name ?? "");
+  // Use firstStr (not `??`) so an empty-string field doesn't mask a real value
+  // in a later one.
+  const name = firstStr(raw.songname, raw.SongName, base.audio_name, fallback.name).trim();
+  const artist = firstStr(raw.singername, raw.SingerName, base.author_name, fallback.artist).trim();
   // Determine duration by SOURCE, not magnitude: the search endpoint reports
   // `duration` in SECONDS, while the nested album/playlist `audio_info` reports
   // milliseconds (a magnitude heuristic would mis-handle multi-hour tracks).
@@ -269,13 +286,19 @@ export function mapKugouSong(raw: KugouNestedTrack): Song {
   else if (raw.timelen != null) duration = Math.round(Number(raw.timelen) / 1000); // ms
   else duration = Number(raw.duration ?? raw.Duration ?? 0) || 0; // seconds
   if (!Number.isFinite(duration) || duration < 0) duration = 0;
+  // Cover art is endpoint-specific: `sizable_cover` (daily/FM), `cover`
+  // (playlist), or `trans_param.union_cover` (search). firstStr skips empty
+  // fields; fixCover resolves the `{size}` template + upgrades http→https.
+  const coverUrl = fixCover(
+    firstStr(raw.sizable_cover, raw.album_sizable_cover, raw.cover, raw.trans_param?.union_cover)
+  );
   return {
     id: makeId(hash, albumAudioId, albumId),
     name: name || "未知歌曲",
     artist: artist || "未知歌手",
-    album: (raw.album_name ?? raw.AlbumName ?? base.album_name ?? raw.album_info?.album_name ?? "").toString(),
+    album: firstStr(raw.album_name, raw.AlbumName, base.album_name, raw.album_info?.album_name, raw.albuminfo?.name),
     duration,
-    coverUrl: "",
+    coverUrl,
     platform: "kugou",
   };
 }
@@ -307,6 +330,18 @@ function fixCover(url: string | undefined): string {
   return url.replace(/\{size\}/g, "240").replace(/^http:/, "https:");
 }
 
+/** First non-empty string among the candidates. Unlike `??`, an empty string —
+ *  which Kugou returns for absent cover/name fields — is treated as missing, so
+ *  a real value in a later field isn't masked by an earlier `""`. */
+function firstStr(...vals: Array<string | number | undefined | null>): string {
+  for (const v of vals) {
+    if (v == null) continue;
+    const s = String(v);
+    if (s !== "") return s;
+  }
+  return "";
+}
+
 export function mapKugouAlbum(raw: KugouRawAlbum): Album {
   return {
     id: String(raw.albumid ?? raw.album_id ?? raw.AlbumID ?? ""),
@@ -321,6 +356,57 @@ export function mapKugouAlbum(raw: KugouRawAlbum): Album {
 export function mapKugouAlbums(list: KugouRawAlbum[] | undefined): Album[] {
   if (!Array.isArray(list)) return [];
   return list.map(mapKugouAlbum);
+}
+
+// Playlist shapes differ by endpoint (user lists vs special_recommend), so map
+// defensively. The id MUST be the `global_collection_id` because that is the
+// only key getPlaylistSongs()/getPlaylistDetail() can open a playlist by.
+interface KugouRawPlaylist {
+  global_collection_id?: string;
+  gid?: string | number;
+  specialid?: string | number;
+  listid?: string | number;
+  id?: string | number;
+  name?: string;
+  specialname?: string;
+  list_name?: string;
+  pic?: string;
+  imgurl?: string;
+  flexible_cover?: string;
+  cover?: string;
+  img?: string;
+  count?: number | string;
+  songcount?: number | string;
+  song_count?: number | string;
+  total?: number | string;
+  // Present in real payloads but not used for mapping (kept for shape fidelity):
+  // `percount` is special_recommend's (unreliable, often 0) song count; `type`
+  // is the list kind in get_all_list.
+  percount?: number | string;
+  type?: number | string;
+}
+
+export function mapKugouPlaylist(raw: KugouRawPlaylist): Playlist {
+  // The id MUST be the `global_collection_id` (the `collection_*` form) — it is
+  // the ONLY key getPlaylistSongs()/getPlaylistDetail() can open a playlist by.
+  // A numeric `specialid`/`listid`/`id` is NOT openable, so it must NOT become
+  // the id (mapKugouPlaylists drops entries that resolve to ""). `gid` is the
+  // common alias for the same collection key in some list shapes.
+  const id = String(raw.global_collection_id ?? raw.gid ?? "");
+  const name = firstStr(raw.name, raw.specialname, raw.list_name).trim();
+  return {
+    id,
+    name: name || "未知歌单",
+    coverUrl: fixCover(firstStr(raw.pic, raw.imgurl, raw.flexible_cover, raw.cover, raw.img)),
+    songCount: Number(raw.count ?? raw.songcount ?? raw.song_count ?? raw.total ?? 0) || 0,
+    platform: "kugou",
+  };
+}
+
+export function mapKugouPlaylists(list: KugouRawPlaylist[] | undefined): Playlist[] {
+  if (!Array.isArray(list)) return [];
+  // Drop entries with no resolvable global_collection_id (can't be opened).
+  return list.map(mapKugouPlaylist).filter((p) => p.id !== "");
 }
 
 // ---------------------------------------------------------------------------
@@ -689,10 +775,50 @@ export class KugouProvider implements MusicProvider {
     }
   }
 
-  // Recommend playlists need a logged-in/personalized context that can't be
-  // reliably resolved anonymously; return empty rather than ship a wrong guess.
+  // 推荐歌单 (精选/个性化歌单). Ported from reference top_playlist.js
+  // (/v2/special_recommend). The misspelled keys `retrun_min` /
+  // `return_special_falg` are intentional — the server expects those exact names.
   async getRecommendPlaylists(): Promise<Playlist[]> {
-    return [];
+    try {
+      const dateTime = Math.floor(Date.now() / 1000).toString();
+      const data = await this.request({
+        method: "POST",
+        url: "/v2/special_recommend",
+        xRouter: "specialrec.service.kugou.com",
+        data: {
+          appid: APPID,
+          mid: this.mid,
+          clientver: CLIENTVER,
+          platform: "android",
+          clienttime: dateTime,
+          userid: this.cookie.userid || 0,
+          module_id: 1,
+          page: 1,
+          pagesize: 30,
+          key: signParamsKey(dateTime),
+          special_recommend: {
+            withtag: 1,
+            withsong: 1,
+            sort: 1,
+            ugc: 1,
+            is_selected: 0,
+            withrecommend: 1,
+            area_code: 1,
+            categoryid: 0,
+          },
+          req_multi: 1,
+          retrun_min: 5,
+          return_special_falg: 1,
+        },
+      });
+      // The list is nested under one of several shapes across API versions.
+      const d = data?.data ?? {};
+      const list =
+        d.special_list ?? d.info ?? d.list ?? d.special ?? (Array.isArray(d) ? d : []);
+      return mapKugouPlaylists(list as KugouRawPlaylist[]);
+    } catch {
+      return [];
+    }
   }
 
   // --- Album (专辑) ----------------------------------------------------------
@@ -763,6 +889,68 @@ export class KugouProvider implements MusicProvider {
       });
       const songs = data?.data?.song_list ?? data?.data?.songs ?? [];
       return mapKugouSongs(songs as KugouRawSong[]);
+    } catch {
+      return [];
+    }
+  }
+
+  // --- 每日推荐歌曲 (daily recommend) ---------------------------------------
+  // Ported from reference recommend_songs.js (/everyday_song_recommend).
+  // Requires a logged-in cookie (userid/token) for personalised results.
+  async getDailyRecommendSongs(): Promise<Song[]> {
+    try {
+      const userid = this.cookie.userid && this.cookie.userid !== "0" ? this.cookie.userid : "0";
+      const data = await this.request({
+        method: "POST",
+        url: "/everyday_song_recommend",
+        xRouter: "everydayrec.service.kugou.com",
+        encryptType: "android",
+        data: { platform: "android", userid },
+      });
+      const d = data?.data ?? {};
+      const list = d.song_list ?? d.songs ?? d.list ?? d.info ?? [];
+      return mapKugouSongs(list as KugouNestedTrack[]);
+    } catch {
+      return [];
+    }
+  }
+
+  // --- 用户歌单 (the logged-in user's own playlists) ------------------------
+  // Ported from reference user_playlist.js (/v7/get_all_list).
+  async getUserPlaylists(): Promise<Playlist[]> {
+    try {
+      const userid = this.cookie.userid || "0";
+      const token = this.cookie.token || "";
+      if (!userid || userid === "0" || !token) return [];
+      const out: Playlist[] = [];
+      const seen = new Set<string>();
+      const PAGE_SIZE = 30;
+      for (let page = 1; page <= 10; page++) {
+        const data = await this.request({
+          method: "POST",
+          url: "/v7/get_all_list",
+          xRouter: "cloudlist.service.kugou.com",
+          encryptType: "android",
+          params: { plat: 1, userid: Number(userid), token },
+          data: { userid: Number(userid), token, total_ver: 979, type: 2, page, pagesize: PAGE_SIZE },
+        });
+        const d = data?.data ?? {};
+        const list = (d.info ?? d.list ?? []) as KugouRawPlaylist[];
+        // Dedup by id: some Kugou list endpoints ignore `page`/`pagesize` and
+        // return the whole list every time, which would otherwise duplicate
+        // entries 10× for users with ≥30 playlists.
+        let added = 0;
+        for (const pl of mapKugouPlaylists(list)) {
+          if (seen.has(pl.id)) continue;
+          seen.add(pl.id);
+          out.push(pl);
+          added++;
+        }
+        // Stop on a short page (real pagination) OR when a page contributed
+        // nothing new (the endpoint re-returned an already-seen set).
+        if (list.length < PAGE_SIZE || added === 0) break;
+      }
+      return out;
     } catch {
       return [];
     }
