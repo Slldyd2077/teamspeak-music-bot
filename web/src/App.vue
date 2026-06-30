@@ -44,11 +44,15 @@
           type="range"
           min="0"
           max="100"
-          :value="mobileVolume"
+          :value="mobileVolumeDisplay"
           class="m-volume-slider"
-          @input="onMobileVolumeChange"
+          @input="onMobileVolumeInput"
+          @change="onMobileVolumeCommit"
+          @pointerup="onMobileVolumeRelease"
+          @pointercancel="onMobileVolumeRelease"
+          @blur="onMobileVolumeRelease"
         />
-        <span class="m-volume-value">{{ mobileVolume }}</span>
+        <span class="m-volume-value">{{ mobileVolumeDisplay }}</span>
       </div>
     </div>
 
@@ -79,6 +83,7 @@ import { computed, onMounted, onUnmounted, ref } from 'vue';
 import { useRoute, useRouter } from 'vue-router';
 import { Icon } from '@iconify/vue';
 import { usePlayerStore } from './stores/player.js';
+import { useDecoupledSlider } from './composables/useDecoupledSlider.js';
 import { useWebSocket } from './composables/useWebSocket.js';
 import { useSession } from './composables/useSession.js';
 import Navbar from './components/Navbar.vue';
@@ -99,7 +104,17 @@ const route = useRoute();
 const router = useRouter();
 const { connect } = useWebSocket();
 const currentSong = computed(() => playerStore.currentSong);
-const mobileVolume = computed(() => playerStore.activeBot?.volume ?? 75);
+// Volume slider decoupled from the 60fps updateMobileProgress() rAF re-render
+// so it isn't reset mid-drag (#111 — same root cause as the desktop player).
+const {
+  display: mobileVolumeDisplay,
+  onInput: onMobileVolumeInput,
+  onChange: onMobileVolumeCommit,
+  onRelease: onMobileVolumeRelease,
+} = useDecoupledSlider(
+  () => playerStore.activeBot?.volume,
+  (v) => playerStore.setVolume(v)
+);
 const mobileMode = computed(() => playerStore.activeBot?.playMode ?? 'seq');
 const mobileModeOrder = ['seq', 'loop', 'random', 'rloop'];
 const mobileModeIcons: Record<string, string> = {
@@ -124,11 +139,6 @@ function updateMobileProgress() {
     ? Math.min((playerStore.liveElapsed() / duration) * 100, 100)
     : 0;
   mobileRaf = requestAnimationFrame(updateMobileProgress);
-}
-
-function onMobileVolumeChange(e: Event) {
-  const volume = Number((e.target as HTMLInputElement).value);
-  playerStore.setVolume(volume);
 }
 
 function toggleMobileVolume() {
