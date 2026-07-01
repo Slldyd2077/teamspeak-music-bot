@@ -8,7 +8,7 @@ export interface PlayHistoryEntry {
   songName: string;
   artist: string;
   album: string;
-  platform: "netease" | "qq" | "bilibili" | "youtube" | "local" | "kugou";
+  platform: "netease" | "qq" | "bilibili" | "youtube" | "local" | "kugou" | "spotify";
   coverUrl: string;
 }
 

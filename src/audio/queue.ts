@@ -10,7 +10,7 @@ export interface QueuedSong {
   name: string;
   artist: string;
   album: string;
-  platform: "netease" | "qq" | "bilibili" | "youtube" | "local" | "kugou";
+  platform: "netease" | "qq" | "bilibili" | "youtube" | "local" | "kugou" | "spotify";
   url?: string; // resolved lazily at play time
   coverUrl: string;
   duration: number; // seconds
