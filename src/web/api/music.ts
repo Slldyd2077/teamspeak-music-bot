@@ -115,6 +115,11 @@ export function createMusicRouter(
         return;
       }
       const parsedLimit = parseInt(limit as string) || 20;
+      // Spotify is intentionally EXCLUDED from unified /search/all in Stage 1:
+      // its tracks are metadata-only (not yet playable) until the librespot audio
+      // backend lands (Stage 2/3), so surfacing them in the default all-sources
+      // view would only yield results that get skipped. Spotify search remains
+      // available from its own tab via /search?platform=spotify.
       const [neteaseResult, qqResult, bilibiliResult, localResult, kugouResult] = await Promise.allSettled([
         neteaseProvider.search(q as string, parsedLimit),
         qqProvider.search(q as string, parsedLimit),
