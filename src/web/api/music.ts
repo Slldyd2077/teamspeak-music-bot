@@ -14,7 +14,8 @@ export function createMusicRouter(
   logger: Logger,
   localProvider?: MusicProvider,
   config?: BotConfig,
-  kugouProvider?: MusicProvider
+  kugouProvider?: MusicProvider,
+  spotifyProvider?: MusicProvider
 ): Router {
   const router = Router();
   const youtubeProvider: MusicProvider = new YouTubeProvider();
@@ -28,6 +29,7 @@ export function createMusicRouter(
     if (platform === "youtube") return youtubeProvider;
     if (platform === "local" && localProvider) return localProvider;
     if (platform === "kugou" && kugouProvider) return kugouProvider;
+    if (platform === "spotify" && spotifyProvider) return spotifyProvider;
     return platform === "qq" ? qqProvider : neteaseProvider;
   }
 
@@ -291,6 +293,7 @@ export function createMusicRouter(
       bilibili: bilibiliProvider.getQuality(),
       local: localProvider?.getQuality() ?? "original",
       kugou: kugouProvider?.getQuality() ?? "128",
+      spotify: spotifyProvider?.getQuality() ?? "320",
     });
   });
 
@@ -312,6 +315,9 @@ export function createMusicRouter(
     }
     if ((!platform || platform === "kugou") && kugouProvider) {
       kugouProvider.setQuality(quality);
+    }
+    if ((!platform || platform === "spotify") && spotifyProvider) {
+      spotifyProvider.setQuality(quality);
     }
     logger.info({ quality, platform }, "Audio quality changed");
     res.json({ success: true, quality });

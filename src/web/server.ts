@@ -40,6 +40,7 @@ export interface WebServerOptions {
   bilibiliProvider: MusicProvider;
   localProvider: MusicProvider;
   kugouProvider: MusicProvider;
+  spotifyProvider: MusicProvider;
   database: BotDatabase;
   config: BotConfig;
   configPath: string;
@@ -125,7 +126,7 @@ export function createWebServer(options: WebServerOptions): WebServer {
   );
   app.use(
     "/api/music",
-    createMusicRouter(options.neteaseProvider, options.qqProvider, options.bilibiliProvider, logger, options.localProvider, options.config, options.kugouProvider)
+    createMusicRouter(options.neteaseProvider, options.qqProvider, options.bilibiliProvider, logger, options.localProvider, options.config, options.kugouProvider, options.spotifyProvider)
   );
   app.use("/api/player", createPlayerRouter(
     options.botManager, logger, options.database,
@@ -133,7 +134,7 @@ export function createWebServer(options: WebServerOptions): WebServer {
   ));
   app.use(
     "/api/auth",
-    createAuthRouter(options.neteaseProvider, options.qqProvider, options.bilibiliProvider, logger, options.cookieStore, options.kugouProvider)
+    createAuthRouter(options.neteaseProvider, options.qqProvider, options.bilibiliProvider, logger, options.cookieStore, options.kugouProvider, options.spotifyProvider)
   );
   app.use("/api/favorites", requireNotGuest, createFavoritesRouter(options.database, logger));
 
