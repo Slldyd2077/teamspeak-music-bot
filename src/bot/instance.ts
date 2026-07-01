@@ -23,6 +23,7 @@ import {
   occupancyFromClientList,
   shouldResumeOnReturn,
 } from "./auto-pause.js";
+import { isSpotifyUri } from "../music/spotify/webapi.js";
 
 /** Reply sent when a non-admin invokes an admin-only chat command. */
 export const COMMAND_DENIED_MESSAGE = "⛔ 需要管理员权限（该命令仅限管理员服务器组）";
@@ -37,6 +38,7 @@ export interface BotInstanceOptions {
   youtubeProvider: MusicProvider;
   localProvider?: MusicProvider;
   kugouProvider?: MusicProvider;
+  spotifyProvider?: MusicProvider;
   database: BotDatabase;
   config: BotConfig;
   logger: Logger;
@@ -71,6 +73,7 @@ export class BotInstance extends EventEmitter {
   private youtubeProvider: MusicProvider;
   private localProvider: MusicProvider;
   private kugouProvider: MusicProvider;
+  private spotifyProvider: MusicProvider;
   private database: BotDatabase;
   private config: BotConfig;
   private logger: Logger;
@@ -101,6 +104,7 @@ export class BotInstance extends EventEmitter {
     this.youtubeProvider = options.youtubeProvider;
     this.localProvider = options.localProvider ?? options.neteaseProvider;
     this.kugouProvider = options.kugouProvider ?? options.neteaseProvider;
+    this.spotifyProvider = options.spotifyProvider ?? options.neteaseProvider;
     this.database = options.database;
     this.config = options.config;
     this.logger = options.logger.child({ botId: this.id });
@@ -532,6 +536,7 @@ export class BotInstance extends EventEmitter {
     if (platform === "youtube") return this.youtubeProvider;
     if (platform === "local") return this.localProvider;
     if (platform === "kugou") return this.kugouProvider;
+    if (platform === "spotify") return this.spotifyProvider;
     return platform === "qq" ? this.qqProvider : this.neteaseProvider;
   }
 
@@ -545,6 +550,7 @@ export class BotInstance extends EventEmitter {
     if (flags.has("q")) return this.qqProvider;
     if (flags.has("y")) return this.youtubeProvider;
     if (flags.has("k")) return this.kugouProvider;
+    if (flags.has("s")) return this.spotifyProvider;
     return this.neteaseProvider;
   }
 
@@ -578,6 +584,17 @@ export class BotInstance extends EventEmitter {
         this.logger.warn(
           { songId: song.id, name: song.name },
           "bot disconnected during URL resolve — aborting playback",
+        );
+        return false;
+      }
+      // Stage 1: Spotify metadata works but audio is not wired yet. getSongUrl
+      // returns a `spotify:` sentinel — never hand it to ffmpeg. Tell the user
+      // and skip so the queue keeps moving. `sendTextMessage` is the same
+      // channel-message helper the command handlers use elsewhere in this file.
+      if (isSpotifyUri(result.url)) {
+        this.logger.info({ songId: song.id, name: song.name }, "Spotify playback not enabled yet — skipping");
+        await this.tsClient.sendTextMessage(
+          "⚠️ Spotify 播放尚未启用（需要 librespot 音频后端，将在后续版本支持）。"
         );
         return false;
       }

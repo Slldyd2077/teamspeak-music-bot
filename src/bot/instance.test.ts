@@ -210,3 +210,11 @@ describe("BotInstance.handleTextMessage — command permission gate", () => {
     expect(ctx.executeCommand).toHaveBeenCalledTimes(1);
   });
 });
+
+describe("BotInstance.getProviderFor — spotify routing", () => {
+  it("getProviderFor routes 'spotify' to the injected spotify provider", () => {
+    const spotify = { platform: "spotify" } as any;
+    const ctx = { spotifyProvider: spotify, neteaseProvider: { platform: "netease" } } as any;
+    expect(BotInstance.prototype.getProviderFor.call(ctx, "spotify" as any)).toBe(spotify);
+  });
+});

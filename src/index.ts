@@ -9,6 +9,7 @@ import { QQMusicProvider } from "./music/qq.js";
 import { BiliBiliProvider } from "./music/bilibili.js";
 import { LocalMusicProvider } from "./music/local.js";
 import { KugouProvider } from "./music/kugou.js";
+import { SpotifyProvider } from "./music/spotify/provider.js";
 import { createCookieStore } from "./music/auth.js";
 import { createAvatarStore } from "./data/avatars.js";
 import { createPermissionStore } from "./data/permissions.js";
@@ -59,6 +60,14 @@ async function main() {
   const bilibiliProvider = new BiliBiliProvider();
   const localProvider = new LocalMusicProvider(LOCAL_AUDIO_DIR);
   const kugouProvider = new KugouProvider();
+  const spotifyProvider = new SpotifyProvider();
+  // Safety gate (spec §7): the source is inert unless EXPLICITLY enabled.
+  // Only feed credentials when enabled — otherwise the provider has no creds,
+  // hasCreds() is false, search returns empty, and getAuthStatus() is loggedIn:false,
+  // so setting a Client ID/Secret alone (enabled:false) never activates Spotify.
+  if (config.spotify.enabled && config.spotify.clientId) {
+    spotifyProvider.setCreds(config.spotify.clientId, config.spotify.clientSecret);
+  }
 
   const cookieStore = createCookieStore(COOKIE_DIR);
   const avatarStore = createAvatarStore(AVATAR_DIR);
@@ -84,7 +93,8 @@ async function main() {
     permissions,
     CONFIG_PATH,
     localProvider,
-    kugouProvider
+    kugouProvider,
+    spotifyProvider
   );
   await botManager.loadSavedBots();
 
@@ -96,6 +106,7 @@ async function main() {
     bilibiliProvider,
     localProvider,
     kugouProvider,
+    spotifyProvider,
     database: db,
     avatarStore,
     config,
