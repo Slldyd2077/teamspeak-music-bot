@@ -205,3 +205,61 @@ describe("adminGroups normalization", () => {
     expect(loadAdminGroups({ adminGroups: "6" })).toEqual([]);
   });
 });
+
+describe("spotify config", () => {
+  it("defaults are present and disabled", () => {
+    const c = getDefaultConfig();
+    expect(c.spotify).toEqual({
+      enabled: false,
+      backend: "auto",
+      clientId: "",
+      clientSecret: "",
+      deviceName: "TSMusicBot",
+      bitrate: 320,
+    });
+  });
+
+  it("loadConfig coerces bad spotify values back to safe defaults", () => {
+    const dir = mkdtempSync(join(tmpdir(), "cfg-"));
+    const p = join(dir, "config.json");
+    writeFileSync(
+      p,
+      JSON.stringify({
+        spotify: { enabled: "yes", backend: "bogus", bitrate: 7, clientId: 5 },
+      })
+    );
+    const c = loadConfig(p);
+    expect(c.spotify.enabled).toBe(false); // non-boolean → false
+    expect(c.spotify.backend).toBe("auto"); // invalid enum → auto
+    expect(c.spotify.bitrate).toBe(320); // invalid → 320
+    expect(c.spotify.clientId).toBe(""); // non-string → ""
+    expect(c.spotify.deviceName).toBe("TSMusicBot"); // missing → default
+  });
+
+  it("loadConfig preserves valid spotify values", () => {
+    const dir = mkdtempSync(join(tmpdir(), "cfg-"));
+    const p = join(dir, "config.json");
+    writeFileSync(
+      p,
+      JSON.stringify({
+        spotify: {
+          enabled: true,
+          backend: "librespot",
+          clientId: "abc",
+          clientSecret: "def",
+          deviceName: "MyBot",
+          bitrate: 160,
+        },
+      })
+    );
+    const c = loadConfig(p);
+    expect(c.spotify).toEqual({
+      enabled: true,
+      backend: "librespot",
+      clientId: "abc",
+      clientSecret: "def",
+      deviceName: "MyBot",
+      bitrate: 160,
+    });
+  });
+});

@@ -9,6 +9,15 @@ export interface GuestModeConfig {
   permissions: GuestPermissions;
 }
 
+export interface SpotifyConfig {
+  enabled: boolean;
+  backend: "auto" | "go-librespot" | "librespot";
+  clientId: string;
+  clientSecret: string;
+  deviceName: string;
+  bitrate: number;
+}
+
 export interface BotConfig {
   webPort: number;
   locale: "zh" | "en";
@@ -33,6 +42,7 @@ export interface BotConfig {
   // behind HTTPS-terminating proxies.
   trustProxy: boolean;
   guestMode: GuestModeConfig;
+  spotify: SpotifyConfig;
 }
 
 export function getDefaultConfig(): BotConfig {
@@ -68,6 +78,14 @@ export function getDefaultConfig(): BotConfig {
         playMode: false,
         playCollection: false,
       },
+    },
+    spotify: {
+      enabled: false,
+      backend: "auto",
+      clientId: "",
+      clientSecret: "",
+      deviceName: "TSMusicBot",
+      bitrate: 320,
     },
   };
 }
@@ -118,11 +136,32 @@ export function loadConfig(path: string): BotConfig {
         )
       : defaults.adminGroups;
 
+    const partialSp = (partial.spotify ?? {}) as Partial<SpotifyConfig>;
+    const validBackends = ["auto", "go-librespot", "librespot"] as const;
+    const validBitrates = [96, 160, 320];
+    const spotify: SpotifyConfig = {
+      enabled: partialSp.enabled === true,
+      backend: (validBackends as readonly string[]).includes(partialSp.backend as string)
+        ? (partialSp.backend as SpotifyConfig["backend"])
+        : defaults.spotify.backend,
+      clientId: typeof partialSp.clientId === "string" ? partialSp.clientId : defaults.spotify.clientId,
+      clientSecret:
+        typeof partialSp.clientSecret === "string" ? partialSp.clientSecret : defaults.spotify.clientSecret,
+      deviceName:
+        typeof partialSp.deviceName === "string" && partialSp.deviceName.trim()
+          ? partialSp.deviceName
+          : defaults.spotify.deviceName,
+      bitrate: validBitrates.includes(partialSp.bitrate as number)
+        ? (partialSp.bitrate as number)
+        : defaults.spotify.bitrate,
+    };
+
     return {
       ...defaults,
       ...partial,
       adminGroups,
       guestMode: gm,
+      spotify,
     };
   } catch {
     return defaults;
