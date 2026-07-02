@@ -297,6 +297,84 @@ describe("bot router /settings", () => {
   });
 });
 
+// Whole-branch I2: saving a Client ID in Settings must re-configure the single
+// live SpotifyOAuth so the operator can Connect without a process restart.
+describe("bot router /settings applies spotify creds to the live OAuth (I2)", () => {
+  let botDb: BotDatabase;
+  let app: express.Express;
+  let cookie: string;
+  let config: BotConfig;
+  let configPath: string;
+  let tmpDir: string;
+  let configureCalls: Array<[string | undefined, string | undefined]>;
+
+  beforeEach(async () => {
+    botDb = createDatabase(":memory:");
+    const users = createUserStore(botDb.db);
+    const sessions = createSessionStore(botDb.db);
+    const alice = await users.createUser("alice", "pw-alice", "admin");
+    cookie = `${SESSION_COOKIE_NAME}=${sessions.createSession(alice.id).token}`;
+
+    tmpDir = mkdtempSync(join(tmpdir(), "botsettings-oauth-"));
+    configPath = join(tmpDir, "config.json");
+    config = getDefaultConfig(); // webPort defaults to 3000
+
+    const fakeManager = { getAllBots: () => [] } as unknown as BotManager;
+    const avatarStore = createAvatarStore(tmpDir);
+
+    // Fake OAuth recording every configure(clientId, redirectUri) call.
+    configureCalls = [];
+    const fakeOAuth = {
+      configure(clientId?: string, redirectUri?: string) {
+        configureCalls.push([clientId, redirectUri]);
+      },
+    };
+
+    app = express();
+    app.use(express.json());
+    app.use(cookieParser());
+    app.use("/api", createRequireAuth(sessions, createPermissionStore(botDb.db), () => getDefaultConfig().guestMode));
+    app.use(
+      "/api/bot",
+      createBotRouter(fakeManager, config, configPath, pino({ level: "silent" }), botDb, avatarStore, undefined, fakeOAuth),
+    );
+  });
+
+  afterEach(() => {
+    botDb.close();
+    rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  it("configures the live OAuth once with the derived callback redirectUri when a Client ID is saved", async () => {
+    const res = await request(app)
+      .post("/api/bot/settings")
+      .set("Cookie", cookie)
+      .send({ spotify: { clientId: "cid", enabled: true } });
+    expect(res.status).toBe(200);
+    expect(configureCalls).toEqual([
+      ["cid", `http://127.0.0.1:${config.webPort}/api/spotify/callback`],
+    ]);
+  });
+
+  it("does NOT touch the OAuth when the request has no spotify block", async () => {
+    const res = await request(app)
+      .post("/api/bot/settings")
+      .set("Cookie", cookie)
+      .send({ autoPauseOnEmpty: false });
+    expect(res.status).toBe(200);
+    expect(configureCalls).toEqual([]);
+  });
+
+  it("configures with ('', undefined) when a spotify block clears the Client ID (disables OAuth)", async () => {
+    const res = await request(app)
+      .post("/api/bot/settings")
+      .set("Cookie", cookie)
+      .send({ spotify: { clientId: "" } });
+    expect(res.status).toBe(200);
+    expect(configureCalls).toEqual([["", undefined]]);
+  });
+});
+
 describe("bot router /settings guest-mode gating + persistence", () => {
   let tmpDir: string;
   let configPath: string;

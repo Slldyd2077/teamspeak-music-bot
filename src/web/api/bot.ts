@@ -17,6 +17,9 @@ export function createBotRouter(
   botDb: BotDatabase,
   avatarStore: AvatarStore,
   onGuestPolicyChanged?: (cfg: GuestModeConfig) => void,
+  // I2: the single process-wide OAuth, so a UI-entered Client ID reaches the
+  // live instance on save (no restart). Structural type = SpotifyOAuth.configure.
+  spotifyOAuth?: { configure(clientId?: string, redirectUri?: string): void },
 ): Router {
   const router = Router();
 
@@ -123,6 +126,16 @@ export function createBotRouter(
     }
 
     saveConfig(configPath, config);
+
+    // I2: only when the spotify block was present, push the (possibly UI-entered)
+    // Client ID into the live process-wide OAuth so Connect works without a
+    // restart. Empty clientId => undefined redirect => configure() disables OAuth.
+    if (sp && typeof sp === "object") {
+      const redirectUri = config.spotify.clientId
+        ? `http://127.0.0.1:${config.webPort}/api/spotify/callback`
+        : undefined;
+      spotifyOAuth?.configure(config.spotify.clientId, redirectUri);
+    }
 
     // Guest-mode changed: tear down / re-scope in-flight guest WS sockets so a
     // disabled or narrowed scope takes effect immediately (matches requireAuth's

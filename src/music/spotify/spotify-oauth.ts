@@ -148,6 +148,14 @@ export class SpotifyOAuth {
     }
   }
 
+  /** Update the operator's app credentials at runtime (from Settings save) so
+   *  a UI-entered Client ID takes effect without a process restart. Empty
+   *  clientId disables OAuth (isAuthorized()/buildAuthorizeUrl() gate on it). */
+  configure(clientId?: string, redirectUri?: string): void {
+    this.clientId = clientId?.trim() || "";
+    this.redirectUri = redirectUri || "";
+  }
+
   getClientId(): string {
     return this.clientId;
   }

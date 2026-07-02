@@ -409,6 +409,53 @@ describe("SpotifyOAuth PKCE verifier TTL + cap (S4.3)", () => {
   });
 });
 
+// Whole-branch I2: a UI-entered Client ID (saved in Settings) must reach the
+// single live SpotifyOAuth WITHOUT a process restart. configure() re-arms the
+// runtime credentials; an empty clientId re-disables OAuth.
+describe("SpotifyOAuth.configure (runtime credentials, whole-branch I2)", () => {
+  it("applies a UI-entered clientId + redirectUri so OAuth arms without a restart", () => {
+    // Fresh install: boot-time config had no clientId, so OAuth is disabled.
+    const store = memStore({
+      accessToken: "a",
+      refreshToken: "r",
+      expiresAt: Date.now() + 60_000,
+      scope: "s",
+    });
+    const oauth = new SpotifyOAuth({ clientId: "", store });
+    expect(oauth.isAuthorized()).toBe(false);
+    expect(() => oauth.buildAuthorizeUrl()).toThrow(/Client ID/i);
+
+    // Operator enters creds in Settings -> POST /settings calls configure().
+    const REDIRECT = "http://127.0.0.1:3000/api/spotify/callback";
+    oauth.configure("cid", REDIRECT);
+    expect(oauth.getClientId()).toBe("cid");
+    expect(oauth.getRedirectUri()).toBe(REDIRECT);
+    // Now authorize + isAuthorized work against the newly-supplied app.
+    expect(oauth.isAuthorized()).toBe(true);
+    const { url } = oauth.buildAuthorizeUrl();
+    const p = new URL(url).searchParams;
+    expect(p.get("client_id")).toBe("cid");
+    expect(p.get("redirect_uri")).toBe(REDIRECT);
+  });
+
+  it("trims the clientId and re-disables OAuth when cleared", () => {
+    const oauth = new SpotifyOAuth({
+      clientId: "old",
+      redirectUri: "http://old",
+      store: memStore(),
+    });
+    oauth.configure("  cid  ", "http://127.0.0.1:3000/api/spotify/callback");
+    expect(oauth.getClientId()).toBe("cid"); // trimmed
+
+    // Empty clientId disables OAuth again (gate on buildAuthorizeUrl/isAuthorized).
+    oauth.configure("");
+    expect(oauth.getClientId()).toBe("");
+    expect(oauth.getRedirectUri()).toBe("");
+    expect(oauth.isAuthorized()).toBe(false);
+    expect(() => oauth.buildAuthorizeUrl()).toThrow(/Client ID/i);
+  });
+});
+
 describe("createFileOAuthTokenStore", () => {
   it("round-trips save/load and clear() removes it", () => {
     const dir = mkdtempSync(join(tmpdir(), "sp-oauth-"));

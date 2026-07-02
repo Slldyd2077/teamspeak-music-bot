@@ -132,6 +132,9 @@ export function createWebServer(options: WebServerOptions): WebServer {
       options.database,
       options.avatarStore,
       (cfg) => onGuestPolicyChanged(cfg),
+      // I2: so saving a Client ID in Settings re-configures the live OAuth
+      // (no restart needed for the UI-entered-creds -> Connect flow).
+      options.spotifyOAuth,
     )
   );
   app.use(
