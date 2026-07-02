@@ -1,6 +1,6 @@
 import { Router } from "express";
 import type { BotManager } from "../../bot/manager.js";
-import type { BotConfig, GuestModeConfig } from "../../data/config.js";
+import type { BotConfig, GuestModeConfig, SpotifyConfig } from "../../data/config.js";
 import { saveConfig } from "../../data/config.js";
 import type { Logger } from "../../logger.js";
 import type { BotDatabase } from "../../data/database.js";
@@ -19,6 +19,17 @@ export function createBotRouter(
   onGuestPolicyChanged?: (cfg: GuestModeConfig) => void,
 ): Router {
   const router = Router();
+
+  // Masked spotify view shared by the GET response and the POST echo. The raw
+  // clientSecret is write-only and NEVER serialized — only whether one is stored.
+  const maskedSpotify = () => ({
+    enabled: config.spotify.enabled,
+    backend: config.spotify.backend,
+    clientId: config.spotify.clientId,
+    deviceName: config.spotify.deviceName,
+    bitrate: config.spotify.bitrate,
+    hasClientSecret: config.spotify.clientSecret.length > 0,
+  });
 
   router.get("/", (req, res) => {
     const all = botManager.getAllBots().map((b) => b.getStatus());
@@ -39,6 +50,7 @@ export function createBotRouter(
       localAudioEnabled: config.localAudioEnabled,
       adminGroups: config.adminGroups ?? [],
       guestMode: config.guestMode,
+      spotify: maskedSpotify(),
     });
   });
 
@@ -85,6 +97,31 @@ export function createBotRouter(
       );
     }
 
+    // Partial-merge the spotify block (mirrors config.ts validation). Invalid
+    // sub-fields are ignored rather than 400-ing the whole request. Omitting
+    // `spotify` entirely leaves config.spotify untouched.
+    const VALID_BACKENDS = ["auto", "go-librespot", "librespot"] as const;
+    const VALID_BITRATES = [96, 160, 320];
+    const sp = req.body?.spotify;
+    if (sp && typeof sp === "object") {
+      const t = config.spotify;
+      if (typeof sp.enabled === "boolean") t.enabled = sp.enabled;
+      if (typeof sp.backend === "string" && (VALID_BACKENDS as readonly string[]).includes(sp.backend)) {
+        t.backend = sp.backend as SpotifyConfig["backend"];
+      }
+      if (typeof sp.clientId === "string") t.clientId = sp.clientId;
+      // Secret is write-only + set-on-non-empty so a blank field never wipes it.
+      if (typeof sp.clientSecret === "string" && sp.clientSecret.length > 0) {
+        t.clientSecret = sp.clientSecret;
+      }
+      if (typeof sp.deviceName === "string" && sp.deviceName.trim().length > 0) {
+        t.deviceName = sp.deviceName.trim();
+      }
+      if (typeof sp.bitrate === "number" && VALID_BITRATES.includes(sp.bitrate)) {
+        t.bitrate = sp.bitrate;
+      }
+    }
+
     saveConfig(configPath, config);
 
     // Guest-mode changed: tear down / re-scope in-flight guest WS sockets so a
@@ -106,6 +143,7 @@ export function createBotRouter(
       localAudioEnabled: config.localAudioEnabled,
       adminGroups: config.adminGroups ?? [],
       guestMode: config.guestMode,
+      spotify: maskedSpotify(),
     });
   });
 

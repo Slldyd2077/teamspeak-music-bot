@@ -3,7 +3,7 @@ import express from "express";
 import cookieParser from "cookie-parser";
 import request from "supertest";
 import pino from "pino";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, readFileSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createDatabase, type BotDatabase } from "../../data/database.js";
@@ -196,6 +196,105 @@ describe("bot router /settings", () => {
     expect(res.status).toBe(200);
     expect(config.adminGroups).toEqual([6]);
   });
+
+  it("GET /settings includes a masked spotify block (hasClientSecret, never a raw secret)", async () => {
+    config.spotify.enabled = true;
+    config.spotify.backend = "librespot";
+    config.spotify.clientId = "cid-1";
+    config.spotify.deviceName = "MyDevice";
+    config.spotify.bitrate = 160;
+    config.spotify.clientSecret = "supersecret";
+
+    const withSecret = await request(app).get("/api/bot/settings").set("Cookie", cookie);
+    expect(withSecret.status).toBe(200);
+    expect(withSecret.body.spotify).toEqual({
+      enabled: true,
+      backend: "librespot",
+      clientId: "cid-1",
+      deviceName: "MyDevice",
+      bitrate: 160,
+      hasClientSecret: true,
+    });
+    // The raw secret is never serialized to the client.
+    expect(withSecret.body.spotify).not.toHaveProperty("clientSecret");
+
+    config.spotify.clientSecret = "";
+    const noSecret = await request(app).get("/api/bot/settings").set("Cookie", cookie);
+    expect(noSecret.body.spotify.hasClientSecret).toBe(false);
+    expect(noSecret.body.spotify).not.toHaveProperty("clientSecret");
+  });
+
+  it("POST /settings updates the spotify block, echoes the masked view, and persists", async () => {
+    const res = await request(app)
+      .post("/api/bot/settings")
+      .set("Cookie", cookie)
+      .send({ spotify: { enabled: true, backend: "librespot", clientId: "cid", deviceName: "Dev", bitrate: 160 } });
+    expect(res.status).toBe(200);
+    expect(config.spotify.enabled).toBe(true);
+    expect(config.spotify.backend).toBe("librespot");
+    expect(config.spotify.clientId).toBe("cid");
+    expect(config.spotify.deviceName).toBe("Dev");
+    expect(config.spotify.bitrate).toBe(160);
+
+    expect(res.body.spotify).toEqual({
+      enabled: true,
+      backend: "librespot",
+      clientId: "cid",
+      deviceName: "Dev",
+      bitrate: 160,
+      hasClientSecret: false,
+    });
+    expect(res.body.spotify).not.toHaveProperty("clientSecret");
+
+    // saveConfig persisted the block to disk.
+    expect(existsSync(configPath)).toBe(true);
+    const persisted = JSON.parse(readFileSync(configPath, "utf-8"));
+    expect(persisted.spotify.clientId).toBe("cid");
+    expect(persisted.spotify.backend).toBe("librespot");
+  });
+
+  it("POST /settings ignores an invalid spotify backend/bitrate (partial-merge, no 400)", async () => {
+    config.spotify.backend = "auto";
+    config.spotify.bitrate = 320;
+    const res = await request(app)
+      .post("/api/bot/settings")
+      .set("Cookie", cookie)
+      .send({ spotify: { backend: "bogus", bitrate: 999 } });
+    expect(res.status).toBe(200);
+    expect(config.spotify.backend).toBe("auto");
+    expect(config.spotify.bitrate).toBe(320);
+  });
+
+  it("POST /settings sets a non-empty clientSecret but a blank one never wipes it", async () => {
+    const set = await request(app)
+      .post("/api/bot/settings")
+      .set("Cookie", cookie)
+      .send({ spotify: { clientSecret: "newsecret" } });
+    expect(set.status).toBe(200);
+    expect(config.spotify.clientSecret).toBe("newsecret");
+    expect(set.body.spotify.hasClientSecret).toBe(true);
+    expect(set.body.spotify).not.toHaveProperty("clientSecret");
+
+    const blank = await request(app)
+      .post("/api/bot/settings")
+      .set("Cookie", cookie)
+      .send({ spotify: { clientSecret: "" } });
+    expect(blank.status).toBe(200);
+    expect(config.spotify.clientSecret).toBe("newsecret");
+    expect(blank.body.spotify.hasClientSecret).toBe(true);
+  });
+
+  it("POST /settings that omits spotify leaves config.spotify untouched (no regression)", async () => {
+    config.spotify.clientId = "keep-me";
+    config.spotify.clientSecret = "keep-secret";
+    const before = { ...config.spotify };
+    const res = await request(app)
+      .post("/api/bot/settings")
+      .set("Cookie", cookie)
+      .send({ autoPauseOnEmpty: false });
+    expect(res.status).toBe(200);
+    expect(config.spotify).toEqual(before);
+  });
 });
 
 describe("bot router /settings guest-mode gating + persistence", () => {
@@ -250,5 +349,16 @@ describe("bot router /settings guest-mode gating + persistence", () => {
     expect(res.body.guestMode.bots).toEqual(["bot1"]);
     expect(res.body.guestMode.permissions.playNext).toBe(true);
     expect(res.body.guestMode.permissions.addToQueue).toBe(true); // untouched default
+  });
+
+  it("POST /settings spotify write is 403 for a member lacking bot.manage", async () => {
+    const memberApp = mountBot(() => ({ role: "member", capabilities: new Set([]) }));
+    const res = await request(memberApp)
+      .post("/api/bot/settings")
+      .send({ spotify: { enabled: true, clientId: "cid" } });
+    expect(res.status).toBe(403);
+    // Gate rejected before any mutation.
+    expect(config.spotify.enabled).toBe(false);
+    expect(config.spotify.clientId).toBe("");
   });
 });
