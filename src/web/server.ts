@@ -23,12 +23,9 @@ import { createSpotifyRouter } from "./api/spotify.js";
 import type { SpotifyOAuth } from "../music/spotify/spotify-oauth.js";
 import { resolveSpotifyBackendKind } from "../music/spotify/backend-select.js";
 import {
-  isGoLibrespotSupported,
-  findGoLibrespot,
-  isRustLibrespotSupported,
-  findLibrespot,
+  isGoLibrespotPresent,
+  isLibrespotPresent,
 } from "../music/spotify/binary.js";
-import { existsSync } from "node:fs";
 import { setupWebSocket } from "./websocket.js";
 import { createUserStore } from "../data/users.js";
 import { createSessionStore } from "../data/sessions.js";
@@ -156,10 +153,10 @@ export function createWebServer(options: WebServerOptions): WebServer {
         oauth: options.spotifyOAuth,
         logger,
         getBackendInfo: () => {
-          const goPresent =
-            isGoLibrespotSupported() && existsSync(findGoLibrespot());
-          const rustPresent =
-            isRustLibrespotSupported() && existsSync(findLibrespot());
+          // PATH-aware presence (Bug m1): a PATH-installed binary (bare name)
+          // is resolved against $PATH, not existsSync()'d against cwd.
+          const goPresent = isGoLibrespotPresent();
+          const rustPresent = isLibrespotPresent();
           const resolved = resolveSpotifyBackendKind(
             options.config.spotify.backend,
             goPresent,

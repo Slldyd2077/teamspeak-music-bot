@@ -2,11 +2,43 @@ import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { existsSync } from "node:fs";
 import { fileURLToPath } from "node:url";
-import { dirname, join } from "node:path";
+import { dirname, join, delimiter } from "node:path";
 
 const execFileAsync = promisify(execFile);
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
+
+/**
+ * Resolve a command to an existing absolute path, SYNCHRONOUSLY. A candidate
+ * that already contains a path separator (a project bin/ path) is checked
+ * directly; a BARE command name (e.g. "librespot" / "go-librespot") is searched
+ * across the $PATH directories — with PATHEXT extensions appended on win32 — so
+ * a scoop/choco/cargo/apt PATH install resolves. Returns the resolved path, or
+ * null when nothing exists.
+ *
+ * This is the sync counterpart to checkLibrespotAvailable()/…GoLibrespot… and
+ * is what the hot-path presence gates (chooseBackend/isAvailable) rely on: a
+ * bare name must NOT be handed to existsSync() directly, since existsSync
+ * resolves it against process.cwd() rather than PATH (Bug I3/m1).
+ */
+export function resolveExecutable(cmd: string): string | null {
+  if (cmd.includes("/") || cmd.includes("\\")) {
+    return existsSync(cmd) ? cmd : null;
+  }
+  const dirs = (process.env.PATH || "").split(delimiter).filter(Boolean);
+  const exts =
+    process.platform === "win32"
+      ? (process.env.PATHEXT || ".EXE;.CMD;.BAT;.COM").split(";").filter(Boolean)
+      : [""];
+  for (const dir of dirs) {
+    for (const ext of exts) {
+      const hasExt = ext && cmd.toLowerCase().endsWith(ext.toLowerCase());
+      const full = join(dir, hasExt ? cmd : cmd + ext);
+      if (existsSync(full)) return full;
+    }
+  }
+  return null;
+}
 
 /**
  * True only on Linux. go-librespot ships Linux-only release binaries and the
@@ -42,6 +74,16 @@ export function findGoLibrespot(): string {
   // src/music/spotify -> ../../../bin (one level deeper than youtube.ts).
   const binPath = join(__dirname, "..", "..", "..", "bin", "go-librespot");
   return pickGoLibrespotPath([binPath, "go-librespot"], existsSync);
+}
+
+/**
+ * SYNCHRONOUS presence gate for go-librespot: supported platform (linux) AND
+ * the resolved binary (project bin/ OR a PATH install) actually exists. This is
+ * what chooseBackend()/isAvailable() must use — NOT existsSync(findGoLibrespot())
+ * which cannot see a bare PATH name (Bug I3/m1).
+ */
+export function isGoLibrespotPresent(): boolean {
+  return isGoLibrespotSupported() && resolveExecutable(findGoLibrespot()) !== null;
 }
 
 // Injectable `--version` probe. Defaults to the real execFile call; tests
@@ -141,6 +183,16 @@ export function findLibrespot(): string {
   const binExe = join(__dirname, "..", "..", "..", "bin", exe);
   const binBare = join(__dirname, "..", "..", "..", "bin", "librespot");
   return pickLibrespotPath([binExe, binBare, exe], existsSync);
+}
+
+/**
+ * SYNCHRONOUS presence gate for Rust librespot: supported everywhere AND the
+ * resolved binary (project bin/ OR a scoop/choco/cargo PATH install) actually
+ * exists. This is what chooseBackend()/isAvailable() must use — NOT
+ * existsSync(findLibrespot()) which cannot see a bare PATH name (Bug I3/m1).
+ */
+export function isLibrespotPresent(): boolean {
+  return isRustLibrespotSupported() && resolveExecutable(findLibrespot()) !== null;
 }
 
 // Injectable `--version` probe. Defaults to the real execFile call; tests

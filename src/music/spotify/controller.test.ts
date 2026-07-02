@@ -22,16 +22,26 @@ const bin = vi.hoisted(() => ({
   rustSupported: true,
   rustPath: "",
 }));
-vi.mock("./binary.js", () => ({
-  isGoLibrespotSupported: () => bin.supported,
-  findGoLibrespot: () => bin.path,
-  resetGoLibrespotBinaryCache: () => {},
-  checkGoLibrespotAvailable: async () => bin.supported && !!bin.path,
-  isRustLibrespotSupported: () => bin.rustSupported,
-  findLibrespot: () => bin.rustPath,
-  resetLibrespotBinaryCache: () => {},
-  checkLibrespotAvailable: async () => bin.rustSupported && !!bin.rustPath,
-}));
+vi.mock("./binary.js", async () => {
+  // existsSync mirrors the real resolveExecutable(find*()) result for the
+  // bin/-style temp paths this suite uses (existingBin exists, missingBin does
+  // not), keeping the chooseBackend/isAvailable matrix behavior-identical.
+  const { existsSync } = await import("node:fs");
+  return {
+    isGoLibrespotSupported: () => bin.supported,
+    findGoLibrespot: () => bin.path,
+    resetGoLibrespotBinaryCache: () => {},
+    checkGoLibrespotAvailable: async () => bin.supported && !!bin.path,
+    isRustLibrespotSupported: () => bin.rustSupported,
+    findLibrespot: () => bin.rustPath,
+    resetLibrespotBinaryCache: () => {},
+    checkLibrespotAvailable: async () => bin.rustSupported && !!bin.rustPath,
+    // PATH-aware presence gates (Bug I3): supported gate AND the resolved
+    // binary actually exists on disk.
+    isGoLibrespotPresent: () => bin.supported && existsSync(bin.path),
+    isLibrespotPresent: () => bin.rustSupported && existsSync(bin.rustPath),
+  };
+});
 
 // Capture options the DEFAULT factory hands to the real GoLibrespotBackend so
 // we can assert per-bot ports (Fix 3) are threaded through. Every other test

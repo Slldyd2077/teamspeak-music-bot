@@ -1,5 +1,7 @@
 import { describe, it, expect, vi, afterEach } from "vitest";
 import { join } from "node:path";
+import { mkdtempSync, writeFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
 import {
   isGoLibrespotSupported,
   pickGoLibrespotPath,
@@ -13,11 +15,25 @@ import {
   checkLibrespotAvailable,
   resetLibrespotBinaryCache,
   __setLibrespotVersionProbe,
+  resolveExecutable,
+  isLibrespotPresent,
+  isGoLibrespotPresent,
 } from "./binary.js";
 
 const origPlatform = process.platform;
 function setPlatform(p: NodeJS.Platform): void {
   Object.defineProperty(process, "platform", { value: p, configurable: true });
+}
+
+// Snapshot the PATH env so PATH-resolution tests can point it at temp dirs and
+// restore afterwards. PATHEXT is optional (undefined on posix); track presence.
+const origPath = process.env.PATH;
+const origPathExt = process.env.PATHEXT;
+const tmpDirs: string[] = [];
+function mkTmpDir(prefix: string): string {
+  const dir = mkdtempSync(join(tmpdir(), prefix));
+  tmpDirs.push(dir);
+  return dir;
 }
 
 afterEach(() => {
@@ -26,6 +42,16 @@ afterEach(() => {
   resetGoLibrespotBinaryCache();
   __setLibrespotVersionProbe(null);
   resetLibrespotBinaryCache();
+  process.env.PATH = origPath;
+  if (origPathExt === undefined) delete process.env.PATHEXT;
+  else process.env.PATHEXT = origPathExt;
+  for (const dir of tmpDirs.splice(0)) {
+    try {
+      rmSync(dir, { recursive: true, force: true });
+    } catch {
+      /* ignore */
+    }
+  }
 });
 
 describe("isGoLibrespotSupported", () => {
@@ -232,5 +258,106 @@ describe("checkLibrespotAvailable", () => {
     expect(a).toBe(true);
     expect(b).toBe(true);
     expect(probe).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("resolveExecutable", () => {
+  it("returns a bin/-style path (contains a separator) that exists, unchanged", () => {
+    const dir = mkTmpDir("tsmb-resolve-");
+    const full = join(dir, "some-binary");
+    writeFileSync(full, "#!/bin/sh\n");
+    // The path contains a separator so it is checked directly, not via PATH.
+    expect(resolveExecutable(full)).toBe(full);
+  });
+
+  it("returns null for a bin/-style path that does not exist", () => {
+    const full = join(tmpdir(), "tsmb-resolve-missing", "nope-binary");
+    expect(resolveExecutable(full)).toBeNull();
+  });
+
+  it("resolves a BARE command name found in a PATH directory (the I3 fix)", () => {
+    // This is the regression the fix targets: a PATH-installed binary (bare
+    // name, no separator) must resolve against $PATH, not process.cwd().
+    const dir = mkTmpDir("tsmb-resolve-path-");
+    const exeName = process.platform === "win32" ? "faketool.exe" : "faketool";
+    const full = join(dir, exeName);
+    writeFileSync(full, "#!/bin/sh\n");
+    process.env.PATH = dir;
+    expect(resolveExecutable(exeName)).toBe(full);
+  });
+
+  it("returns null for a bare name not present in any PATH directory", () => {
+    process.env.PATH = mkTmpDir("tsmb-resolve-empty-");
+    expect(resolveExecutable("definitely-not-a-real-binary-xyz")).toBeNull();
+  });
+
+  it("appends PATHEXT extensions on win32 to resolve a bare (extensionless) name", () => {
+    setPlatform("win32");
+    const dir = mkTmpDir("tsmb-resolve-pathext-");
+    const full = join(dir, "mytool.CMD");
+    writeFileSync(full, "@echo hi\n");
+    process.env.PATH = dir;
+    process.env.PATHEXT = ".EXE;.CMD;.BAT;.COM";
+    // Bare "mytool" has no extension; win32 resolution must try PATHEXT and
+    // find mytool.CMD.
+    expect(resolveExecutable("mytool")).toBe(full);
+  });
+
+  it("does not touch PATH for a bin/-style relative path with a separator", () => {
+    // A candidate with a separator is checked directly even if PATH is empty.
+    process.env.PATH = "";
+    const dir = mkTmpDir("tsmb-resolve-direct-");
+    const full = join(dir, "direct-binary");
+    writeFileSync(full, "#!/bin/sh\n");
+    expect(resolveExecutable(full)).toBe(full);
+  });
+});
+
+describe("isLibrespotPresent (PATH-aware, sync)", () => {
+  it("true when the bare librespot name resolves on PATH (posix)", () => {
+    setPlatform("linux");
+    const dir = mkTmpDir("tsmb-librespot-path-");
+    writeFileSync(join(dir, "librespot"), "#!/bin/sh\n");
+    process.env.PATH = dir;
+    expect(isLibrespotPresent()).toBe(true);
+  });
+
+  it("true when librespot.exe resolves on PATH (win32)", () => {
+    setPlatform("win32");
+    const dir = mkTmpDir("tsmb-librespot-win-");
+    writeFileSync(join(dir, "librespot.exe"), "MZ\n");
+    process.env.PATH = dir;
+    process.env.PATHEXT = ".EXE;.CMD;.BAT;.COM";
+    expect(isLibrespotPresent()).toBe(true);
+  });
+
+  it("false when librespot is not on PATH", () => {
+    setPlatform("linux");
+    process.env.PATH = mkTmpDir("tsmb-librespot-empty-");
+    expect(isLibrespotPresent()).toBe(false);
+  });
+});
+
+describe("isGoLibrespotPresent (PATH-aware, sync)", () => {
+  it("true when go-librespot resolves on PATH (linux)", () => {
+    setPlatform("linux");
+    const dir = mkTmpDir("tsmb-go-path-");
+    writeFileSync(join(dir, "go-librespot"), "#!/bin/sh\n");
+    process.env.PATH = dir;
+    expect(isGoLibrespotPresent()).toBe(true);
+  });
+
+  it("false on non-linux platforms regardless of PATH (unsupported gate)", () => {
+    setPlatform("win32");
+    const dir = mkTmpDir("tsmb-go-win-");
+    writeFileSync(join(dir, "go-librespot"), "#!/bin/sh\n");
+    process.env.PATH = dir;
+    expect(isGoLibrespotPresent()).toBe(false);
+  });
+
+  it("false on linux when go-librespot is not on PATH", () => {
+    setPlatform("linux");
+    process.env.PATH = mkTmpDir("tsmb-go-empty-");
+    expect(isGoLibrespotPresent()).toBe(false);
   });
 });

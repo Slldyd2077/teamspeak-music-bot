@@ -15,12 +15,7 @@ import type {
   SpotifyTrackEndedEvent,
   SpotifyNowPlaying,
 } from "./backend.js";
-import {
-  isGoLibrespotSupported,
-  findGoLibrespot,
-  isRustLibrespotSupported,
-  findLibrespot,
-} from "./binary.js";
+import { isGoLibrespotPresent, isLibrespotPresent } from "./binary.js";
 import { GoLibrespotBackend } from "./go-librespot.js";
 import { RustLibrespotBackend } from "./rust-librespot.js";
 import {
@@ -151,11 +146,13 @@ export class SpotifyController extends EventEmitter {
   }
 
   private goPresent(): boolean {
-    return isGoLibrespotSupported() && existsSync(findGoLibrespot());
+    // PATH-aware, sync presence gate (Bug I3): a bare PATH-installed binary is
+    // resolved against $PATH, not existsSync()'d against process.cwd().
+    return isGoLibrespotPresent();
   }
 
   private rustPresent(): boolean {
-    return isRustLibrespotSupported() && existsSync(findLibrespot());
+    return isLibrespotPresent();
   }
 
   /**
