@@ -310,6 +310,74 @@ describe("SpotifyController backend error handling (C3)", () => {
     expect(built).toBe(2);
     expect(be2.startCalls).toBe(1);
   });
+
+  it("tears down the errored backend (stop + detach + null) so it is not orphaned", async () => {
+    const be1 = new FakeBackend();
+    const be2 = new FakeBackend();
+    const backends = [be1, be2];
+    let built = 0;
+    const { ctrl } = makeCtrl({
+      backendFactory: () => {
+        built++;
+        return backends.shift()!;
+      },
+    });
+    await ctrl.ensureStarted();
+    expect(built).toBe(1);
+
+    // On "error" the controller must stop() the errored backend (cleans its
+    // ffmpeg/go-librespot children + FIFO) and detach ALL its listeners.
+    expect(() => be1.emit("error", new Error("sidecar boom"))).not.toThrow();
+    expect(be1.stopCalls).toBe(1);
+    expect(be1.listenerCount("error")).toBe(0);
+    expect(be1.listenerCount("trackEnded")).toBe(0);
+    expect(be1.listenerCount("metadata")).toBe(0);
+
+    // Internal backend is null: a transport call no-ops (delegates to nothing)
+    // and getPcmStream throws until a rebuild.
+    await ctrl.pause();
+    expect(be1.pauseCalls).toBe(0);
+    expect(() => ctrl.getPcmStream()).toThrow();
+
+    // A fresh ensureStarted builds a NEW backend instance.
+    expect(await ctrl.ensureStarted()).toBe(true);
+    expect(built).toBe(2);
+    expect(be2.startCalls).toBe(1);
+    expect(ctrl.getPcmStream()).toBe(be2.pcm);
+  });
+
+  it("does not cross-talk: a later error from the ORPHANED backend leaves the healthy rebuilt controller ready", async () => {
+    const be1 = new FakeBackend();
+    const be2 = new FakeBackend();
+    const backends = [be1, be2];
+    let built = 0;
+    const { ctrl } = makeCtrl({
+      backendFactory: () => {
+        built++;
+        return backends.shift()!;
+      },
+    });
+    await ctrl.ensureStarted();
+
+    // First error tears down be1 and the controller rebuilds onto healthy be2.
+    be1.emit("error", new Error("sidecar boom"));
+    expect(await ctrl.ensureStarted()).toBe(true);
+    expect(built).toBe(2);
+    await ctrl.pause();
+    expect(be2.pauseCalls).toBe(1);
+
+    // A SECOND error emitted by the OLD (orphaned) backend must NOT reach the
+    // controller: the healthy be2 stays owned, ready, and untouched.
+    be1.on("error", () => {}); // controller detached; re-arm to avoid unhandled throw
+    expect(() => be1.emit("error", new Error("orphan boom"))).not.toThrow();
+    expect(be2.stopCalls).toBe(0); // healthy backend not torn down
+    // Still ready: ensureStarted returns true without rebuilding a third time.
+    expect(await ctrl.ensureStarted()).toBe(true);
+    expect(built).toBe(2);
+    await ctrl.pause();
+    expect(be2.pauseCalls).toBe(2);
+    expect(ctrl.getPcmStream()).toBe(be2.pcm);
+  });
 });
 
 describe("SpotifyController.stop", () => {

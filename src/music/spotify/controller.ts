@@ -114,6 +114,25 @@ export class SpotifyController extends EventEmitter {
    */
   private handleBackendError(err: unknown): void {
     this.logger.error({ err }, "Spotify backend error; marking not-ready");
+    // Tear down the errored backend BEFORE resetting flags so ensureStarted()
+    // does not orphan it: stop() cleans its ffmpeg/go-librespot children + FIFO,
+    // removeAllListeners() detaches its "error" handler so a later error from
+    // this now-orphaned backend cannot flip a healthy rebuilt controller
+    // back to not-ready (state cross-talk). Teardown must never mask the
+    // original error, so guard stop() which may throw.
+    try {
+      this.backend?.stop();
+    } catch (stopErr) {
+      this.logger.error(
+        { err: stopErr },
+        "Spotify backend stop() threw during error teardown",
+      );
+    }
+    // SpotifyAudioBackend's type contract exposes on() but not
+    // removeAllListeners(); every concrete backend extends EventEmitter, so
+    // detach through it to drop this controller's listeners from the orphan.
+    (this.backend as unknown as EventEmitter | null)?.removeAllListeners();
+    this.backend = null;
     this.started = false;
     this.startPromise = null;
   }
