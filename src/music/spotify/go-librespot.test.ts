@@ -15,7 +15,7 @@ function makeFakeChild() {
   return child;
 }
 
-function makeHarness() {
+function makeHarness(portOpts: { apiPort?: number; callbackPort?: number } = {}) {
   const calls: string[] = [];
   const ffmpegChild = makeFakeChild();
   const gliChild = makeFakeChild();
@@ -52,7 +52,8 @@ function makeHarness() {
     bitrate: 320,
     workDir: "/tmp/work",
     configDir: "/tmp/cfg",
-    apiPort: 3678,
+    apiPort: portOpts.apiPort ?? 3678,
+    callbackPort: portOpts.callbackPort,
     logger: log,
     deps: {
       spawn,
@@ -131,6 +132,37 @@ describe("GoLibrespotBackend.start", () => {
     await h.backend.start();
     expect(h.rest.ping).toHaveBeenCalledTimes(3);
     expect(h.backend.isReady()).toBe(true);
+  });
+});
+
+describe("GoLibrespotBackend config binding (Fix 1 loopback + Fix 3 ports)", () => {
+  function writtenYml(h: ReturnType<typeof makeHarness>): string {
+    const calls = h.writeFileSync.mock.calls as unknown as any[][];
+    const call = calls.find((c) => String(c[0]).endsWith("config.yml"));
+    expect(call).toBeDefined();
+    return call![1] as string;
+  }
+
+  it("binds the control API to loopback (127.0.0.1), never 0.0.0.0", async () => {
+    const h = makeHarness();
+    await h.backend.start();
+    const yml = writtenYml(h);
+    expect(yml).toContain("address: 127.0.0.1");
+    expect(yml).not.toContain("0.0.0.0");
+  });
+
+  it("threads apiPort + callbackPort into the rendered config", async () => {
+    const h = makeHarness({ apiPort: 3712, callbackPort: 8712 });
+    await h.backend.start();
+    const yml = writtenYml(h);
+    expect(yml).toContain("port: 3712");
+    expect(yml).toContain("callback_port: 8712");
+  });
+
+  it("defaults callbackPort to 8080 when unset", async () => {
+    const h = makeHarness();
+    await h.backend.start();
+    expect(writtenYml(h)).toContain("callback_port: 8080");
   });
 });
 

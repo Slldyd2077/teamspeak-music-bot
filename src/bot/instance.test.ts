@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from "vitest";
-import { BotInstance, COMMAND_DENIED_MESSAGE } from "./instance.js";
+import { BotInstance, COMMAND_DENIED_MESSAGE, spotifyPortsForBotId } from "./instance.js";
 import type { TS3TextMessage } from "../ts-protocol/client.js";
 
 // Constructing a real BotInstance is heavy (spawns a TS3Client, AudioPlayer,
@@ -404,6 +404,44 @@ describe("BotInstance.resolveAndPlay — Spotify routing (C4)", () => {
     expect(player.isExternalActive()).toBe(true);
   });
 
+  it("returns false + sends the fallback when playTrack resolves false (dead/failed sidecar)", async () => {
+    const controller = makeController();
+    controller.playTrack = vi.fn(async () => false);
+    const player = makePlayer();
+    const ctx = makeResolveCtx({ controller, player, url: "spotify:track:abc" });
+
+    const ok = await resolveAndPlay.call(ctx, spotifySong());
+
+    expect(ok).toBe(false);
+    expect(controller.playTrack).toHaveBeenCalledTimes(1);
+    // Same Stage-1 fallback message as the backend-unavailable path.
+    expect(ctx.tsClient.sendTextMessage).toHaveBeenCalledTimes(1);
+    // Never attach the player to a dead stream.
+    expect(player.playPcmStream).not.toHaveBeenCalled();
+    expect(ctx.currentSourceIsSpotify).toBe(false);
+  });
+
+  it("recovers on mid-session sidecar death: onExternalEnd stops controller+player and clears the flag", async () => {
+    const controller = makeController();
+    const player = makePlayer();
+    const ctx = makeResolveCtx({ controller, player, url: "spotify:track:abc" });
+
+    await resolveAndPlay.call(ctx, spotifySong());
+    expect(ctx.currentSourceIsSpotify).toBe(true);
+    expect(player.playPcmStream).toHaveBeenCalledTimes(1);
+
+    // The sidecar PCM stream EOFs mid-session → fire the wired onExternalEnd.
+    const opts = player.playPcmStream.mock.calls[0][1] as { onExternalEnd?: () => void };
+    expect(typeof opts.onExternalEnd).toBe("function");
+    opts.onExternalEnd!();
+
+    // Recovery: controller torn down (next track rebuilds), player stopped
+    // (drops external mode so the next track re-attaches), flag cleared.
+    expect(controller.stop).toHaveBeenCalledTimes(1);
+    expect(player.stop).toHaveBeenCalledTimes(1);
+    expect(ctx.currentSourceIsSpotify).toBe(false);
+  });
+
   it("pauses the sidecar and clears the flag when switching to a non-spotify track", async () => {
     const controller = makeController();
     const player = makePlayer();
@@ -570,5 +608,32 @@ describe("BotInstance.seek — spotify routing (C4)", () => {
     seek.call(ctx, 30);
     expect(ctx.player.seek).toHaveBeenCalledWith(30);
     expect(ctx.spotifyController.seek).not.toHaveBeenCalled();
+  });
+});
+
+describe("spotifyPortsForBotId — per-bot go-librespot ports (Fix 3)", () => {
+  it("yields the SAME ports for the same bot id (stable across restarts)", () => {
+    const a = spotifyPortsForBotId("bot-alpha");
+    const b = spotifyPortsForBotId("bot-alpha");
+    expect(a).toEqual(b);
+  });
+
+  it("yields DIFFERENT ports for different bot ids", () => {
+    const a = spotifyPortsForBotId("bot-alpha");
+    const b = spotifyPortsForBotId("bot-beta");
+    expect(a.apiPort).not.toBe(b.apiPort);
+    expect(a.callbackPort).not.toBe(b.callbackPort);
+  });
+
+  it("keeps apiPort and callbackPort in disjoint ranges", () => {
+    for (const id of ["bot-alpha", "bot-beta", "x", "a-very-long-bot-identifier-123"]) {
+      const { apiPort, callbackPort } = spotifyPortsForBotId(id);
+      expect(apiPort).toBeGreaterThanOrEqual(3700);
+      expect(apiPort).toBeLessThan(4700);
+      expect(callbackPort).toBeGreaterThanOrEqual(8700);
+      expect(callbackPort).toBeLessThan(9700);
+      // Same offset within each range → the two never collide with each other.
+      expect(callbackPort - apiPort).toBe(5000);
+    }
   });
 });

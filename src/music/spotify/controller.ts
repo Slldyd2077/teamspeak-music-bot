@@ -16,6 +16,10 @@ export interface SpotifyControllerOptions {
   workDir: string;
   configDir: string;
   logger: Logger;
+  /** Per-bot go-librespot control-API port (distinct per bot to avoid binds). */
+  apiPort?: number;
+  /** Per-bot go-librespot OAuth callback port (distinct per bot). */
+  callbackPort?: number;
   /** Injected for tests; defaults to constructing a real GoLibrespotBackend. */
   backendFactory?: () => SpotifyAudioBackend;
 }
@@ -39,6 +43,8 @@ export class SpotifyController extends EventEmitter {
   private readonly workDir: string;
   private readonly configDir: string;
   private readonly logger: Logger;
+  private readonly apiPort?: number;
+  private readonly callbackPort?: number;
   private readonly backendFactory: () => SpotifyAudioBackend;
 
   private backend: SpotifyAudioBackend | null = null;
@@ -51,6 +57,8 @@ export class SpotifyController extends EventEmitter {
     this.workDir = o.workDir;
     this.configDir = o.configDir;
     this.logger = o.logger;
+    this.apiPort = o.apiPort;
+    this.callbackPort = o.callbackPort;
     this.backendFactory =
       o.backendFactory ??
       (() =>
@@ -59,6 +67,8 @@ export class SpotifyController extends EventEmitter {
           bitrate: this.config.bitrate,
           workDir: this.workDir,
           configDir: this.configDir,
+          apiPort: this.apiPort,
+          callbackPort: this.callbackPort,
           logger: this.logger,
         }));
   }
@@ -79,7 +89,14 @@ export class SpotifyController extends EventEmitter {
    */
   async ensureStarted(): Promise<boolean> {
     if (!this.isAvailable()) return false;
-    if (this.started) return true;
+    if (this.started) {
+      // A previously-started backend still counts as ready only if its process
+      // is alive. If the sidecar died (isReady()===false) — e.g. the go-librespot
+      // child exited — tear it down here so the code below rebuilds a fresh one
+      // instead of handing callers a dead backend.
+      if (this.backend?.isReady()) return true;
+      this.stop();
+    }
     if (this.startPromise) return this.startPromise;
 
     this.startPromise = (async () => {
@@ -169,12 +186,22 @@ export class SpotifyController extends EventEmitter {
     return this.backend.getPcmStream();
   }
 
-  /** Tear down the backend and reset lifecycle state (safe before start). */
+  /**
+   * Tear down the backend and reset lifecycle state (safe before start).
+   * Mirrors handleBackendError's teardown so the NEXT ensureStarted() rebuilds
+   * a fresh backend: stop() cleans the ffmpeg/go-librespot children + FIFO,
+   * removeAllListeners() detaches this controller's handlers so a late event
+   * from the now-orphaned backend can't disturb a rebuilt one. Guard stop()
+   * (it may throw) so teardown always completes.
+   */
   stop(): void {
-    if (this.backend) {
-      this.backend.stop();
-      this.backend = null;
+    try {
+      this.backend?.stop();
+    } catch (stopErr) {
+      this.logger.error({ err: stopErr }, "Spotify backend stop() threw during teardown");
     }
+    (this.backend as unknown as EventEmitter | null)?.removeAllListeners();
+    this.backend = null;
     this.started = false;
     this.startPromise = null;
   }

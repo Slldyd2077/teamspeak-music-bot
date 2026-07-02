@@ -32,6 +32,7 @@ export interface GoLibrespotBackendOptions {
   workDir: string;
   configDir: string;
   apiPort?: number;
+  callbackPort?: number;
   logger: Logger;
   deps?: GoLibrespotBackendDeps;
 }
@@ -67,6 +68,7 @@ export class GoLibrespotBackend extends EventEmitter implements SpotifyAudioBack
   private readonly log: Logger;
   private readonly deps: GoLibrespotBackendDeps;
   private readonly apiPort: number;
+  private readonly callbackPort: number;
   private readonly fifoPath: string;
 
   private ffmpeg: ChildProcess | null = null;
@@ -82,6 +84,7 @@ export class GoLibrespotBackend extends EventEmitter implements SpotifyAudioBack
     this.log = o.logger;
     this.deps = o.deps ?? {};
     this.apiPort = o.apiPort ?? DEFAULT_API_PORT;
+    this.callbackPort = o.callbackPort ?? DEFAULT_CALLBACK_PORT;
     this.fifoPath = posixPath.join(o.workDir, FIFO_NAME);
   }
 
@@ -132,9 +135,12 @@ export class GoLibrespotBackend extends EventEmitter implements SpotifyAudioBack
         deviceName: this.opts.deviceName,
         bitrate: this.opts.bitrate,
         fifoPath: this.fifoPath,
-        apiAddress: "0.0.0.0",
+        // The go-librespot control API is UNAUTHENTICATED and the client only
+        // ever connects via 127.0.0.1; the sidecar runs in the SAME container
+        // as the bot, so bind to loopback rather than exposing it on 0.0.0.0.
+        apiAddress: "127.0.0.1",
         apiPort: this.apiPort,
-        callbackPort: DEFAULT_CALLBACK_PORT,
+        callbackPort: this.callbackPort,
       });
       writeFileSync(posixPath.join(this.opts.configDir, "config.yml"), yml, "utf8");
 

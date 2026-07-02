@@ -21,6 +21,37 @@ vi.mock("./binary.js", () => ({
   checkGoLibrespotAvailable: async () => bin.supported && !!bin.path,
 }));
 
+// Capture options the DEFAULT factory hands to the real GoLibrespotBackend so
+// we can assert per-bot ports (Fix 3) are threaded through. Every other test
+// injects its own backendFactory, so this mock is inert for them.
+const goLibrespotCtor = vi.hoisted(() => vi.fn());
+vi.mock("./go-librespot.js", async () => {
+  const { EventEmitter } = await import("node:events");
+  return {
+    GoLibrespotBackend: class extends EventEmitter {
+      constructor(opts: any) {
+        super();
+        goLibrespotCtor(opts);
+      }
+      async start(): Promise<void> {}
+      isReady(): boolean {
+        return true;
+      }
+      stop(): void {}
+      async playTrack(): Promise<void> {}
+      async pause(): Promise<void> {}
+      async resume(): Promise<void> {}
+      async seek(): Promise<void> {}
+      getPcmStream(): any {
+        return null;
+      }
+      getPositionMs(): number {
+        return 0;
+      }
+    },
+  };
+});
+
 // Import AFTER vi.mock so the mocked binary module is used.
 const { SpotifyController } = await import("./controller.js");
 
@@ -399,5 +430,24 @@ describe("SpotifyController.stop", () => {
     const { ctrl, be } = makeCtrl();
     expect(() => ctrl.stop()).not.toThrow();
     expect(be.stopCalls).toBe(0);
+  });
+});
+
+describe("SpotifyController per-bot ports (Fix 3)", () => {
+  it("threads apiPort + callbackPort into the default GoLibrespotBackend", async () => {
+    goLibrespotCtor.mockClear();
+    // No injected backendFactory → the controller builds the (mocked) real backend.
+    const ctrl = new SpotifyController({
+      config: cfg(),
+      workDir: "/tmp/work",
+      configDir: "/tmp/cfg",
+      logger: silentLogger,
+      apiPort: 3712,
+      callbackPort: 8712,
+    });
+    expect(await ctrl.ensureStarted()).toBe(true);
+    expect(goLibrespotCtor).toHaveBeenCalledWith(
+      expect.objectContaining({ apiPort: 3712, callbackPort: 8712 }),
+    );
   });
 });

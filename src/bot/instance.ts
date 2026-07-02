@@ -31,6 +31,35 @@ import type { SpotifyTrackEndedEvent } from "../music/spotify/backend.js";
 /** Reply sent when a non-admin invokes an admin-only chat command. */
 export const COMMAND_DENIED_MESSAGE = "⛔ 需要管理员权限（该命令仅限管理员服务器组）";
 
+/** Fallback message when Spotify audio can't be served (backend unavailable
+ *  OR a per-track playTrack failure against a dead/failed sidecar). */
+const SPOTIFY_UNAVAILABLE_MESSAGE =
+  "⚠️ Spotify 播放尚未启用（需要 librespot 音频后端，将在后续版本支持）。";
+
+/** FNV-1a deterministic string hash (unsigned 32-bit). Stable across restarts
+ *  and processes, unlike a random/insertion-order value — used to derive
+ *  per-bot go-librespot ports. */
+function stableHash(s: string): number {
+  let h = 2166136261;
+  for (let i = 0; i < s.length; i++) {
+    h ^= s.charCodeAt(i);
+    h = Math.imul(h, 16777619);
+  }
+  return h >>> 0;
+}
+
+/**
+ * STABLE per-bot go-librespot ports derived from the bot id. A second
+ * Spotify-enabled bot's sidecar must not collide on the control-API or OAuth
+ * callback ports; deriving them from the id keeps them fixed across restarts.
+ * The two ranges (37xx / 87xx) are disjoint so the API and callback ports for
+ * a given bot never clash with each other.
+ */
+export function spotifyPortsForBotId(id: string): { apiPort: number; callbackPort: number } {
+  const off = stableHash(id) % 1000;
+  return { apiPort: 3700 + off, callbackPort: 8700 + off };
+}
+
 export interface BotInstanceOptions {
   id: string;
   name: string;
@@ -54,6 +83,8 @@ export interface BotInstanceOptions {
     workDir: string;
     configDir: string;
     logger: Logger;
+    apiPort: number;
+    callbackPort: number;
   }) => SpotifyController;
 }
 
@@ -136,6 +167,10 @@ export class BotInstance extends EventEmitter {
       options.spotifyDataDir ?? path.join(process.cwd(), "data", "spotify");
     const spotifyWorkDir = path.join(spotifyBase, this.id, "work");
     const spotifyConfigDir = path.join(spotifyBase, this.id, "config");
+    // Distinct, stable per-bot ports so a second Spotify-enabled bot's sidecar
+    // doesn't fail to bind the go-librespot control API / OAuth callback.
+    const { apiPort: spotifyApiPort, callbackPort: spotifyCallbackPort } =
+      spotifyPortsForBotId(this.id);
     const buildController =
       options.spotifyControllerFactory ??
       ((o) => new SpotifyController({ ...o }));
@@ -144,6 +179,8 @@ export class BotInstance extends EventEmitter {
       workDir: spotifyWorkDir,
       configDir: spotifyConfigDir,
       logger: this.logger,
+      apiPort: spotifyApiPort,
+      callbackPort: spotifyCallbackPort,
     });
 
     const profileConfig = this.database.getProfileConfig(this.id);
@@ -659,15 +696,20 @@ export class BotInstance extends EventEmitter {
         const ready = await this.spotifyController.ensureStarted();
         if (!ready) {
           this.logger.info({ songId: song.id, name: song.name }, "Spotify backend unavailable — skipping");
-          await this.tsClient.sendTextMessage(
-            "⚠️ Spotify 播放尚未启用（需要 librespot 音频后端，将在后续版本支持）。"
-          );
+          await this.tsClient.sendTextMessage(SPOTIFY_UNAVAILABLE_MESSAGE);
           return false;
         }
         // `spotify:track:<id>` is the URI. go-librespot decodes into a SINGLE
         // continuous FIFO/PCM stream, so per-track playback is just a REST
-        // playTrack — the stream keeps flowing.
-        await this.spotifyController.playTrack(result.url);
+        // playTrack — the stream keeps flowing. A false result means the
+        // sidecar failed the play (dead/errored backend): never attach the
+        // player to a dead stream — send the same fallback and skip.
+        const played = await this.spotifyController.playTrack(result.url);
+        if (!played) {
+          this.logger.info({ songId: song.id, name: song.name }, "Spotify playTrack failed — skipping");
+          await this.tsClient.sendTextMessage(SPOTIFY_UNAVAILABLE_MESSAGE);
+          return false;
+        }
         // Only ATTACH the persistent PCM stream when the player is NOT already
         // attached to it. Gate on the player's ACTUAL external state, not the
         // currentSourceIsSpotify flag: command paths (cmdPlay/cmdPlaylist/…)
@@ -681,8 +723,18 @@ export class BotInstance extends EventEmitter {
           this.player.playPcmStream(this.spotifyController.getPcmStream(), {
             // The sidecar PCM pipe is long-lived; per-track end arrives via the
             // controller "trackEnded" WS event, not stream EOF. A real EOF here
-            // means the sidecar died — surface it rather than silently swallow.
-            onExternalEnd: () => this.logger.warn("Spotify PCM stream ended unexpectedly"),
+            // means the sidecar died mid-session — RECOVER instead of emitting
+            // silence forever (which would also leave the player stuck in
+            // externalMode, so the re-attach gate skips every future track).
+            // Tear the controller down (next ensureStarted() rebuilds a fresh
+            // backend), stop the player (drop external mode so it re-attaches),
+            // and clear the flag so a non-spotify track isn't mis-handled.
+            onExternalEnd: () => {
+              this.logger.warn("Spotify PCM stream ended unexpectedly — recovering");
+              this.spotifyController.stop();
+              this.player.stop();
+              this.currentSourceIsSpotify = false;
+            },
           });
         }
         this.currentSourceIsSpotify = true;
