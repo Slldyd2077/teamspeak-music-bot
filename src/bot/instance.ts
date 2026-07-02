@@ -15,7 +15,7 @@ import {
 import { parseSongRef, parseSelectionIndex } from "./song-ref.js";
 import type { Logger } from "../logger.js";
 import type { BotDatabase, ProfileConfig } from "../data/database.js";
-import type { BotConfig } from "../data/config.js";
+import type { BotConfig, SpotifyConfig } from "../data/config.js";
 import { BotProfileManager } from "./profile.js";
 import type { AvatarStore } from "../data/avatars.js";
 import {
@@ -24,6 +24,9 @@ import {
   shouldResumeOnReturn,
 } from "./auto-pause.js";
 import { isSpotifyUri } from "../music/spotify/webapi.js";
+import path from "node:path";
+import { SpotifyController } from "../music/spotify/controller.js";
+import type { SpotifyTrackEndedEvent } from "../music/spotify/backend.js";
 
 /** Reply sent when a non-admin invokes an admin-only chat command. */
 export const COMMAND_DENIED_MESSAGE = "⛔ 需要管理员权限（该命令仅限管理员服务器组）";
@@ -43,6 +46,15 @@ export interface BotInstanceOptions {
   config: BotConfig;
   logger: Logger;
   avatarStore: AvatarStore;
+  /** Base dir (under DATA_DIR) for per-bot go-librespot work/config trees. */
+  spotifyDataDir?: string;
+  /** Test seam: build a fake controller instead of a real go-librespot one. */
+  spotifyControllerFactory?: (o: {
+    config: SpotifyConfig;
+    workDir: string;
+    configDir: string;
+    logger: Logger;
+  }) => SpotifyController;
 }
 
 export interface BotStatus {
@@ -66,6 +78,7 @@ export class BotInstance extends EventEmitter {
 
   private tsClient: TS3Client;
   private player: AudioPlayer;
+  private spotifyController: SpotifyController;
   private queue: PlayQueue;
   private neteaseProvider: MusicProvider;
   private qqProvider: MusicProvider;
@@ -85,6 +98,9 @@ export class BotInstance extends EventEmitter {
   private idleTimer: ReturnType<typeof setTimeout> | null = null;
   private channelUserCount = 0;
   private autoPaused = false;
+  /** True while the audible track is served by the Spotify sidecar (external
+   *  PCM mode) — drives fence/handoff decisions in resolveAndPlay + cmdStop. */
+  private currentSourceIsSpotify = false;
   private profileManager: BotProfileManager;
   private isFmMode = false;
   private fmProvider: MusicProvider | null = null;
@@ -113,6 +129,22 @@ export class BotInstance extends EventEmitter {
     this.tsClient = new TS3Client(options.tsOptions, this.logger);
     this.player = new AudioPlayer(this.logger);
     this.queue = new PlayQueue();
+
+    // One long-lived Spotify sidecar controller per bot. Construction is
+    // cheap and side-effect-free — nothing spawns until ensureStarted().
+    const spotifyBase =
+      options.spotifyDataDir ?? path.join(process.cwd(), "data", "spotify");
+    const spotifyWorkDir = path.join(spotifyBase, this.id, "work");
+    const spotifyConfigDir = path.join(spotifyBase, this.id, "config");
+    const buildController =
+      options.spotifyControllerFactory ??
+      ((o) => new SpotifyController({ ...o }));
+    this.spotifyController = buildController({
+      config: this.config.spotify,
+      workDir: spotifyWorkDir,
+      configDir: spotifyConfigDir,
+      logger: this.logger,
+    });
 
     const profileConfig = this.database.getProfileConfig(this.id);
     this.profileManager = new BotProfileManager(
@@ -153,6 +185,19 @@ export class BotInstance extends EventEmitter {
       this.logger.error({ err }, "Player error");
       this.playNext().catch((err2) => {
         this.logger.error({ err: err2 }, "playNext failed after player error");
+      });
+    });
+
+    // Spotify advances exclusively via the sidecar's WebSocket "trackEnded"
+    // (the continuous go-librespot→ffmpeg pipe never EOFs per track, so the
+    // player's own underrun "trackEnd" is suppressed in external mode). Guard
+    // on the current song being spotify so a stray event can't double-advance
+    // a URL track; playNext()'s isAdvancing guard covers any residual race.
+    this.spotifyController.on("trackEnded", (_e: SpotifyTrackEndedEvent) => {
+      if (this.queue.current()?.platform !== "spotify") return;
+      this.logger.debug("Spotify track ended, advancing queue");
+      this.playNext().catch((err) => {
+        this.logger.error({ err }, "playNext failed after spotify trackEnded");
       });
     });
   }
@@ -205,6 +250,8 @@ export class BotInstance extends EventEmitter {
       // this.connected was never flipped to true. Previously this handler
       // short-circuited on !this.connected, leaving player stuck as "playing".
       this.connected = false;
+      this.spotifyController.stop();
+      this.currentSourceIsSpotify = false;
       this.player.stop();
       this.queue.clear();
       this.sweepLocalAudio("disconnected");
@@ -288,6 +335,8 @@ export class BotInstance extends EventEmitter {
 
   disconnect(): void {
     this._cancelIdleTimer();
+    this.spotifyController.stop();
+    this.currentSourceIsSpotify = false;
     this.player.stop();
     this.queue.clear();
     this.sweepLocalAudio("disconnected");
@@ -310,6 +359,10 @@ export class BotInstance extends EventEmitter {
     this.config.autoPauseOnEmpty = enabled;
     if (!enabled && this.autoPaused && this.player.getState() === "paused") {
       this.player.resume();
+      if (this.queue.current()?.platform === "spotify") {
+        this.spotifyController.resume().catch((err) =>
+          this.logger.warn({ err }, "Spotify resume failed (auto-pause disabled)"));
+      }
       this.autoPaused = false;
       this.emit("stateChange");
     }
@@ -343,10 +396,21 @@ export class BotInstance extends EventEmitter {
     );
     if (action === "pause") {
       this.player.pause();
+      // Occupancy paths drive player.pause()/resume() DIRECTLY (bypassing the
+      // cmd handlers), so they must ALSO stop/resume the sidecar — else it
+      // keeps decoding into an empty channel.
+      if (this.queue.current()?.platform === "spotify") {
+        this.spotifyController.pause().catch((err) =>
+          this.logger.warn({ err }, "Spotify pause failed (occupancy)"));
+      }
       this.autoPaused = true;
       this.emit("stateChange");
     } else if (action === "resume") {
       this.player.resume();
+      if (this.queue.current()?.platform === "spotify") {
+        this.spotifyController.resume().catch((err) =>
+          this.logger.warn({ err }, "Spotify resume failed (occupancy)"));
+      }
       this.autoPaused = false;
       this.emit("stateChange");
     }
@@ -587,16 +651,61 @@ export class BotInstance extends EventEmitter {
         );
         return false;
       }
-      // Stage 1: Spotify metadata works but audio is not wired yet. getSongUrl
-      // returns a `spotify:` sentinel — never hand it to ffmpeg. Tell the user
-      // and skip so the queue keeps moving. `sendTextMessage` is the same
-      // channel-message helper the command handlers use elsewhere in this file.
+      // Stage 2: a `spotify:` sentinel URI means the go-librespot sidecar
+      // serves the audio, NOT ffmpeg. Start the per-bot sidecar on demand; if
+      // it can't run (disabled / non-Linux / binary missing) keep the Stage-1
+      // fallback message + skip so the queue keeps moving.
       if (isSpotifyUri(result.url)) {
-        this.logger.info({ songId: song.id, name: song.name }, "Spotify playback not enabled yet — skipping");
-        await this.tsClient.sendTextMessage(
-          "⚠️ Spotify 播放尚未启用（需要 librespot 音频后端，将在后续版本支持）。"
-        );
-        return false;
+        const ready = await this.spotifyController.ensureStarted();
+        if (!ready) {
+          this.logger.info({ songId: song.id, name: song.name }, "Spotify backend unavailable — skipping");
+          await this.tsClient.sendTextMessage(
+            "⚠️ Spotify 播放尚未启用（需要 librespot 音频后端，将在后续版本支持）。"
+          );
+          return false;
+        }
+        // `spotify:track:<id>` is the URI. go-librespot decodes into a SINGLE
+        // continuous FIFO/PCM stream, so per-track playback is just a REST
+        // playTrack — the stream keeps flowing.
+        await this.spotifyController.playTrack(result.url);
+        // C4: only ATTACH the persistent PCM stream when coming from a
+        // non-spotify source. playPcmStream internally fences the prior
+        // url-ffmpeg (so NO player.stop() here). On a spotify→spotify handoff
+        // the sidecar changes tracks into the SAME FIFO — re-attaching would
+        // tear down and re-subscribe the shared stream and silence playback.
+        if (!this.currentSourceIsSpotify) {
+          this.player.playPcmStream(this.spotifyController.getPcmStream(), {
+            // The sidecar PCM pipe is long-lived; per-track end arrives via the
+            // controller "trackEnded" WS event, not stream EOF. A real EOF here
+            // means the sidecar died — recovery is the controller's job.
+            onExternalEnd: () => {},
+          });
+        }
+        this.currentSourceIsSpotify = true;
+        song.url = result.url;
+        // No trial clip for Spotify — full-track duration only (the near-end
+        // stall watchdog is disabled for the external stream anyway).
+        this.effectiveDuration = song.duration;
+        this.autoPaused = false;
+        this.database.addPlayHistory({
+          botId: this.id,
+          songId: song.id,
+          songName: song.name,
+          artist: song.artist,
+          album: song.album,
+          platform: song.platform,
+          coverUrl: song.coverUrl,
+        });
+        await this.syncProfileToSong(song);
+        this.emit("stateChange");
+        return true;
+      }
+      // Non-Spotify track: if we were on Spotify, pause the sidecar so it stops
+      // decoding ahead before the URL ffmpeg reclaims the PCM buffer.
+      if (this.currentSourceIsSpotify) {
+        this.spotifyController.pause().catch((err) =>
+          this.logger.warn({ err }, "Failed to pause Spotify sidecar on source switch"));
+        this.currentSourceIsSpotify = false;
       }
       song.url = result.url;
       // 试听片段用试听时长（让 player nearEnd 正确触发自动切歌）；完整曲回退 song.duration
@@ -767,6 +876,10 @@ export class BotInstance extends EventEmitter {
 
   private cmdPause(): string {
     this.player.pause();
+    if (this.queue.current()?.platform === "spotify") {
+      this.spotifyController.pause().catch((err) =>
+        this.logger.warn({ err }, "Spotify pause failed"));
+    }
     // User-initiated pause — clear auto-pause so occupancy won't auto-resume it.
     this.autoPaused = false;
     this.emit("stateChange");
@@ -775,6 +888,10 @@ export class BotInstance extends EventEmitter {
 
   private cmdResume(): string {
     this.player.resume();
+    if (this.queue.current()?.platform === "spotify") {
+      this.spotifyController.resume().catch((err) =>
+        this.logger.warn({ err }, "Spotify resume failed"));
+    }
     // User-initiated resume — drop any auto-pause flag.
     this.autoPaused = false;
     this.emit("stateChange");
@@ -782,6 +899,12 @@ export class BotInstance extends EventEmitter {
   }
 
   private cmdStop(): string {
+    // Read the current song BEFORE queue.clear() so we can tell whether the
+    // sidecar needs stopping.
+    if (this.queue.current()?.platform === "spotify") {
+      this.spotifyController.stop();
+    }
+    this.currentSourceIsSpotify = false;
     this.player.stop();
     this.autoPaused = false;
     this.queue.clear();
@@ -842,6 +965,8 @@ export class BotInstance extends EventEmitter {
   }
 
   private cmdClear(): string {
+    this.spotifyController.stop();
+    this.currentSourceIsSpotify = false;
     this.player.stop();
     this.queue.clear();
     this.sweepLocalAudio("queue_cleared");
@@ -1229,6 +1354,20 @@ export class BotInstance extends EventEmitter {
 
   getPlayer(): AudioPlayer {
     return this.player;
+  }
+
+  /**
+   * Route a seek to the Spotify sidecar for a spotify track (its PCM stream is
+   * external — AudioPlayer.seek would respawn ffmpeg on the `spotify:` sentinel
+   * and collide with the running stream), otherwise to the URL player.
+   */
+  seek(ms: number): void {
+    if (this.queue.current()?.platform === "spotify") {
+      this.spotifyController.seek(ms).catch((err) =>
+        this.logger.warn({ err }, "Spotify seek failed"));
+      return;
+    }
+    this.player.seek(ms);
   }
 
   getQueueManager(): PlayQueue {

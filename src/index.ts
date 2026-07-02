@@ -29,6 +29,7 @@ const LOG_DIR = path.join(DATA_DIR, "logs");
 const COOKIE_DIR = path.join(DATA_DIR, "cookies");
 const AVATAR_DIR = path.join(DATA_DIR, "avatars");
 const LOCAL_AUDIO_DIR = path.join(DATA_DIR, "local-audio");
+const SPOTIFY_DATA_DIR = path.join(DATA_DIR, "spotify");
 const STATIC_DIR = path.join(ROOT_DIR, "web", "dist");
 
 async function main() {
@@ -94,7 +95,8 @@ async function main() {
     CONFIG_PATH,
     localProvider,
     kugouProvider,
-    spotifyProvider
+    spotifyProvider,
+    SPOTIFY_DATA_DIR
   );
   await botManager.loadSavedBots();
 

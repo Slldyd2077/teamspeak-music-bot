@@ -1,5 +1,6 @@
 import crypto from "node:crypto";
 import { EventEmitter } from "node:events";
+import path from "node:path";
 import {
   BotInstance,
   type BotInstanceOptions,
@@ -77,6 +78,7 @@ export class BotManager extends EventEmitter {
   private localProvider: MusicProvider;
   private kugouProvider: MusicProvider;
   private spotifyProvider: MusicProvider;
+  private spotifyDataDir: string;
   private database: BotDatabase;
   private config: BotConfig;
   private logger: Logger;
@@ -96,7 +98,8 @@ export class BotManager extends EventEmitter {
     configPath: string,
     localProvider?: MusicProvider,
     kugouProvider?: MusicProvider,
-    spotifyProvider?: MusicProvider
+    spotifyProvider?: MusicProvider,
+    spotifyDataDir?: string
   ) {
     super();
     this.neteaseProvider = neteaseProvider;
@@ -106,6 +109,7 @@ export class BotManager extends EventEmitter {
     this.localProvider = localProvider ?? neteaseProvider;
     this.kugouProvider = kugouProvider ?? neteaseProvider;
     this.spotifyProvider = spotifyProvider ?? neteaseProvider;
+    this.spotifyDataDir = spotifyDataDir ?? path.join(process.cwd(), "data", "spotify");
     // Let the local provider see which uploads are still referenced by any
     // bot's queue, so it never deletes a file another queue/bot still needs.
     const referenceable = this.localProvider as Partial<{
@@ -149,6 +153,7 @@ export class BotManager extends EventEmitter {
       config: this.config,
       logger: this.logger,
       avatarStore: this.avatarStore,
+      spotifyDataDir: this.spotifyDataDir,
     });
 
     this.bots.set(id, bot);
@@ -290,6 +295,7 @@ export class BotManager extends EventEmitter {
         config: this.config,
         logger: this.logger,
         avatarStore: this.avatarStore,
+        spotifyDataDir: this.spotifyDataDir,
       });
       this.bots.set(id, bot);
       this.emit("botInstance", bot);
@@ -345,6 +351,7 @@ export class BotManager extends EventEmitter {
         config: this.config,
         logger: this.logger,
         avatarStore: this.avatarStore,
+        spotifyDataDir: this.spotifyDataDir,
       });
 
       this.bots.set(saved.id, bot);

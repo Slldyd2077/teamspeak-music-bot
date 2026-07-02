@@ -198,7 +198,7 @@ export function createPlayerRouter(
           .json({ error: "position must be a finite non-negative number" });
         return;
       }
-      bot.getPlayer().seek(position);
+      bot.seek(position);
       res.json({ message: `Seeked to ${Math.floor(position)}s`, seekOffset: position });
     } catch (err) {
       res.status(500).json({ error: (err as Error).message });

@@ -218,3 +218,322 @@ describe("BotInstance.getProviderFor — spotify routing", () => {
     expect(BotInstance.prototype.getProviderFor.call(ctx, "spotify" as any)).toBe(spotify);
   });
 });
+
+// --- Spotify orchestration (Task 7 + Correction C4) ------------------------
+// These drive the REAL prototype methods on a hand-built ctx (the file's
+// established `.call(ctx)` style) and assert the routing DECISIONS. Live audio
+// is not testable here. C4 supersedes the brief where they conflict: switching
+// a URL track -> spotify does NOT call player.stop() (playPcmStream fences the
+// prior ffmpeg internally), and a spotify -> spotify handoff does NOT re-attach
+// the persistent PCM stream (playPcmStream is called ONCE across both tracks).
+
+const resolveAndPlay = BotInstance.prototype.resolveAndPlay as (
+  this: unknown,
+  song: any,
+) => Promise<boolean>;
+const setupPlayerEvents = (BotInstance.prototype as any).setupPlayerEvents as (
+  this: unknown,
+) => void;
+const cmdPause = (BotInstance.prototype as any).cmdPause as (this: unknown) => string;
+const cmdResume = (BotInstance.prototype as any).cmdResume as (this: unknown) => string;
+const cmdStop = (BotInstance.prototype as any).cmdStop as (this: unknown) => string;
+const handleOccupancy = (BotInstance.prototype as any).handleOccupancy as (
+  this: unknown,
+  userCount: number,
+) => void;
+const seek = (BotInstance.prototype as any).seek as (this: unknown, ms: number) => void;
+
+function makeController() {
+  return {
+    ensureStarted: vi.fn(async () => true),
+    playTrack: vi.fn(async () => true),
+    getPcmStream: vi.fn(() => ({ kind: "pcm" } as any)),
+    pause: vi.fn(async () => {}),
+    resume: vi.fn(async () => {}),
+    seek: vi.fn(async () => {}),
+    stop: vi.fn(() => {}),
+    on: vi.fn(),
+  };
+}
+function makePlayer() {
+  return {
+    play: vi.fn(),
+    stop: vi.fn(),
+    playPcmStream: vi.fn(),
+    pause: vi.fn(),
+    resume: vi.fn(),
+    seek: vi.fn(),
+  };
+}
+function makeResolveCtx(opts: {
+  controller: ReturnType<typeof makeController>;
+  player: ReturnType<typeof makePlayer>;
+  url: string;
+  currentSourceIsSpotify?: boolean;
+}) {
+  return {
+    connected: true,
+    config: {},
+    id: "bot1",
+    voteSkipUsers: new Set<string>(),
+    autoPaused: false,
+    currentSourceIsSpotify: opts.currentSourceIsSpotify ?? false,
+    effectiveDuration: undefined,
+    logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
+    tsClient: { sendTextMessage: vi.fn(async () => {}) },
+    database: { addPlayHistory: vi.fn() },
+    spotifyController: opts.controller,
+    player: opts.player,
+    getProviderFor: vi.fn(() => ({ getSongUrl: async () => ({ url: opts.url }) })),
+    syncProfileToSong: vi.fn(async () => {}),
+    emit: vi.fn(),
+  } as any;
+}
+function spotifySong() {
+  return {
+    id: "abc",
+    name: "Song",
+    artist: "Artist",
+    album: "Album",
+    platform: "spotify",
+    coverUrl: "c",
+    duration: 200,
+    url: "",
+  };
+}
+
+describe("BotInstance.resolveAndPlay — Spotify routing (C4)", () => {
+  it("routes a spotify song to controller.playTrack + player.playPcmStream, not player.play", async () => {
+    const controller = makeController();
+    const player = makePlayer();
+    const ctx = makeResolveCtx({ controller, player, url: "spotify:track:abc" });
+
+    const ok = await resolveAndPlay.call(ctx, spotifySong());
+
+    expect(ok).toBe(true);
+    expect(controller.ensureStarted).toHaveBeenCalledTimes(1);
+    expect(controller.playTrack).toHaveBeenCalledWith("spotify:track:abc");
+    expect(player.playPcmStream).toHaveBeenCalledTimes(1);
+    expect(player.playPcmStream.mock.calls[0][0]).toEqual({ kind: "pcm" });
+    expect(player.play).not.toHaveBeenCalled();
+    // C4: playPcmStream fences the prior url-ffmpeg internally — no player.stop().
+    expect(player.stop).not.toHaveBeenCalled();
+    expect(ctx.currentSourceIsSpotify).toBe(true);
+    expect(ctx.database.addPlayHistory).toHaveBeenCalledTimes(1);
+    expect(ctx.emit).toHaveBeenCalledWith("stateChange");
+  });
+
+  it("returns false + sends the Stage-1 fallback when the backend is unavailable", async () => {
+    const controller = makeController();
+    controller.ensureStarted = vi.fn(async () => false);
+    const player = makePlayer();
+    const ctx = makeResolveCtx({ controller, player, url: "spotify:track:abc" });
+
+    const ok = await resolveAndPlay.call(ctx, spotifySong());
+
+    expect(ok).toBe(false);
+    expect(ctx.tsClient.sendTextMessage).toHaveBeenCalledTimes(1);
+    expect(controller.playTrack).not.toHaveBeenCalled();
+    expect(player.playPcmStream).not.toHaveBeenCalled();
+    expect(player.play).not.toHaveBeenCalled();
+  });
+
+  it("attaches the PCM stream once (no player.stop) when switching URL -> spotify", async () => {
+    const controller = makeController();
+    const player = makePlayer();
+    const ctx = makeResolveCtx({
+      controller, player, url: "spotify:track:abc", currentSourceIsSpotify: false,
+    });
+
+    await resolveAndPlay.call(ctx, spotifySong());
+
+    // C4: NO player.stop() on the URL -> spotify transition.
+    expect(player.stop).not.toHaveBeenCalled();
+    expect(player.playPcmStream).toHaveBeenCalledTimes(1);
+  });
+
+  it("does NOT re-attach the stream on a spotify -> spotify handoff (playPcmStream called once across two tracks)", async () => {
+    const controller = makeController();
+    const player = makePlayer();
+    const ctx = makeResolveCtx({
+      controller, player, url: "spotify:track:abc", currentSourceIsSpotify: false,
+    });
+
+    // First spotify track: coming from a URL/idle source -> attach.
+    await resolveAndPlay.call(ctx, spotifySong());
+    expect(ctx.currentSourceIsSpotify).toBe(true);
+    // Second spotify track: go-librespot changes tracks into the SAME FIFO.
+    await resolveAndPlay.call(ctx, spotifySong());
+
+    expect(player.playPcmStream).toHaveBeenCalledTimes(1); // NOT re-attached
+    expect(controller.playTrack).toHaveBeenCalledTimes(2); // both tracks played
+    expect(player.stop).not.toHaveBeenCalled();
+  });
+
+  it("pauses the sidecar and clears the flag when switching to a non-spotify track", async () => {
+    const controller = makeController();
+    const player = makePlayer();
+    const song = { ...spotifySong(), platform: "netease" };
+    const ctx = makeResolveCtx({
+      controller, player, url: "http://cdn/x.mp3", currentSourceIsSpotify: true,
+    });
+
+    const ok = await resolveAndPlay.call(ctx, song);
+
+    expect(ok).toBe(true);
+    expect(controller.pause).toHaveBeenCalledTimes(1);
+    expect(ctx.currentSourceIsSpotify).toBe(false);
+    expect(player.play).toHaveBeenCalledWith("http://cdn/x.mp3", 0, 200);
+    expect(player.playPcmStream).not.toHaveBeenCalled();
+  });
+});
+
+describe("BotInstance.setupPlayerEvents — controller trackEnded wiring", () => {
+  function makeEventCtx(currentPlatform: string) {
+    return {
+      spotifyController: { on: vi.fn() },
+      player: { on: vi.fn() },
+      queue: { current: vi.fn(() => ({ platform: currentPlatform })) },
+      logger: { debug: vi.fn(), error: vi.fn() },
+      playNext: vi.fn(async () => true),
+    } as any;
+  }
+  function trackEndedHandler(ctx: any) {
+    const call = ctx.spotifyController.on.mock.calls.find(
+      (c: any[]) => c[0] === "trackEnded",
+    );
+    expect(call).toBeDefined();
+    return call[1] as (e: any) => void;
+  }
+
+  it("advances via playNext when the current song is spotify", () => {
+    const ctx = makeEventCtx("spotify");
+    setupPlayerEvents.call(ctx);
+    trackEndedHandler(ctx)({ uri: "spotify:track:x", reason: "ended" });
+    expect(ctx.playNext).toHaveBeenCalledTimes(1);
+  });
+
+  it("ignores controller trackEnded when the current song is not spotify", () => {
+    const ctx = makeEventCtx("netease");
+    setupPlayerEvents.call(ctx);
+    trackEndedHandler(ctx)({ uri: "spotify:track:x", reason: "ended" });
+    expect(ctx.playNext).not.toHaveBeenCalled();
+  });
+});
+
+describe("BotInstance transport delegation — spotify current song", () => {
+  function makeCmdCtx(currentPlatform: string) {
+    return {
+      player: { pause: vi.fn(), resume: vi.fn(), stop: vi.fn() },
+      spotifyController: {
+        pause: vi.fn(async () => {}),
+        resume: vi.fn(async () => {}),
+        stop: vi.fn(() => {}),
+      },
+      queue: { current: vi.fn(() => ({ platform: currentPlatform })), clear: vi.fn() },
+      logger: { warn: vi.fn() },
+      emit: vi.fn(),
+      autoPaused: true,
+      currentSourceIsSpotify: true,
+      sweepLocalAudio: vi.fn(),
+      disableFmMode: vi.fn(),
+      profileManager: { onSongChange: vi.fn(async () => {}) },
+    } as any;
+  }
+
+  it("cmdPause delegates to controller.pause when current is spotify", () => {
+    const ctx = makeCmdCtx("spotify");
+    cmdPause.call(ctx);
+    expect(ctx.player.pause).toHaveBeenCalled();
+    expect(ctx.spotifyController.pause).toHaveBeenCalledTimes(1);
+  });
+
+  it("cmdResume delegates to controller.resume when current is spotify", () => {
+    const ctx = makeCmdCtx("spotify");
+    cmdResume.call(ctx);
+    expect(ctx.player.resume).toHaveBeenCalled();
+    expect(ctx.spotifyController.resume).toHaveBeenCalledTimes(1);
+  });
+
+  it("cmdStop stops the sidecar + player and clears the spotify flag", () => {
+    const ctx = makeCmdCtx("spotify");
+    cmdStop.call(ctx);
+    expect(ctx.spotifyController.stop).toHaveBeenCalledTimes(1);
+    expect(ctx.player.stop).toHaveBeenCalledTimes(1);
+    expect(ctx.queue.clear).toHaveBeenCalledTimes(1);
+    expect(ctx.currentSourceIsSpotify).toBe(false);
+  });
+
+  it("does NOT touch the controller when current is not spotify", () => {
+    const ctx = makeCmdCtx("netease");
+    cmdPause.call(ctx);
+    cmdResume.call(ctx);
+    expect(ctx.spotifyController.pause).not.toHaveBeenCalled();
+    expect(ctx.spotifyController.resume).not.toHaveBeenCalled();
+  });
+});
+
+describe("BotInstance.handleOccupancy — spotify auto-pause delegation (C4)", () => {
+  function makeOccupancyCtx(currentPlatform: string, state: string) {
+    return {
+      player: { getState: () => state, pause: vi.fn(), resume: vi.fn() },
+      spotifyController: { pause: vi.fn(async () => {}), resume: vi.fn(async () => {}) },
+      queue: { current: vi.fn(() => ({ platform: currentPlatform })) },
+      config: { autoPauseOnEmpty: true },
+      autoPaused: false,
+      logger: { warn: vi.fn() },
+      emit: vi.fn(),
+      _scheduleIdleCheck: vi.fn(),
+      _cancelIdleTimer: vi.fn(),
+    } as any;
+  }
+
+  it("delegates pause to the controller when auto-pausing a spotify track (empty channel)", () => {
+    const ctx = makeOccupancyCtx("spotify", "playing");
+    handleOccupancy.call(ctx, 0);
+    expect(ctx.player.pause).toHaveBeenCalledTimes(1);
+    expect(ctx.spotifyController.pause).toHaveBeenCalledTimes(1);
+    expect(ctx.autoPaused).toBe(true);
+  });
+
+  it("delegates resume to the controller when a listener returns to a spotify track", () => {
+    const ctx = makeOccupancyCtx("spotify", "paused");
+    ctx.autoPaused = true;
+    handleOccupancy.call(ctx, 1);
+    expect(ctx.player.resume).toHaveBeenCalledTimes(1);
+    expect(ctx.spotifyController.resume).toHaveBeenCalledTimes(1);
+    expect(ctx.autoPaused).toBe(false);
+  });
+
+  it("does NOT touch the controller when auto-pausing a non-spotify track", () => {
+    const ctx = makeOccupancyCtx("netease", "playing");
+    handleOccupancy.call(ctx, 0);
+    expect(ctx.player.pause).toHaveBeenCalledTimes(1);
+    expect(ctx.spotifyController.pause).not.toHaveBeenCalled();
+  });
+});
+
+describe("BotInstance.seek — spotify routing (C4)", () => {
+  function makeSeekCtx(currentPlatform: string) {
+    return {
+      queue: { current: vi.fn(() => ({ platform: currentPlatform })) },
+      spotifyController: { seek: vi.fn(async () => {}) },
+      player: { seek: vi.fn() },
+      logger: { warn: vi.fn() },
+    } as any;
+  }
+
+  it("routes seek to the controller for a spotify track", () => {
+    const ctx = makeSeekCtx("spotify");
+    seek.call(ctx, 30);
+    expect(ctx.spotifyController.seek).toHaveBeenCalledWith(30);
+    expect(ctx.player.seek).not.toHaveBeenCalled();
+  });
+
+  it("routes seek to the player for a non-spotify track", () => {
+    const ctx = makeSeekCtx("netease");
+    seek.call(ctx, 30);
+    expect(ctx.player.seek).toHaveBeenCalledWith(30);
+    expect(ctx.spotifyController.seek).not.toHaveBeenCalled();
+  });
+});
