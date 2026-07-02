@@ -5,6 +5,7 @@ import { accessSync, chmodSync, constants, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createOpusEncoder, PCM_FRAME_BYTES, type Encoder } from "./encoder.js";
+import type { Readable } from "node:stream";
 import type { Logger } from "../logger.js";
 
 const require = createRequire(import.meta.url);
@@ -186,6 +187,22 @@ export class AudioPlayer extends EventEmitter {
   // transient underrun never trips it.
   private static readonly MAX_STALL_ATTEMPTS = 3000;
   private currentSongDuration = 0; // 当前歌曲总时长（秒）
+
+  // --- External PCM mode (Stage 2: go-librespot Spotify sidecar) ---
+  // When true, PCM arrives from a long-lived external Readable instead of a
+  // per-URL ffmpeg: this.ffmpeg stays null, and the underrun-driven trackEnd
+  // branches are suppressed (advance is driven by the controller, not EOF).
+  //
+  // CORRECTION C2: externalStream is the backend's LONG-LIVED, SHARED ffmpeg
+  // stdout (one stream reused across every track). Teardown must DETACH (remove
+  // the listeners we added + pause), never destroy it. We keep references to the
+  // exact handler functions so detach can removeListener precisely.
+  private externalMode = false;
+  private externalStream: Readable | null = null;
+  private onExternalEnd: (() => void) | null = null;
+  private externalDataHandler: ((chunk: Buffer) => void) | null = null;
+  private externalEndHandler: (() => void) | null = null;
+  private externalErrorHandler: ((err: Error) => void) | null = null;
 
   constructor(logger: Logger) {
     super();
@@ -390,6 +407,108 @@ export class AudioPlayer extends EventEmitter {
     this.startFrameLoop();
   }
 
+  /**
+   * External-PCM mode (Stage 2 go-librespot Spotify sidecar).
+   *
+   * Feeds an already-normalized 48kHz/s16le/stereo PCM Readable (the
+   * go-librespot FIFO -> ffmpeg output) straight into the existing pcmBuffer +
+   * 20ms frame loop + Opus encoder + "frame" emission, WITHOUT spawning a
+   * per-URL ffmpeg. The url play() path is left completely untouched.
+   *
+   * Track advance is NOT driven by buffer underrun here (the sidecar stream is
+   * continuous and never EOFs per song); the caller drives advance via the
+   * SpotifyController "trackEnded" WebSocket event. onExternalEnd fires only if
+   * the underlying readable itself ends or errors.
+   *
+   * CORRECTION C2: the readable is the backend's long-lived, SHARED ffmpeg
+   * stdout reused across every track — a gapless track change is just LATER PCM
+   * on this SAME already-attached stream (no re-attach). Teardown DETACHES
+   * (removes our listeners + pauses); it never destroys the shared stream.
+   */
+  playPcmStream(readable: Readable, opts: { onExternalEnd?: () => void } = {}): void {
+    // 1. Fence current playback: stop() bumps sessionId, clears pcmBuffer, kills
+    //    any ffmpeg, and DETACHES (never destroys) any prior external stream.
+    this.stop();
+
+    const currentSessionId = this.sessionId;
+    this.externalMode = true;
+    this.externalStream = readable;
+    this.onExternalEnd = opts.onExternalEnd ?? null;
+    // Leave this.ffmpeg = null; clear currentUrl so seek() cannot respawn ffmpeg.
+    this.currentUrl = "";
+    this.seekOffset = 0;
+    this.framesPlayed = 0;
+    this.healthyFrames = 0;
+    this.ffmpegPaused = false;
+    this.spawnFailed = false;
+    this.emptyFrameAttempts = 0;
+    this.currentSongDuration = 0;
+
+    // Same ingestion + high-water backpressure as the ffmpeg.stdout handler,
+    // but pausing the Readable instead of ffmpeg.stdout. sessionId-guarded so
+    // stale sidecar PCM can't leak into a new track after stop()/skip. Handler
+    // refs are stored so detach can remove exactly these listeners (C2).
+    const onData = (chunk: Buffer): void => {
+      if (this.sessionId !== currentSessionId) return;
+      this.pcmBuffer = Buffer.concat([this.pcmBuffer, chunk]);
+      if (
+        this.pcmBuffer.length > AudioPlayer.BUFFER_HIGH_WATER &&
+        !this.ffmpegPaused &&
+        this.externalStream === readable
+      ) {
+        readable.pause();
+        this.ffmpegPaused = true;
+      }
+    };
+    const onEnd = (): void => {
+      if (this.sessionId !== currentSessionId) return;
+      this.onExternalEnd?.();
+    };
+    const onError = (err: Error): void => {
+      if (this.sessionId !== currentSessionId) return;
+      this.logger.warn({ err }, "External PCM stream error");
+      this.onExternalEnd?.();
+    };
+
+    this.externalDataHandler = onData;
+    this.externalEndHandler = onEnd;
+    this.externalErrorHandler = onError;
+
+    readable.on("data", onData);
+    readable.on("end", onEnd);
+    readable.on("error", onError);
+
+    this.state = "playing";
+    this.startFrameLoop();
+  }
+
+  /**
+   * CORRECTION C2: DETACH, never destroy. The external readable is the backend's
+   * long-lived, SHARED ffmpeg stdout reused across every track; destroying it
+   * would kill the sidecar pipe for all future tracks. Remove only the listeners
+   * WE added and pause the flow so stale PCM stops landing in pcmBuffer, then
+   * clear the external-mode state.
+   */
+  private detachExternalStream(): void {
+    const stream = this.externalStream;
+    if (stream) {
+      if (this.externalDataHandler) stream.off("data", this.externalDataHandler);
+      if (this.externalEndHandler) stream.off("end", this.externalEndHandler);
+      if (this.externalErrorHandler) stream.off("error", this.externalErrorHandler);
+      try {
+        stream.pause();
+      } catch {
+        /* best-effort: never destroy the shared sidecar stream */
+      }
+    }
+    this.externalDataHandler = null;
+    this.externalEndHandler = null;
+    this.externalErrorHandler = null;
+    this.externalStream = null;
+    this.externalMode = false;
+    this.onExternalEnd = null;
+  }
+
   stop(): void {
     // 3. 递增 ID 是最有效的逻辑“隔离墙”
     this.sessionId++; 
@@ -418,6 +537,11 @@ export class AudioPlayer extends EventEmitter {
       cleanupTempDir(this.currentTempDir);
       this.currentTempDir = null;
     }
+
+    // CORRECTION C2: tear down external mode by DETACHING (remove our listeners +
+    // pause) — never destroy the shared, long-lived sidecar stream. The
+    // sessionId++ above already fences the external data/end/error handlers.
+    this.detachExternalStream();
 
     this.ffmpegPaused = false;
     this.spawnFailed = false;
@@ -480,7 +604,10 @@ export class AudioPlayer extends EventEmitter {
         ? (this.currentSongDuration - elapsed) <= 5 // 距离结尾不足5秒
         : true; // 未知时长时保守处理
       
-      if (this.ffmpeg !== null && this.pcmBuffer.length < PCM_FRAME_BYTES) {
+      // External mode: the sidecar PCM stream is continuous and never EOFs per
+      // song; a transient underrun must NOT end the track (advance is driven by
+      // the controller). Skip BOTH drain/stall branches while externalMode.
+      if (!this.externalMode && this.ffmpeg !== null && this.pcmBuffer.length < PCM_FRAME_BYTES) {
         this.emptyFrameAttempts++;
         
         // End the track when FFmpeg has gone silent: quickly if we're near the
@@ -526,7 +653,7 @@ export class AudioPlayer extends EventEmitter {
         this.emptyFrameAttempts = 0;
       }
 
-      if (!this.ffmpeg && this.pcmBuffer.length < PCM_FRAME_BYTES) {
+      if (!this.externalMode && !this.ffmpeg && this.pcmBuffer.length < PCM_FRAME_BYTES) {
         this.frameLoopRunning = false;
         if (this.state !== "idle") {
           this.state = "idle";
@@ -542,13 +669,24 @@ export class AudioPlayer extends EventEmitter {
   }
 
   private sendNextFrame(): void {
-    if (this.pcmBuffer.length < PCM_FRAME_BYTES) return;
+    if (this.pcmBuffer.length < PCM_FRAME_BYTES) {
+      // External mode: the sidecar PCM stream is long-lived and must NOT end on
+      // a transient underrun. Emit an encoded silence frame so the 20ms voice
+      // timeline stays continuous instead of returning (which would desync TS).
+      if (this.externalMode) this.emitSilenceFrame();
+      return;
+    }
     const pcmFrame = this.pcmBuffer.subarray(0, PCM_FRAME_BYTES);
     this.pcmBuffer = this.pcmBuffer.subarray(PCM_FRAME_BYTES);
 
-    if (this.ffmpegPaused && this.pcmBuffer.length < AudioPlayer.BUFFER_LOW_WATER && this.ffmpeg?.stdout) {
-      this.ffmpeg.stdout.resume();
-      this.ffmpegPaused = false;
+    if (this.ffmpegPaused && this.pcmBuffer.length < AudioPlayer.BUFFER_LOW_WATER) {
+      if (this.externalMode && this.externalStream) {
+        this.externalStream.resume();
+        this.ffmpegPaused = false;
+      } else if (this.ffmpeg?.stdout) {
+        this.ffmpeg.stdout.resume();
+        this.ffmpegPaused = false;
+      }
     }
 
     try {
@@ -566,6 +704,16 @@ export class AudioPlayer extends EventEmitter {
     }
   }
 
+  private emitSilenceFrame(): void {
+    try {
+      const opusFrame = this.encoder.encode(Buffer.alloc(PCM_FRAME_BYTES));
+      this.emit("frame", opusFrame);
+      this.framesPlayed++;
+    } catch (err) {
+      this.emit("error", err as Error);
+    }
+  }
+
   private applyVolume(pcm: Buffer): Buffer {
     const factor = volumeToFactor(this.volume);
     // factor === 1 only at volume 100; skip the per-sample loop at full loudness.
@@ -578,8 +726,16 @@ export class AudioPlayer extends EventEmitter {
     return out;
   }
 
+  // NOTE: in external (Spotify sidecar) mode getElapsed() is frame-count based
+  // (framesPlayed includes silence frames emitted on underrun) and therefore
+  // only APPROXIMATE — the authoritative position is the controller's live
+  // status.track.position. This approximation is acceptable for Spotify.
   getElapsed(): number { return this.seekOffset + (this.framesPlayed * FRAME_DURATION_MS) / 1000; }
-  seek(seconds: number): void { 
+  seek(seconds: number): void {
+    // External (Spotify sidecar) mode: local seek is a no-op. Respawning ffmpeg
+    // on the spotify: sentinel would collide with the continuous PCM source;
+    // transport is delegated to the SpotifyController by the caller (Task 7).
+    if (this.externalMode) return;
     if (this.currentUrl && Number.isFinite(seconds) && seconds >= 0) {
       this.play(this.currentUrl, seconds, this.currentSongDuration);
     }

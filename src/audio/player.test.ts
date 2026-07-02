@@ -2,7 +2,9 @@ import { describe, it, expect } from "vitest";
 import { mkdtempSync, writeFileSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { buildFfmpegArgs, shouldUsePowerShellDownload, cleanupTempDir, shouldEndOnStall, volumeToFactor } from "./player.js";
+import { Readable } from "node:stream";
+import { buildFfmpegArgs, shouldUsePowerShellDownload, cleanupTempDir, shouldEndOnStall, volumeToFactor, AudioPlayer } from "./player.js";
+import type { Logger } from "../logger.js";
 
 function getHeadersArg(args: string[]): string {
   const idx = args.indexOf("-headers");
@@ -198,5 +200,194 @@ describe("shouldEndOnStall (#89 mid-track stall watchdog)", () => {
   it("never ends before any threshold", () => {
     expect(shouldEndOnStall(0, true, MAX_EMPTY, MAX_STALL)).toBe(false);
     expect(shouldEndOnStall(10, false, MAX_EMPTY, MAX_STALL)).toBe(false);
+  });
+});
+
+// Minimal stub: AudioPlayer only calls debug/info/warn/error; child() returns self.
+const silentLogger = {
+  debug() {},
+  info() {},
+  warn() {},
+  error() {},
+  fatal() {},
+  trace() {},
+  child() {
+    return silentLogger;
+  },
+} as unknown as Logger;
+
+// A readable we fully control: no underlying source; we push PCM manually and
+// keep it open (never push(null)) to model the long-lived go-librespot sidecar.
+function openPcmReadable(): Readable {
+  return new Readable({ read() {} });
+}
+
+const wait = (ms: number): Promise<void> => new Promise<void>((r) => setTimeout(r, ms));
+const FRAME_BYTES = 3840; // PCM_FRAME_BYTES: 960 samples * 2ch * 2 bytes @48k s16le
+
+describe("AudioPlayer external-PCM mode (playPcmStream)", () => {
+  it("emits Opus 'frame' events from the external PCM stream without spawning ffmpeg", async () => {
+    const player = new AudioPlayer(silentLogger);
+    const frames: Buffer[] = [];
+    player.on("frame", (f) => frames.push(f));
+
+    const stream = openPcmReadable();
+    player.playPcmStream(stream, {});
+    stream.push(Buffer.alloc(FRAME_BYTES * 10)); // ~10 frames of PCM
+
+    await wait(150); // ~7 frame ticks at 20ms
+
+    expect(player.getState()).toBe("playing");
+    expect(frames.length).toBeGreaterThan(0);
+    expect(Buffer.isBuffer(frames[0])).toBe(true);
+    player.stop();
+  });
+
+  it("does NOT emit 'trackEnd' on underrun while external (stream stays open)", async () => {
+    const player = new AudioPlayer(silentLogger);
+    let ended = 0;
+    const frames: Buffer[] = [];
+    player.on("trackEnd", () => ended++);
+    player.on("frame", (f) => frames.push(f));
+
+    const stream = openPcmReadable();
+    player.playPcmStream(stream, {});
+    stream.push(Buffer.alloc(FRAME_BYTES * 2)); // only 2 frames, then underrun
+
+    await wait(200); // long after those 2 frames have drained
+
+    // In the url path, ffmpeg===null + empty buffer would fire trackEnd; here it must not.
+    expect(ended).toBe(0);
+    // Silence frames keep the 20ms timeline alive -> more than the 2 fed frames emitted.
+    expect(frames.length).toBeGreaterThan(2);
+    expect(player.getState()).toBe("playing");
+    player.stop();
+  });
+
+  // CORRECTION C2 (c): stop() DETACHES the shared readable — it must NOT be destroyed
+  // (destroying the sidecar's long-lived ffmpeg stdout would kill it for every future
+  // track). The sessionId bump + listener removal fence stale PCM out of pcmBuffer.
+  it("stop() detaches external mode without destroying the readable, and fences via sessionId", async () => {
+    const player = new AudioPlayer(silentLogger);
+    const frames: Buffer[] = [];
+    player.on("frame", (f) => frames.push(f));
+
+    const stream = openPcmReadable();
+    player.playPcmStream(stream, {});
+    expect(stream.listenerCount("data")).toBe(1);
+    stream.push(Buffer.alloc(FRAME_BYTES * 5));
+    await wait(80);
+
+    player.stop();
+    expect(player.getState()).toBe("idle");
+    // C2: the shared sidecar stream must NOT be destroyed by teardown.
+    expect(stream.destroyed).toBe(false);
+    // Player's listeners are removed on detach (data/end/error).
+    expect(stream.listenerCount("data")).toBe(0);
+    expect(stream.listenerCount("end")).toBe(0);
+    expect(stream.listenerCount("error")).toBe(0);
+
+    const countAtStop = frames.length;
+    // sessionId fence + detached listeners: PCM pushed after stop must not
+    // resurrect the timeline or re-feed pcmBuffer.
+    stream.push(Buffer.alloc(FRAME_BYTES * 5));
+    await wait(80);
+    expect(frames.length).toBe(countAtStop);
+  });
+
+  // CORRECTION C2 (a): a gapless track change is driven by the sidecar pushing LATER
+  // PCM over the SAME already-attached stream. The player must NOT detach/re-attach
+  // (no second playPcmStream) — one persistent data listener serves every track.
+  it("(C2-a) feeds a later chunk over the SAME single attachment — gapless track change, no re-attach", async () => {
+    const player = new AudioPlayer(silentLogger);
+    const frames: Buffer[] = [];
+    player.on("frame", (f) => frames.push(f));
+
+    const stream = openPcmReadable();
+    player.playPcmStream(stream, {});
+    expect(stream.listenerCount("data")).toBe(1); // attached exactly once
+
+    stream.push(Buffer.alloc(FRAME_BYTES * 4)); // "track 1" PCM
+    await wait(120);
+    const afterFirst = frames.length;
+    expect(afterFirst).toBeGreaterThan(0);
+
+    stream.push(Buffer.alloc(FRAME_BYTES * 4)); // sidecar seamlessly rolls into "track 2"
+    await wait(120);
+    expect(frames.length).toBeGreaterThan(afterFirst);
+
+    // Still exactly ONE listener — no detach/re-attach across the handoff.
+    expect(stream.listenerCount("data")).toBe(1);
+    expect(player.getState()).toBe("playing");
+    player.stop();
+  });
+
+  // CORRECTION C2 (b): a second playPcmStream detaches the first (NOT destroyed, and it
+  // stops feeding pcmBuffer) and attaches the second.
+  it("(C2-b) a second playPcmStream detaches the first (not destroyed, stops feeding) and attaches the second", async () => {
+    const player = new AudioPlayer(silentLogger);
+    const frames: Buffer[] = [];
+    player.on("frame", (f) => frames.push(f));
+
+    const first = openPcmReadable();
+    player.playPcmStream(first, {});
+    first.push(Buffer.alloc(FRAME_BYTES * 4));
+    await wait(120);
+    expect(frames.length).toBeGreaterThan(0);
+    expect(first.listenerCount("data")).toBe(1);
+
+    const second = openPcmReadable();
+    player.playPcmStream(second, {}); // fences + detaches `first`, attaches `second`
+
+    // C2: `first` is DETACHED, not destroyed.
+    expect(first.destroyed).toBe(false);
+    // `first` no longer feeds pcmBuffer — its data listener was removed.
+    expect(first.listenerCount("data")).toBe(0);
+    // `second` is now the attached source.
+    expect(second.listenerCount("data")).toBe(1);
+    expect(player.getState()).toBe("playing");
+    player.stop();
+  });
+
+  it("fires onExternalEnd when the readable ends (drives controller-based advance)", async () => {
+    const player = new AudioPlayer(silentLogger);
+    let endedCb = 0;
+
+    const stream = openPcmReadable();
+    player.playPcmStream(stream, { onExternalEnd: () => endedCb++ });
+    stream.push(Buffer.alloc(FRAME_BYTES));
+    await wait(40);
+    stream.push(null); // end-of-stream
+    await wait(40);
+
+    expect(endedCb).toBe(1);
+    player.stop();
+  });
+
+  it("seek() is a local no-op in external mode (never respawns ffmpeg on a spotify sentinel)", async () => {
+    const player = new AudioPlayer(silentLogger);
+    const stream = openPcmReadable();
+    player.playPcmStream(stream, {});
+    stream.push(Buffer.alloc(FRAME_BYTES * 3));
+    await wait(40);
+
+    expect(() => player.seek(30)).not.toThrow();
+    // Still external, still playing — no url-ffmpeg respawn, state unchanged.
+    expect(player.getState()).toBe("playing");
+    player.stop();
+  });
+
+  it("pause()/resume() still gate local emission in external mode (unchanged semantics)", async () => {
+    const player = new AudioPlayer(silentLogger);
+    const stream = openPcmReadable();
+    player.playPcmStream(stream, {});
+    stream.push(Buffer.alloc(FRAME_BYTES * 3));
+    await wait(40);
+
+    player.pause();
+    expect(player.getState()).toBe("paused");
+    player.resume();
+    expect(player.getState()).toBe("playing");
+    player.stop();
   });
 });
