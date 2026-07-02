@@ -179,6 +179,11 @@ describe("SpotifyConnectApi mutating calls", () => {
  * rejection that crashes the backend.
  */
 describe("SpotifyConnectApi C3.6 — mutating calls are resilient (no throw)", () => {
+  // S4.6: transient statuses (404/429) now retry with backoff; inject a no-op
+  // sleep so these swallow-guarantee tests stay instant (no real timers). The
+  // no-throw/swallow contract asserted here is unchanged.
+  const noSleep = async () => {};
+
   function rejectingHttp(status: number) {
     const err: any = new Error(`http ${status}`);
     err.response = { status };
@@ -186,12 +191,18 @@ describe("SpotifyConnectApi C3.6 — mutating calls are resilient (no throw)", (
   }
 
   it("play() does NOT throw on a 404 (no active device)", async () => {
-    const api = new SpotifyConnectApi(token(), { http: rejectingHttp(404) });
+    const api = new SpotifyConnectApi(token(), {
+      http: rejectingHttp(404),
+      sleep: noSleep,
+    });
     await expect(api.play("dev-1", "spotify:track:abc")).resolves.toBeUndefined();
   });
 
   it("play() does NOT throw on a 429 (rate-limited)", async () => {
-    const api = new SpotifyConnectApi(token(), { http: rejectingHttp(429) });
+    const api = new SpotifyConnectApi(token(), {
+      http: rejectingHttp(429),
+      sleep: noSleep,
+    });
     await expect(api.play("dev-1", "spotify:track:abc")).resolves.toBeUndefined();
   });
 
@@ -201,7 +212,10 @@ describe("SpotifyConnectApi C3.6 — mutating calls are resilient (no throw)", (
   });
 
   it("pause/resume/seek do NOT throw on a rejection", async () => {
-    const api = new SpotifyConnectApi(token(), { http: rejectingHttp(404) });
+    const api = new SpotifyConnectApi(token(), {
+      http: rejectingHttp(404),
+      sleep: noSleep,
+    });
     await expect(api.pause("dev-1")).resolves.toBeUndefined();
     await expect(api.resume("dev-1")).resolves.toBeUndefined();
     await expect(api.seek(1000, "dev-1")).resolves.toBeUndefined();
@@ -211,6 +225,81 @@ describe("SpotifyConnectApi C3.6 — mutating calls are resilient (no throw)", (
     const http = makeHttp({ put: vi.fn().mockRejectedValue(new Error("ECONNRESET")) });
     const api = new SpotifyConnectApi(token(), { http });
     await expect(api.play("dev-1", "spotify:track:abc")).resolves.toBeUndefined();
+  });
+});
+
+/**
+ * Task S4.6: bounded retry/backoff on the mutating Connect commands
+ * (spec §4.3/§13 recovery/watchdog). Transient statuses {404,429,500,502,503}
+ * retry up to MAX_ATTEMPTS (3) with exponential backoff; non-transient statuses
+ * are NOT retried. Every path still preserves C3.6 (swallow, never throw). A
+ * no-op injected `sleep` keeps the tests instant (no real timers).
+ */
+describe("SpotifyConnectApi S4.6 — retry/backoff on mutating commands", () => {
+  const MAX_ATTEMPTS = 3;
+  const noSleep = async () => {};
+
+  function rejectStatus(status: number, headers?: Record<string, string>) {
+    const err: any = new Error(`http ${status}`);
+    err.response = { status, headers };
+    return err;
+  }
+
+  it("play() retries a transient 404 then succeeds (2 calls, no throw)", async () => {
+    const put = vi
+      .fn()
+      .mockRejectedValueOnce(rejectStatus(404))
+      .mockResolvedValueOnce({ status: 200, data: {} });
+    const http = makeHttp({ put });
+    const api = new SpotifyConnectApi(token(), { http, sleep: noSleep });
+    await expect(api.play("dev-1", "spotify:track:abc")).resolves.toBeUndefined();
+    expect(put).toHaveBeenCalledTimes(2);
+  });
+
+  it("play() exhausts on a persistent 500 (MAX_ATTEMPTS calls, swallowed, warns once)", async () => {
+    const put = vi.fn().mockRejectedValue(rejectStatus(500));
+    const http = makeHttp({ put });
+    const warn = vi.fn();
+    const logger = { warn } as any;
+    const api = new SpotifyConnectApi(token(), { http, sleep: noSleep, logger });
+    await expect(api.play("dev-1", "spotify:track:abc")).resolves.toBeUndefined();
+    expect(put).toHaveBeenCalledTimes(MAX_ATTEMPTS);
+    expect(warn).toHaveBeenCalledTimes(1);
+  });
+
+  it("does NOT retry a non-transient 403 (exactly ONE call, no throw)", async () => {
+    const put = vi.fn().mockRejectedValue(rejectStatus(403));
+    const http = makeHttp({ put });
+    const api = new SpotifyConnectApi(token(), { http, sleep: noSleep });
+    await expect(api.play("dev-1", "spotify:track:abc")).resolves.toBeUndefined();
+    expect(put).toHaveBeenCalledTimes(1);
+  });
+
+  it("429 honors a CAPPED Retry-After then succeeds (2 calls, bounded sleep)", async () => {
+    const put = vi
+      .fn()
+      .mockRejectedValueOnce(rejectStatus(429, { "retry-after": "1" }))
+      .mockResolvedValueOnce({ status: 200, data: {} });
+    const http = makeHttp({ put });
+    const sleep = vi.fn<(ms: number) => Promise<void>>(async () => {});
+    const api = new SpotifyConnectApi(token(), { http, sleep });
+    await expect(api.play("dev-1", "spotify:track:abc")).resolves.toBeUndefined();
+    expect(put).toHaveBeenCalledTimes(2);
+    expect(sleep).toHaveBeenCalledTimes(1);
+    const delay = sleep.mock.calls[0][0];
+    expect(delay).toBe(1000);
+    expect(delay).toBeLessThanOrEqual(2000);
+  });
+
+  it("transfer() shares the retry path — 404 then success (2 calls)", async () => {
+    const put = vi
+      .fn()
+      .mockRejectedValueOnce(rejectStatus(404))
+      .mockResolvedValueOnce({ status: 200, data: {} });
+    const http = makeHttp({ put });
+    const api = new SpotifyConnectApi(token(), { http, sleep: noSleep });
+    await expect(api.transfer("dev-1", true)).resolves.toBeUndefined();
+    expect(put).toHaveBeenCalledTimes(2);
   });
 });
 

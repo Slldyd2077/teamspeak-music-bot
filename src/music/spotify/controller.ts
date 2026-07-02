@@ -128,7 +128,10 @@ export class SpotifyController extends EventEmitter {
         ),
       });
     this.connect =
-      o.connect ?? new SpotifyConnectApi(() => this.oauth.getAccessToken());
+      o.connect ??
+      new SpotifyConnectApi(() => this.oauth.getAccessToken(), {
+        logger: this.logger,
+      });
   }
 
   /** Shared OAuth client (web router + Rust backend reuse this instance). */
