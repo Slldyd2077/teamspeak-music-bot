@@ -11,14 +11,26 @@ import type {
   SpotifyTrackEndedEvent,
   SpotifyNowPlaying,
 } from "./backend.js";
+import type { SpotifyOAuth } from "./spotify-oauth.js";
 
 // Controllable, hoisted so the vi.mock factory can close over it.
-const bin = vi.hoisted(() => ({ supported: true, path: "" }));
+// go-* keys keep their Stage-2 names (`supported`/`path`) so existing tests are
+// untouched; rust* keys drive the new librespot selection paths.
+const bin = vi.hoisted(() => ({
+  supported: true,
+  path: "",
+  rustSupported: true,
+  rustPath: "",
+}));
 vi.mock("./binary.js", () => ({
   isGoLibrespotSupported: () => bin.supported,
   findGoLibrespot: () => bin.path,
   resetGoLibrespotBinaryCache: () => {},
   checkGoLibrespotAvailable: async () => bin.supported && !!bin.path,
+  isRustLibrespotSupported: () => bin.rustSupported,
+  findLibrespot: () => bin.rustPath,
+  resetLibrespotBinaryCache: () => {},
+  checkLibrespotAvailable: async () => bin.rustSupported && !!bin.rustPath,
 }));
 
 // Capture options the DEFAULT factory hands to the real GoLibrespotBackend so
@@ -71,6 +83,8 @@ afterAll(() => {
 beforeEach(() => {
   bin.supported = true;
   bin.path = existingBin;
+  bin.rustSupported = true;
+  bin.rustPath = missingBin;
 });
 
 class FakeBackend extends EventEmitter implements SpotifyAudioBackend {
@@ -145,6 +159,7 @@ function cfg(over: Partial<SpotifyConfig> = {}): SpotifyConfig {
 function makeCtrl(over: {
   config?: Partial<SpotifyConfig>;
   backendFactory?: () => SpotifyAudioBackend;
+  oauth?: import("./spotify-oauth.js").SpotifyOAuth;
 } = {}) {
   const be = new FakeBackend();
   const ctrl = new SpotifyController({
@@ -153,8 +168,26 @@ function makeCtrl(over: {
     configDir: "/tmp/cfg",
     logger: silentLogger,
     backendFactory: over.backendFactory ?? (() => be),
+    oauth: over.oauth,
   });
   return { ctrl, be };
+}
+
+function fakeOAuth(
+  authorized: boolean,
+  hooks: { onIsAuthorized?: () => void } = {},
+): SpotifyOAuth {
+  return {
+    isAuthorized: () => {
+      hooks.onIsAuthorized?.();
+      return authorized;
+    },
+    getAccessToken: async () => (authorized ? "tok" : null),
+    getClientId: () => "cid",
+    getRedirectUri: () => "http://127.0.0.1:5588/login",
+    buildAuthorizeUrl: () => ({ url: "https://accounts.spotify.com/authorize", state: "s" }),
+    handleCallback: async () => true,
+  } as unknown as SpotifyOAuth;
 }
 
 describe("SpotifyController.isAvailable", () => {
@@ -449,5 +482,106 @@ describe("SpotifyController per-bot ports (Fix 3)", () => {
     expect(goLibrespotCtor).toHaveBeenCalledWith(
       expect.objectContaining({ apiPort: 3712, callbackPort: 8712 }),
     );
+  });
+});
+
+describe("SpotifyController.chooseBackend (platform x config matrix)", () => {
+  function pick(
+    backend: SpotifyConfig["backend"],
+    opts: { go: boolean; goSupported?: boolean; rust: boolean; rustSupported?: boolean },
+  ) {
+    bin.supported = opts.goSupported ?? true;
+    bin.path = opts.go ? existingBin : missingBin;
+    bin.rustSupported = opts.rustSupported ?? true;
+    bin.rustPath = opts.rust ? existingBin : missingBin;
+    const { ctrl } = makeCtrl({ config: { backend } });
+    return ctrl.chooseBackend();
+  }
+
+  it("auto: prefers go-librespot when linux + go binary present", () => {
+    expect(pick("auto", { go: true, rust: true })).toBe("go-librespot");
+  });
+  it("auto: falls back to librespot when go unsupported (e.g. Windows) but librespot present", () => {
+    expect(pick("auto", { go: true, goSupported: false, rust: true })).toBe("librespot");
+  });
+  it("auto: falls back to librespot when go binary is absent", () => {
+    expect(pick("auto", { go: false, rust: true })).toBe("librespot");
+  });
+  it("auto: null when neither backend is usable", () => {
+    expect(pick("auto", { go: false, goSupported: false, rust: false })).toBeNull();
+  });
+  it("go-librespot: selected when supported + present", () => {
+    expect(pick("go-librespot", { go: true, rust: true })).toBe("go-librespot");
+  });
+  it("go-librespot: null when unsupported, even if librespot is present", () => {
+    expect(pick("go-librespot", { go: true, goSupported: false, rust: true })).toBeNull();
+  });
+  it("librespot: selected when the librespot binary is present", () => {
+    expect(pick("librespot", { go: true, rust: true })).toBe("librespot");
+  });
+  it("librespot: null when the librespot binary is absent, even if go is present", () => {
+    expect(pick("librespot", { go: true, rust: false })).toBeNull();
+  });
+});
+
+describe("SpotifyController Rust-backend auth gate", () => {
+  it("isAvailable is true for a present librespot binary regardless of auth", () => {
+    bin.rustPath = existingBin;
+    const { ctrl } = makeCtrl({
+      config: { backend: "librespot" },
+      oauth: fakeOAuth(false),
+    });
+    expect(ctrl.isAvailable()).toBe(true);
+  });
+
+  it("ensureStarted returns false (no backend built) when Rust chosen but unauthorized", async () => {
+    bin.rustPath = existingBin;
+    let built = 0;
+    const { ctrl } = makeCtrl({
+      config: { backend: "librespot" },
+      oauth: fakeOAuth(false),
+      backendFactory: () => {
+        built++;
+        return new FakeBackend();
+      },
+    });
+    expect(await ctrl.ensureStarted()).toBe(false);
+    expect(built).toBe(0);
+  });
+
+  it("ensureStarted starts the Rust backend once authorized", async () => {
+    bin.rustPath = existingBin;
+    const be = new FakeBackend();
+    let built = 0;
+    const { ctrl } = makeCtrl({
+      config: { backend: "librespot" },
+      oauth: fakeOAuth(true),
+      backendFactory: () => {
+        built++;
+        return be;
+      },
+    });
+    expect(await ctrl.ensureStarted()).toBe(true);
+    expect(built).toBe(1);
+    expect(be.startCalls).toBe(1);
+  });
+
+  it("go-librespot path never consults oauth.isAuthorized()", async () => {
+    // auto + go present -> go-librespot; the auth gate must be skipped so a
+    // throwing isAuthorized() is never reached.
+    const oauth = fakeOAuth(false, {
+      onIsAuthorized: () => {
+        throw new Error("isAuthorized must not be called on the go path");
+      },
+    });
+    const { ctrl } = makeCtrl({ config: { backend: "auto" }, oauth });
+    expect(await ctrl.ensureStarted()).toBe(true);
+  });
+
+  it("exposes the shared oauth + connect instances", () => {
+    const oauth = fakeOAuth(true);
+    const { ctrl } = makeCtrl({ config: { backend: "auto" }, oauth });
+    expect(ctrl.getOAuth()).toBe(oauth);
+    expect(ctrl.getConnect()).toBeDefined();
   });
 });

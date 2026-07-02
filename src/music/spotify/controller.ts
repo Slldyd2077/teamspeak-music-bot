@@ -1,5 +1,12 @@
 import { EventEmitter } from "node:events";
-import { existsSync } from "node:fs";
+import {
+  existsSync,
+  readFileSync,
+  writeFileSync,
+  mkdirSync,
+  rmSync,
+} from "node:fs";
+import { dirname, join } from "node:path";
 import type { Readable } from "node:stream";
 import type { Logger } from "pino";
 import type { SpotifyConfig } from "../../data/config.js";
@@ -8,8 +15,52 @@ import type {
   SpotifyTrackEndedEvent,
   SpotifyNowPlaying,
 } from "./backend.js";
-import { isGoLibrespotSupported, findGoLibrespot } from "./binary.js";
+import {
+  isGoLibrespotSupported,
+  findGoLibrespot,
+  isRustLibrespotSupported,
+  findLibrespot,
+} from "./binary.js";
 import { GoLibrespotBackend } from "./go-librespot.js";
+import { RustLibrespotBackend } from "./rust-librespot.js";
+import {
+  SpotifyOAuth,
+  type OAuthTokens,
+  type OAuthTokenStore,
+} from "./spotify-oauth.js";
+import { SpotifyConnectApi } from "./connect-api.js";
+
+/** Which concrete backend the controller will run for this host + config. */
+export type SpotifyBackendKind = "go-librespot" | "librespot";
+
+/**
+ * Minimal file-backed OAuth token store used when the caller does not inject a
+ * SpotifyOAuth. Persists the rotating refresh-token JSON next to the bot config
+ * (0600). All IO is lazy + guarded so construction never throws and a
+ * missing/corrupt file simply reads as "unauthorized".
+ */
+class FileOAuthTokenStore implements OAuthTokenStore {
+  constructor(private readonly file: string) {}
+  load(): OAuthTokens | null {
+    try {
+      if (!existsSync(this.file)) return null;
+      return JSON.parse(readFileSync(this.file, "utf8")) as OAuthTokens;
+    } catch {
+      return null;
+    }
+  }
+  save(t: OAuthTokens): void {
+    mkdirSync(dirname(this.file), { recursive: true });
+    writeFileSync(this.file, JSON.stringify(t), { mode: 0o600 });
+  }
+  clear(): void {
+    try {
+      rmSync(this.file, { force: true });
+    } catch {
+      /* ignore */
+    }
+  }
+}
 
 export interface SpotifyControllerOptions {
   config: SpotifyConfig;
@@ -20,23 +71,25 @@ export interface SpotifyControllerOptions {
   apiPort?: number;
   /** Per-bot go-librespot OAuth callback port (distinct per bot). */
   callbackPort?: number;
-  /** Injected for tests; defaults to constructing a real GoLibrespotBackend. */
+  /** Injected for tests; when set it overrides the per-kind default builders. */
   backendFactory?: () => SpotifyAudioBackend;
+  /** Injected for tests; defaults to a file-backed SpotifyOAuth in configDir. */
+  oauth?: SpotifyOAuth;
+  /** Injected for tests; defaults to a SpotifyConnectApi wired to oauth. */
+  connect?: SpotifyConnectApi;
 }
 
 /**
- * Per-bot orchestrator for the go-librespot Spotify sidecar. Owns backend
- * lifecycle, gates on availability (config + platform + binary), delegates
- * transport, and re-emits the backend's "trackEnded"/"metadata" events so
- * BotInstance can advance the queue exactly as it does for the ffmpeg path.
+ * Per-bot orchestrator for the Spotify sidecar. Selects a backend for this
+ * host+config (chooseBackend), owns backend lifecycle, gates on availability
+ * (config + platform + binary) plus — for the Rust librespot backend — OAuth
+ * authorization, delegates transport, and re-emits "trackEnded"/"metadata" so
+ * BotInstance can advance the queue exactly as for the ffmpeg path.
  *
- * Correction C3: this controller does NOT re-emit a raw "error" event (Node's
- * EventEmitter throws on an unhandled "error"). It subscribes to the backend's
- * "error", logs it, and marks itself not-ready so the next ensureStarted()
- * relaunches the backend. Only the safe "trackEnded"/"metadata" events are
- * re-emitted. getPcmStream() proxies the backend's SINGLE persistent stream
- * (no per-attach PassThrough) to pair with the AudioPlayer detach-not-destroy
- * behaviour and BotInstance's no-re-attach on spotify->spotify transitions.
+ * Correction C3 (unchanged): this controller does NOT re-emit a raw "error"
+ * event. It subscribes to the backend's "error", logs it, tears the backend
+ * down, and marks itself not-ready so the next ensureStarted() relaunches a
+ * fresh backend. getPcmStream() proxies the backend's SINGLE persistent stream.
  */
 export class SpotifyController extends EventEmitter {
   private readonly config: SpotifyConfig;
@@ -45,7 +98,9 @@ export class SpotifyController extends EventEmitter {
   private readonly logger: Logger;
   private readonly apiPort?: number;
   private readonly callbackPort?: number;
-  private readonly backendFactory: () => SpotifyAudioBackend;
+  private readonly injectedFactory?: () => SpotifyAudioBackend;
+  private readonly oauth: SpotifyOAuth;
+  private readonly connect: SpotifyConnectApi;
 
   private backend: SpotifyAudioBackend | null = null;
   private started = false;
@@ -59,41 +114,105 @@ export class SpotifyController extends EventEmitter {
     this.logger = o.logger;
     this.apiPort = o.apiPort;
     this.callbackPort = o.callbackPort;
-    this.backendFactory =
-      o.backendFactory ??
-      (() =>
-        new GoLibrespotBackend({
-          deviceName: this.config.deviceName,
-          bitrate: this.config.bitrate,
-          workDir: this.workDir,
-          configDir: this.configDir,
-          apiPort: this.apiPort,
-          callbackPort: this.callbackPort,
-          logger: this.logger,
-        }));
+    this.injectedFactory = o.backendFactory;
+    // The controller OWNS a shared OAuth + Connect pair (Task 6 web router and
+    // the Rust backend reuse these exact instances). Constructing the defaults
+    // performs no IO/network — the file store loads lazily on first use.
+    this.oauth =
+      o.oauth ??
+      new SpotifyOAuth({
+        store: new FileOAuthTokenStore(
+          join(this.configDir, "spotify-oauth.json"),
+        ),
+      });
+    this.connect =
+      o.connect ?? new SpotifyConnectApi(() => this.oauth.getAccessToken());
   }
 
-  /** enabled in config AND on a supported OS AND the binary is present on disk. */
-  isAvailable(): boolean {
-    return (
-      this.config.enabled &&
-      isGoLibrespotSupported() &&
-      existsSync(findGoLibrespot())
-    );
+  /** Shared OAuth client (web router + Rust backend reuse this instance). */
+  getOAuth(): SpotifyOAuth {
+    return this.oauth;
+  }
+
+  /** Shared Connect API client (Rust backend reuses this instance). */
+  getConnect(): SpotifyConnectApi {
+    return this.connect;
+  }
+
+  private goPresent(): boolean {
+    return isGoLibrespotSupported() && existsSync(findGoLibrespot());
+  }
+
+  private rustPresent(): boolean {
+    return isRustLibrespotSupported() && existsSync(findLibrespot());
   }
 
   /**
-   * Idempotently start the backend. Returns false (without building a backend)
-   * when unavailable, so callers fall back to the Stage-1 sentinel message.
-   * A failed start clears the cached promise so a later call can retry.
+   * Resolve which backend to run for this platform + config, or null when none
+   * is usable (caller falls back to the Stage-1 sentinel message):
+   *   "go-librespot" -> GoLibrespot iff supported (linux) + binary present
+   *   "librespot"    -> Rust iff librespot(.exe) present (all platforms)
+   *   "auto"         -> GoLibrespot when (linux + go binary), else Rust when
+   *                     librespot present, else null.
+   */
+  chooseBackend(): SpotifyBackendKind | null {
+    switch (this.config.backend) {
+      case "go-librespot":
+        return this.goPresent() ? "go-librespot" : null;
+      case "librespot":
+        return this.rustPresent() ? "librespot" : null;
+      case "auto":
+      default:
+        if (this.goPresent()) return "go-librespot";
+        if (this.rustPresent()) return "librespot";
+        return null;
+    }
+  }
+
+  /** enabled in config AND a backend is selectable (platform + binary present). */
+  isAvailable(): boolean {
+    return this.config.enabled && this.chooseBackend() !== null;
+  }
+
+  /** Build the concrete backend for the chosen kind (or the injected fake). */
+  private buildBackend(kind: SpotifyBackendKind): SpotifyAudioBackend {
+    if (this.injectedFactory) return this.injectedFactory();
+    if (kind === "librespot") {
+      return new RustLibrespotBackend({
+        deviceName: this.config.deviceName,
+        bitrate: this.config.bitrate,
+        cacheDir: join(this.workDir, "librespot-cache"),
+        oauth: this.oauth,
+        connect: this.connect,
+        logger: this.logger,
+      });
+    }
+    return new GoLibrespotBackend({
+      deviceName: this.config.deviceName,
+      bitrate: this.config.bitrate,
+      workDir: this.workDir,
+      configDir: this.configDir,
+      apiPort: this.apiPort,
+      callbackPort: this.callbackPort,
+      logger: this.logger,
+    });
+  }
+
+  /**
+   * Idempotently start the selected backend. Returns false (without building a
+   * backend) when unavailable, or — for the Rust backend — when OAuth is not
+   * yet authorized, so callers show the login-needed / fallback message. A
+   * failed start clears the cached promise so a later call can retry.
    */
   async ensureStarted(): Promise<boolean> {
     if (!this.isAvailable()) return false;
+    const kind = this.chooseBackend();
+    if (!kind) return false;
+    // The Rust librespot device only appears in Spotify Connect once the user
+    // has authorized OAuth; without it, do not spawn a dead sidecar.
+    if (kind === "librespot" && !this.oauth.isAuthorized()) return false;
+
     if (this.started) {
-      // A previously-started backend still counts as ready only if its process
-      // is alive. If the sidecar died (isReady()===false) — e.g. the go-librespot
-      // child exited — tear it down here so the code below rebuilds a fresh one
-      // instead of handing callers a dead backend.
       if (this.backend?.isReady()) return true;
       this.stop();
     }
@@ -101,7 +220,7 @@ export class SpotifyController extends EventEmitter {
 
     this.startPromise = (async () => {
       try {
-        const backend = this.backendFactory();
+        const backend = this.buildBackend(kind);
         backend.on("trackEnded", (e: SpotifyTrackEndedEvent) =>
           this.emit("trackEnded", e),
         );
@@ -126,17 +245,11 @@ export class SpotifyController extends EventEmitter {
 
   /**
    * C3 backend-error handler. Never re-emits "error" (an unhandled "error" on
-   * an EventEmitter throws). Logs and marks the controller not-ready so the
-   * next ensureStarted() relaunches the backend.
+   * an EventEmitter throws). Logs, tears the errored backend down, and marks
+   * the controller not-ready so the next ensureStarted() relaunches it.
    */
   private handleBackendError(err: unknown): void {
     this.logger.error({ err }, "Spotify backend error; marking not-ready");
-    // Tear down the errored backend BEFORE resetting flags so ensureStarted()
-    // does not orphan it: stop() cleans its ffmpeg/go-librespot children + FIFO,
-    // removeAllListeners() detaches its "error" handler so a later error from
-    // this now-orphaned backend cannot flip a healthy rebuilt controller
-    // back to not-ready (state cross-talk). Teardown must never mask the
-    // original error, so guard stop() which may throw.
     try {
       this.backend?.stop();
     } catch (stopErr) {
@@ -145,9 +258,6 @@ export class SpotifyController extends EventEmitter {
         "Spotify backend stop() threw during error teardown",
       );
     }
-    // SpotifyAudioBackend's type contract exposes on() but not
-    // removeAllListeners(); every concrete backend extends EventEmitter, so
-    // detach through it to drop this controller's listeners from the orphan.
     (this.backend as unknown as EventEmitter | null)?.removeAllListeners();
     this.backend = null;
     this.started = false;
@@ -189,16 +299,16 @@ export class SpotifyController extends EventEmitter {
   /**
    * Tear down the backend and reset lifecycle state (safe before start).
    * Mirrors handleBackendError's teardown so the NEXT ensureStarted() rebuilds
-   * a fresh backend: stop() cleans the ffmpeg/go-librespot children + FIFO,
-   * removeAllListeners() detaches this controller's handlers so a late event
-   * from the now-orphaned backend can't disturb a rebuilt one. Guard stop()
-   * (it may throw) so teardown always completes.
+   * a fresh backend.
    */
   stop(): void {
     try {
       this.backend?.stop();
     } catch (stopErr) {
-      this.logger.error({ err: stopErr }, "Spotify backend stop() threw during teardown");
+      this.logger.error(
+        { err: stopErr },
+        "Spotify backend stop() threw during teardown",
+      );
     }
     (this.backend as unknown as EventEmitter | null)?.removeAllListeners();
     this.backend = null;
