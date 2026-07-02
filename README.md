@@ -636,6 +636,11 @@ OAuth 相关端点：`/api/spotify/login`、`/api/spotify/callback`、`/api/spot
 | Windows 上无法使用 go-librespot | 属预期行为（FIFO 仅限 POSIX，官方无 Windows 资产）；请把 `backend` 设为 `librespot` 或 `auto` |
 | 完全没有声音 | 确认账号为 **Spotify Premium**；免费账号无法通过 Spotify Connect 输出音频 |
 
+### 已知限制
+
+- 在多租户/共享主机上，librespot 通过命令行参数接收访问令牌，同机其他本地进程理论上可读取（令牌约 1 小时有效，需本地访问权限）。
+- Spotify 连续播放（gapless spotify→spotify）时，网页进度条的"已播放时间"可能不准确（以后端上报的播放进度为准）。
+
 ## 配置文件
 
 配置文件位于 **`data/config.json`**（与数据库、Cookie、日志同在持久化的 `data/` 目录，Docker 部署对应挂载卷），首次运行时自动生成，可手动编辑：

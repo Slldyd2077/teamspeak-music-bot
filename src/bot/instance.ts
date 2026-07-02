@@ -725,6 +725,10 @@ export class BotInstance extends EventEmitter {
         // (so NO player.stop() here). On the gapless auto-advance path the
         // player is still attached (isExternalActive() === true) so we do NOT
         // re-attach — the sidecar rolls the SAME FIFO into the next track.
+        // KNOWN LIMITATION: on a gapless spotify->spotify advance the player's
+        // frame counter is not reset, so player.getElapsed() over-reads for the
+        // 2nd+ consecutive Spotify track. Cosmetic only — the authoritative
+        // elapsed shown to users is status.track.position from the backend poll.
         if (!this.player.isExternalActive()) {
           this.player.playPcmStream(this.spotifyController.getPcmStream(), {
             // The sidecar PCM pipe is long-lived; per-track end arrives via the

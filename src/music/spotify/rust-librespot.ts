@@ -149,6 +149,10 @@ export class RustLibrespotBackend extends EventEmitter implements SpotifyAudioBa
           "--format", "S16",
           "--cache", this.opts.cacheDir,
           "--device-type", "speaker",
+          // KNOWN LIMITATION (CWE-214): the live Spotify access token is passed in
+          // the child argv, so on a shared/multi-tenant host a co-located local
+          // process could read it via `ps` / /proc/<pid>/cmdline. Bounded (~1h token,
+          // needs local access) and `--access-token` is librespot's supported bootstrap.
           "--access-token", token,
         ],
         { stdio: ["ignore", "pipe", "pipe"] },
