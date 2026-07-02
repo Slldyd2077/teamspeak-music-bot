@@ -30,7 +30,7 @@
 - **本地音频上传播放** — 在搜索页拖拽或选择本地音频上传，上传后可直接播放 / 下一首播放 / 加入队列；管理员可在 设置 → 行为设置 开关此功能，播放结束或停止/清空/替换队列时会清理服务端接收的本地文件
 - **专属链接（单机器人锁定）** — 通过 `/bot/<id>` 专属链接打开 WebUI 时锁定到单个机器人，刷新后保持，适合把某台机器人的控制页分享给特定用户
 - **频道无人时自动暂停** — 机器人所在频道没有其他人时自动暂停播放，有人加入后自动恢复（**默认关闭**，可在设置中开启）
-- **多平台音源** — 网易云音乐 + QQ 音乐 + 酷狗音乐 + 哔哩哔哩（默认内置），YouTube 可选启用（通过 yt-dlp），统一搜索，结果标注来源
+- **多平台音源** — 网易云音乐 + QQ 音乐 + 酷狗音乐 + 哔哩哔哩（默认内置），YouTube 可选启用（通过 yt-dlp），**Spotify（实验性）** 可选启用（需 Premium + 自建开发者应用，默认关闭，详见 [Spotify 音源（实验性）](#spotify-音源实验性)），统一搜索，结果标注来源
 - **真实客户端协议 (TS3/TS6 双协议)** — 机器人在 TeamSpeak 中可见（非 ServerQuery 隐身模式），自动检测并适配 TS3 和 TS6 服务器，支持 TS6 HTTP Query API
 - **YesPlayMusic 风格 WebUI** — 精美界面，支持深色/浅色主题切换
 - **完整播放控制** — 播放/暂停/上一首/下一首/进度跳转/音量调节
@@ -517,6 +517,124 @@ pip install -U yt-dlp
 - 音质由源视频决定，不受音质设置影响
 - 受 YouTube 风控/地域限制，部分视频可能无法播放
 - `yt-dlp` 更新较频繁，如果播放失败，先尝试升级 `yt-dlp` 到最新版本
+
+## Spotify 音源（实验性）
+
+> **⚠️ 实验性功能，启用前请务必读完本节**
+>
+> - **需要 Spotify Premium 账号。** 免费账号无法通过 Spotify Connect 输出音频，无法使用本功能。
+> - **使用你自己在 Spotify Developer Dashboard 注册的应用（Client ID）。** 本项目**不内置任何共享凭据**，也不会替你代管账号。
+> - Spotify 官方并未开放第三方播放的公开授权，本功能处于 **Spotify 服务条款的灰色地带**，是否使用请自行评估，**风险自负**。
+> - 该音源**默认关闭**（`spotify.enabled = false`），需要手动开启并完成授权。
+> - 这**不是** YouTube 那样的「免登录回退音源」，而是**真正的 Spotify 音频**，必须有 Premium 才能出声；音频链路依赖第三方开源解码器（librespot / go-librespot），本项目仅在本地作为独立子进程调用，**播放效果不做保证**，也未在本仓库端到端测试。
+
+### 工作原理（简述）
+
+1. `librespot`（Rust）或 `go-librespot`（Linux）作为**独立子进程**登录 Spotify Connect 并解码音频，输出原始 **PCM**。
+2. 本项目用内置 **ffmpeg** 把 PCM 重采样到 **48kHz**。
+3. 重采样后的音频接入**现有的 Opus 编码 / 发送管线**（与其它音源共用），推送到 TeamSpeak。
+4. 歌名、歌手、封面等**元数据来自 Spotify Web API**。
+
+### 平台矩阵
+
+后端由配置项 `spotify.backend` 决定，可选 `auto`（默认）/ `go-librespot` / `librespot`：
+
+| 平台 | 默认后端（`auto`） | 说明 |
+|------|------|------|
+| Windows | `librespot`（Rust） | 不支持 go-librespot（FIFO 仅限 POSIX，且官方无 Windows 资产） |
+| Linux / Docker | `go-librespot`（可回退 `librespot`） | `auto` 优先 go-librespot，未检测到时自动改用 librespot |
+| macOS | `librespot`（Rust） | 与 Windows 同，仅支持 Rust 版 |
+
+> `auto` 会按平台与二进制可用性自动选择：优先 `go-librespot`（若可用），否则 `librespot`。若显式指定 `go-librespot` 或 `librespot` 但对应二进制不存在，则该音源保持不可用。
+
+### 获取二进制
+
+程序会先在项目根目录的 `bin/` 中查找，找不到再回退到系统 `PATH`。`bin/` 已被 `.gitignore` 忽略，不影响代码更新。
+
+**Rust librespot（librespot-org，全平台）** — 官方**没有预编译发布包**，需自行获取（任选其一）：
+
+```bash
+# 方式 1：用 Cargo 编译安装（需要 Rust 工具链）
+cargo install librespot
+
+# 方式 2（Windows）：scoop / choco
+scoop install librespot        # 或：choco install librespot
+
+# 方式 3：把可执行文件放到项目 bin/ 目录
+#   Windows:      bin/librespot.exe
+#   Linux/macOS:  bin/librespot
+```
+
+或直接把 `librespot` 加入系统 `PATH`。
+
+**go-librespot（仅 Linux）** — 官方仅提供 **Linux** 预编译资产：
+
+```bash
+# 从 Release 页下载对应架构的二进制：
+#   https://github.com/devgianlu/go-librespot/releases
+# 放到项目 bin/ 目录（或加入系统 PATH）：
+#   bin/go-librespot
+```
+
+> **Windows 不支持 go-librespot**：它依赖 POSIX FIFO（`mkfifo`），官方也只发布 Linux 资产。Windows / macOS 请使用 Rust `librespot`。
+
+### 注册 Spotify 开发者应用 + 回调地址
+
+1. 打开 [Spotify Developer Dashboard](https://developer.spotify.com/dashboard)，新建一个应用，记下 **Client ID**。
+2. 在应用设置里添加 **Redirect URI（回调地址）**，精确填写：
+
+   ```
+   http://127.0.0.1:<webPort>/api/spotify/callback
+   ```
+
+   其中 `<webPort>` 与本项目设置里的 Web 端口一致（默认 `3000`，即 `http://127.0.0.1:3000/api/spotify/callback`）。回调路径必须精确为 `/api/spotify/callback`。
+3. 本项目使用 **Authorization Code + PKCE** 流程，**不需要 Client Secret**（配置里的 `clientSecret` 可留空）。
+4. 授权时请求的权限范围（scope）：
+
+   ```
+   streaming user-read-playback-state user-modify-playback-state user-read-currently-playing playlist-read-private
+   ```
+
+### 启用步骤
+
+1. 进入**设置页**的「连接 Spotify」卡片。
+2. 填入 **Client ID**、选择**后端**（`auto` / `go-librespot` / `librespot`）、打开**开关**。
+3. 点击**保存**。
+4. 点击「**连接 Spotify**」，在弹出的 Spotify 页面完成 **OAuth 授权**。
+
+> 仅当 **`enabled = true`** + **已完成 OAuth 授权** + **检测到可用的后端二进制** 三者同时满足时，Spotify 音源才可播放。任一条件不满足，该音源保持**不可用**（点播会被跳过，播放队列照常前进，不影响其它音源）。
+
+对应的配置块（`data/config.json`）：
+
+```json
+{
+  "spotify": {
+    "enabled": false,
+    "backend": "auto",
+    "clientId": "",
+    "clientSecret": "",
+    "deviceName": "TSMusicBot",
+    "bitrate": 320
+  }
+}
+```
+
+OAuth 相关端点：`/api/spotify/login`、`/api/spotify/callback`、`/api/spotify/status`。
+
+### 许可与来源
+
+- **go-librespot** 采用 **GPL-3.0** 许可。本项目**仅将其作为独立子进程调用**（mere aggregation / 独立聚合），**不链接、不打包**其代码，因此**不影响本项目自身的 MIT 许可**。
+  - 源码与许可：<https://github.com/devgianlu/go-librespot>（GPL-3.0；如需其对应源码请前往该仓库获取 —— source offer）。
+- **Rust librespot** 采用 **MIT** 许可：<https://github.com/librespot-org/librespot>。
+
+### 故障排查
+
+| 现象 | 处理 |
+|------|------|
+| 提示「未检测到 librespot / go-librespot」 | 检查项目 `bin/` 目录里是否放了可执行文件，或该命令是否在系统 `PATH` 中；Rust 版可用 `cargo install librespot` 安装 |
+| 提示「未授权 / 需要连接 Spotify」 | 在设置页「连接 Spotify」卡片点击「连接 Spotify」完成 OAuth 授权 |
+| Windows 上无法使用 go-librespot | 属预期行为（FIFO 仅限 POSIX，官方无 Windows 资产）；请把 `backend` 设为 `librespot` 或 `auto` |
+| 完全没有声音 | 确认账号为 **Spotify Premium**；免费账号无法通过 Spotify Connect 输出音频 |
 
 ## 配置文件
 
