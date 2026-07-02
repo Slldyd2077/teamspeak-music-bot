@@ -18,7 +18,7 @@ function makeApp(oauth: SpotifyOAuthLike, role: Role = "admin", caps: string[] =
     createSpotifyRouter({
       oauth,
       logger: pino({ level: "silent" }),
-      getBackendInfo: () => ({ backend: "librespot", deviceName: "TS-Bot" }),
+      getBackendInfo: () => ({ backend: "librespot", deviceName: "TS-Bot", binaryAvailable: true }),
       webUiRedirect: "/",
     }),
   );
@@ -84,7 +84,7 @@ describe("spotify OAuth router", () => {
     const app = makeApp(fakeOauth({ isAuthorized: () => true }));
     const res = await request(app).get("/api/spotify/status");
     expect(res.status).toBe(200);
-    expect(res.body).toEqual({ authorized: true, backend: "librespot", deviceName: "TS-Bot" });
+    expect(res.body).toEqual({ authorized: true, backend: "librespot", deviceName: "TS-Bot", binaryAvailable: true });
   });
 
   it("GET /status is 403 for a guest", async () => {

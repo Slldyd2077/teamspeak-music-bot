@@ -21,6 +21,14 @@ import { createAuditRouter } from "./api/audit.js";
 import { createFavoritesRouter } from "./api/favorites.js";
 import { createSpotifyRouter } from "./api/spotify.js";
 import type { SpotifyOAuth } from "../music/spotify/spotify-oauth.js";
+import { resolveSpotifyBackendKind } from "../music/spotify/backend-select.js";
+import {
+  isGoLibrespotSupported,
+  findGoLibrespot,
+  isRustLibrespotSupported,
+  findLibrespot,
+} from "../music/spotify/binary.js";
+import { existsSync } from "node:fs";
 import { setupWebSocket } from "./websocket.js";
 import { createUserStore } from "../data/users.js";
 import { createSessionStore } from "../data/sessions.js";
@@ -147,10 +155,22 @@ export function createWebServer(options: WebServerOptions): WebServer {
       createSpotifyRouter({
         oauth: options.spotifyOAuth,
         logger,
-        getBackendInfo: () => ({
-          backend: options.config.spotify.backend,
-          deviceName: options.config.spotify.deviceName,
-        }),
+        getBackendInfo: () => {
+          const goPresent =
+            isGoLibrespotSupported() && existsSync(findGoLibrespot());
+          const rustPresent =
+            isRustLibrespotSupported() && existsSync(findLibrespot());
+          const resolved = resolveSpotifyBackendKind(
+            options.config.spotify.backend,
+            goPresent,
+            rustPresent,
+          );
+          return {
+            backend: resolved ?? "none",
+            deviceName: options.config.spotify.deviceName,
+            binaryAvailable: resolved !== null,
+          };
+        },
         webUiRedirect: "/",
       }),
     );

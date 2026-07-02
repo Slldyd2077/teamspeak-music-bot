@@ -15,7 +15,11 @@ export interface SpotifyRouterOptions {
   oauth: SpotifyOAuthLike;
   logger: Logger;
   /** Process-wide backend info for /status (single Premium account, Stage 3). */
-  getBackendInfo: () => { backend: string; deviceName: string };
+  getBackendInfo: () => {
+    backend: string;
+    deviceName: string;
+    binaryAvailable: boolean;
+  };
   /** Web UI page to bounce the browser back to after the OAuth callback. */
   webUiRedirect?: string;
 }
@@ -67,6 +71,7 @@ export function createSpotifyRouter(opts: SpotifyRouterOptions): Router {
       authorized: oauth.isAuthorized(),
       backend: info.backend,
       deviceName: info.deviceName,
+      binaryAvailable: info.binaryAvailable,
     });
   });
 

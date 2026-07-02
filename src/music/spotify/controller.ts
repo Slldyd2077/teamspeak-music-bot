@@ -29,9 +29,11 @@ import {
   type OAuthTokenStore,
 } from "./spotify-oauth.js";
 import { SpotifyConnectApi } from "./connect-api.js";
-
-/** Which concrete backend the controller will run for this host + config. */
-export type SpotifyBackendKind = "go-librespot" | "librespot";
+import {
+  resolveSpotifyBackendKind,
+  type SpotifyBackendKind,
+} from "./backend-select.js";
+export type { SpotifyBackendKind }; // keep the name exported for existing importers
 
 /**
  * Minimal file-backed OAuth token store used when the caller does not inject a
@@ -156,17 +158,11 @@ export class SpotifyController extends EventEmitter {
    *                     librespot present, else null.
    */
   chooseBackend(): SpotifyBackendKind | null {
-    switch (this.config.backend) {
-      case "go-librespot":
-        return this.goPresent() ? "go-librespot" : null;
-      case "librespot":
-        return this.rustPresent() ? "librespot" : null;
-      case "auto":
-      default:
-        if (this.goPresent()) return "go-librespot";
-        if (this.rustPresent()) return "librespot";
-        return null;
-    }
+    return resolveSpotifyBackendKind(
+      this.config.backend,
+      this.goPresent(),
+      this.rustPresent(),
+    );
   }
 
   /** enabled in config AND a backend is selectable (platform + binary present). */
