@@ -284,6 +284,36 @@ describe("bot router /settings", () => {
     expect(blank.body.spotify.hasClientSecret).toBe(true);
   });
 
+  it("POST /settings ignores a blank/whitespace deviceName but stores a trimmed non-empty one", async () => {
+    config.spotify.deviceName = "OldDevice";
+
+    // Empty string leaves the prior deviceName untouched.
+    const empty = await request(app)
+      .post("/api/bot/settings")
+      .set("Cookie", cookie)
+      .send({ spotify: { deviceName: "" } });
+    expect(empty.status).toBe(200);
+    expect(config.spotify.deviceName).toBe("OldDevice");
+    expect(empty.body.spotify.deviceName).toBe("OldDevice");
+
+    // Whitespace-only is likewise ignored (trim().length === 0).
+    const ws = await request(app)
+      .post("/api/bot/settings")
+      .set("Cookie", cookie)
+      .send({ spotify: { deviceName: "   " } });
+    expect(ws.status).toBe(200);
+    expect(config.spotify.deviceName).toBe("OldDevice");
+
+    // A non-empty value is stored TRIMMED.
+    const set = await request(app)
+      .post("/api/bot/settings")
+      .set("Cookie", cookie)
+      .send({ spotify: { deviceName: "  Dev  " } });
+    expect(set.status).toBe(200);
+    expect(config.spotify.deviceName).toBe("Dev");
+    expect(set.body.spotify.deviceName).toBe("Dev");
+  });
+
   it("POST /settings that omits spotify leaves config.spotify untouched (no regression)", async () => {
     config.spotify.clientId = "keep-me";
     config.spotify.clientSecret = "keep-secret";

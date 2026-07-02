@@ -104,4 +104,16 @@ describe("SPOTIFY_DISCLAIMER", () => {
     expect(SPOTIFY_DISCLAIMER).toContain("Premium");
     expect(SPOTIFY_DISCLAIMER.length).toBeGreaterThan(20);
   });
+
+  // The disclaimer is compliance-critical: it must keep the Premium requirement,
+  // the ToS grey-area / at-your-own-risk warning, the default-off promise, and the
+  // "use your own developer credentials" notion. A refactor that drops any of these
+  // must fail here rather than silently shipping weakened copy.
+  it("retains every compliance-critical element (Premium, ToS/risk, default-off, own credentials)", () => {
+    expect(SPOTIFY_DISCLAIMER).toContain("Premium");
+    expect(SPOTIFY_DISCLAIMER).toContain("灰色地带"); // grey area of Spotify's ToS
+    expect(SPOTIFY_DISCLAIMER).toContain("风险自负"); // at your own risk
+    expect(SPOTIFY_DISCLAIMER).toContain("默认关闭"); // disabled by default
+    expect(SPOTIFY_DISCLAIMER).toContain("凭据"); // your own developer app credentials
+  });
 });
