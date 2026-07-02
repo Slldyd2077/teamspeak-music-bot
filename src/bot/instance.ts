@@ -27,6 +27,7 @@ import { isSpotifyUri } from "../music/spotify/webapi.js";
 import path from "node:path";
 import { SpotifyController } from "../music/spotify/controller.js";
 import type { SpotifyTrackEndedEvent } from "../music/spotify/backend.js";
+import type { SpotifyOAuth } from "../music/spotify/spotify-oauth.js";
 
 /** Reply sent when a non-admin invokes an admin-only chat command. */
 export const COMMAND_DENIED_MESSAGE = "⛔ 需要管理员权限（该命令仅限管理员服务器组）";
@@ -77,6 +78,9 @@ export interface BotInstanceOptions {
   avatarStore: AvatarStore;
   /** Base dir (under DATA_DIR) for per-bot go-librespot work/config trees. */
   spotifyDataDir?: string;
+  /** Process-wide shared Spotify OAuth (single account); injected into the
+   *  SpotifyController so web-login authorization is visible to playback (C3.1). */
+  spotifyOAuth?: SpotifyOAuth;
   /** Test seam: build a fake controller instead of a real go-librespot one. */
   spotifyControllerFactory?: (o: {
     config: SpotifyConfig;
@@ -85,6 +89,7 @@ export interface BotInstanceOptions {
     logger: Logger;
     apiPort: number;
     callbackPort: number;
+    oauth?: SpotifyOAuth;
   }) => SpotifyController;
 }
 
@@ -181,6 +186,7 @@ export class BotInstance extends EventEmitter {
       logger: this.logger,
       apiPort: spotifyApiPort,
       callbackPort: spotifyCallbackPort,
+      oauth: options.spotifyOAuth,
     });
 
     const profileConfig = this.database.getProfileConfig(this.id);
@@ -1410,6 +1416,13 @@ export class BotInstance extends EventEmitter {
 
   getPlayer(): AudioPlayer {
     return this.player;
+  }
+
+  /** The per-bot Spotify sidecar controller. Exposed like getPlayer()/
+   *  getQueueManager() so the shared, process-wide OAuth threaded in at
+   *  construction (C3.1) is observable to callers/tests via getOAuth(). */
+  getSpotifyController(): SpotifyController {
+    return this.spotifyController;
   }
 
   /**

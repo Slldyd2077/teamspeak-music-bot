@@ -19,6 +19,8 @@ import { createUsersRouter } from "./api/users.js";
 import { createAuditStore } from "../data/audit.js";
 import { createAuditRouter } from "./api/audit.js";
 import { createFavoritesRouter } from "./api/favorites.js";
+import { createSpotifyRouter } from "./api/spotify.js";
+import type { SpotifyOAuth } from "../music/spotify/spotify-oauth.js";
 import { setupWebSocket } from "./websocket.js";
 import { createUserStore } from "../data/users.js";
 import { createSessionStore } from "../data/sessions.js";
@@ -48,6 +50,9 @@ export interface WebServerOptions {
   cookieStore?: CookieStore;
   avatarStore: AvatarStore;
   staticDir?: string;
+  /** Process-wide shared Spotify OAuth (single account, Stage 3). When set, the
+   *  /api/spotify {login,callback,status} router is mounted. */
+  spotifyOAuth?: SpotifyOAuth;
 }
 
 export interface WebServer {
@@ -136,6 +141,20 @@ export function createWebServer(options: WebServerOptions): WebServer {
     "/api/auth",
     createAuthRouter(options.neteaseProvider, options.qqProvider, options.bilibiliProvider, logger, options.cookieStore, options.kugouProvider, options.spotifyProvider)
   );
+  if (options.spotifyOAuth) {
+    app.use(
+      "/api/spotify",
+      createSpotifyRouter({
+        oauth: options.spotifyOAuth,
+        logger,
+        getBackendInfo: () => ({
+          backend: options.config.spotify.backend,
+          deviceName: options.config.spotify.deviceName,
+        }),
+        webUiRedirect: "/",
+      }),
+    );
+  }
   app.use("/api/favorites", requireNotGuest, createFavoritesRouter(options.database, logger));
 
   // admin-only routes

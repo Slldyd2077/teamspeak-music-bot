@@ -1,6 +1,13 @@
 import { describe, it, expect, vi } from "vitest";
 import { BotInstance, COMMAND_DENIED_MESSAGE, spotifyPortsForBotId } from "./instance.js";
+import type { BotInstanceOptions } from "./instance.js";
 import type { TS3TextMessage } from "../ts-protocol/client.js";
+import type { SpotifyController } from "../music/spotify/controller.js";
+import type { SpotifyOAuth } from "../music/spotify/spotify-oauth.js";
+import type { MusicProvider } from "../music/provider.js";
+import type { BotDatabase } from "../data/database.js";
+import type { AvatarStore } from "../data/avatars.js";
+import type { BotConfig } from "../data/config.js";
 
 // Constructing a real BotInstance is heavy (spawns a TS3Client, AudioPlayer,
 // reads avatars, etc.), and runExclusive only touches a single private field
@@ -608,6 +615,67 @@ describe("BotInstance.seek — spotify routing (C4)", () => {
     seek.call(ctx, 30);
     expect(ctx.player.seek).toHaveBeenCalledWith(30);
     expect(ctx.spotifyController.seek).not.toHaveBeenCalled();
+  });
+});
+
+// --- Spotify OAuth threading (Task 6, C3.1) --------------------------------
+// The process-wide shared SpotifyOAuth must reach the SpotifyController via the
+// controller factory. We drive the REAL BotInstance constructor with a fake
+// controller factory that captures its param object, so the thread is observed
+// end-to-end (options.spotifyOAuth -> buildController({ oauth })).
+describe("BotInstance — spotifyOAuth threading to the controller factory (C3.1)", () => {
+  function makeInstanceOptions(over: Partial<BotInstanceOptions> = {}): {
+    options: BotInstanceOptions;
+    captured: { param?: { oauth?: SpotifyOAuth } };
+  } {
+    const captured: { param?: { oauth?: SpotifyOAuth } } = {};
+    const provider = { platform: "netease" } as unknown as MusicProvider;
+    const logger: any = {
+      info() {}, warn() {}, error() {}, debug() {},
+      child() { return logger; },
+    };
+    const database = {
+      getProfileConfig: () => ({}),
+      getCustomAvatarPath: () => null,
+    } as unknown as BotDatabase;
+    const options: BotInstanceOptions = {
+      id: "bot-oauth-test",
+      name: "OAuthBot",
+      tsOptions: { host: "localhost", port: 9987, queryPort: 10011, nickname: "OAuthBot" } as any,
+      neteaseProvider: provider,
+      qqProvider: provider,
+      bilibiliProvider: provider,
+      youtubeProvider: provider,
+      database,
+      config: { spotify: {} } as unknown as BotConfig,
+      logger,
+      avatarStore: { read: () => null } as unknown as AvatarStore,
+      spotifyControllerFactory: (o) => {
+        captured.param = o;
+        // Only `on` is touched during construction (setupPlayerEvents wires
+        // the "trackEnded" listener); return a minimal fake controller.
+        return { on: () => {} } as unknown as SpotifyController;
+      },
+      ...over,
+    };
+    return { options, captured };
+  }
+
+  it("forwards the injected spotifyOAuth to the controller factory as `oauth`", () => {
+    const sentinel = {} as unknown as SpotifyOAuth;
+    const { options, captured } = makeInstanceOptions({ spotifyOAuth: sentinel });
+    // eslint-disable-next-line no-new
+    new BotInstance(options);
+    expect(captured.param).toBeDefined();
+    expect(captured.param?.oauth).toBe(sentinel);
+  });
+
+  it("leaves the factory `oauth` undefined when no spotifyOAuth is supplied (behavior-unchanged)", () => {
+    const { options, captured } = makeInstanceOptions();
+    // eslint-disable-next-line no-new
+    new BotInstance(options);
+    expect(captured.param).toBeDefined();
+    expect(captured.param?.oauth).toBeUndefined();
   });
 });
 

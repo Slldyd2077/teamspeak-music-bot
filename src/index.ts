@@ -10,6 +10,7 @@ import { BiliBiliProvider } from "./music/bilibili.js";
 import { LocalMusicProvider } from "./music/local.js";
 import { KugouProvider } from "./music/kugou.js";
 import { SpotifyProvider } from "./music/spotify/provider.js";
+import { SpotifyOAuth, createFileOAuthTokenStore } from "./music/spotify/spotify-oauth.js";
 import { createCookieStore } from "./music/auth.js";
 import { createAvatarStore } from "./data/avatars.js";
 import { createPermissionStore } from "./data/permissions.js";
@@ -83,6 +84,22 @@ async function main() {
 
   const permissions = createPermissionStore(db.db);
 
+  // Single process-wide Spotify authorization (one Premium account for Stage 3).
+  // Threaded into BOTH the web OAuth router and every bot's SpotifyController so
+  // a web login immediately authorizes playback (C3.1). Own-app clientId => the
+  // redirect points at this bot's web callback; empty clientId leaves OAuth
+  // disabled (isAuthorized() stays false and the Rust backend never starts).
+  const spotifyOAuthClientId = config.spotify.clientId.trim();
+  const spotifyOAuth = new SpotifyOAuth({
+    clientId: spotifyOAuthClientId || undefined,
+    redirectUri: spotifyOAuthClientId
+      ? `http://127.0.0.1:${config.webPort}/api/spotify/callback`
+      : undefined,
+    store: createFileOAuthTokenStore(
+      path.join(SPOTIFY_DATA_DIR, "oauth", "oauth-tokens.json"),
+    ),
+  });
+
   const botManager = new BotManager(
     neteaseProvider,
     qqProvider,
@@ -96,7 +113,8 @@ async function main() {
     localProvider,
     kugouProvider,
     spotifyProvider,
-    SPOTIFY_DATA_DIR
+    SPOTIFY_DATA_DIR,
+    spotifyOAuth
   );
   await botManager.loadSavedBots();
 
@@ -116,6 +134,7 @@ async function main() {
     logger,
     cookieStore,
     staticDir: STATIC_DIR,
+    spotifyOAuth,
   });
   await webServer.start();
 
