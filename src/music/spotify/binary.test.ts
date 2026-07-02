@@ -7,6 +7,12 @@ import {
   checkGoLibrespotAvailable,
   resetGoLibrespotBinaryCache,
   __setGoLibrespotVersionProbe,
+  isRustLibrespotSupported,
+  pickLibrespotPath,
+  findLibrespot,
+  checkLibrespotAvailable,
+  resetLibrespotBinaryCache,
+  __setLibrespotVersionProbe,
 } from "./binary.js";
 
 const origPlatform = process.platform;
@@ -18,6 +24,8 @@ afterEach(() => {
   setPlatform(origPlatform);
   __setGoLibrespotVersionProbe(null);
   resetGoLibrespotBinaryCache();
+  __setLibrespotVersionProbe(null);
+  resetLibrespotBinaryCache();
 });
 
 describe("isGoLibrespotSupported", () => {
@@ -105,5 +113,124 @@ describe("checkGoLibrespotAvailable", () => {
       throw new Error("gone");
     });
     expect(await checkGoLibrespotAvailable()).toBe(false);
+  });
+});
+
+describe("isRustLibrespotSupported", () => {
+  it("is true on every platform (pipe->stdout works everywhere)", () => {
+    setPlatform("linux");
+    expect(isRustLibrespotSupported()).toBe(true);
+    setPlatform("win32");
+    expect(isRustLibrespotSupported()).toBe(true);
+    setPlatform("darwin");
+    expect(isRustLibrespotSupported()).toBe(true);
+  });
+});
+
+describe("pickLibrespotPath (bin/ then PATH ordering, win32 exe)", () => {
+  it("prefers the bin/ path when the file exists", () => {
+    const binPath = join("some", "root", "bin", "librespot");
+    expect(
+      pickLibrespotPath([binPath, "librespot"], (p) => p === binPath),
+    ).toBe(binPath);
+  });
+
+  it("prefers the bin/librespot.exe path on win32 when it exists", () => {
+    setPlatform("win32");
+    const binExe = join("some", "root", "bin", "librespot.exe");
+    expect(
+      pickLibrespotPath([binExe, "librespot.exe"], (p) => p === binExe),
+    ).toBe(binExe);
+  });
+
+  it("falls through to the bare PATH name (librespot) on posix when bin/ is missing", () => {
+    setPlatform("linux");
+    const binPath = join("some", "root", "bin", "librespot");
+    expect(pickLibrespotPath([binPath, "librespot"], () => false)).toBe(
+      "librespot",
+    );
+  });
+
+  it("falls through to librespot.exe on win32 when bin/ is missing", () => {
+    setPlatform("win32");
+    const binExe = join("some", "root", "bin", "librespot.exe");
+    expect(pickLibrespotPath([binExe], () => false)).toBe("librespot.exe");
+  });
+
+  it("returns bare command names without touching the filesystem", () => {
+    const exists = vi.fn(() => false);
+    expect(pickLibrespotPath(["librespot"], exists)).toBe("librespot");
+    expect(exists).not.toHaveBeenCalled();
+  });
+});
+
+describe("findLibrespot", () => {
+  it("returns the bare command name when bin/librespot is absent", () => {
+    // No librespot binary is committed under bin/, so resolution must fall
+    // back to the bare PATH name (execFile resolves it at run time).
+    setPlatform("linux");
+    expect(findLibrespot()).toBe("librespot");
+  });
+
+  it("returns librespot.exe on win32 when bin/librespot.exe is absent", () => {
+    setPlatform("win32");
+    expect(findLibrespot()).toBe("librespot.exe");
+  });
+});
+
+describe("checkLibrespotAvailable", () => {
+  it("returns true when the binary responds to --version (any platform)", async () => {
+    setPlatform("win32");
+    __setLibrespotVersionProbe(async () => {});
+    expect(await checkLibrespotAvailable()).toBe(true);
+  });
+
+  it("returns true on darwin too (no platform gate)", async () => {
+    setPlatform("darwin");
+    __setLibrespotVersionProbe(async () => {});
+    expect(await checkLibrespotAvailable()).toBe(true);
+  });
+
+  it("caches only positive results and probes once", async () => {
+    setPlatform("linux");
+    const probe = vi.fn(async () => {});
+    __setLibrespotVersionProbe(probe);
+    expect(await checkLibrespotAvailable()).toBe(true);
+    expect(await checkLibrespotAvailable()).toBe(true);
+    expect(probe).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not cache a failed probe (retries on the next call)", async () => {
+    setPlatform("win32");
+    __setLibrespotVersionProbe(async () => {
+      throw new Error("ENOENT");
+    });
+    expect(await checkLibrespotAvailable()).toBe(false);
+    __setLibrespotVersionProbe(async () => {});
+    expect(await checkLibrespotAvailable()).toBe(true);
+  });
+
+  it("resetLibrespotBinaryCache clears a cached positive", async () => {
+    setPlatform("linux");
+    __setLibrespotVersionProbe(async () => {});
+    expect(await checkLibrespotAvailable()).toBe(true);
+    resetLibrespotBinaryCache();
+    __setLibrespotVersionProbe(async () => {
+      throw new Error("gone");
+    });
+    expect(await checkLibrespotAvailable()).toBe(false);
+  });
+
+  it("de-dupes concurrent in-flight probes", async () => {
+    setPlatform("linux");
+    const probe = vi.fn(async () => {});
+    __setLibrespotVersionProbe(probe);
+    const [a, b] = await Promise.all([
+      checkLibrespotAvailable(),
+      checkLibrespotAvailable(),
+    ]);
+    expect(a).toBe(true);
+    expect(b).toBe(true);
+    expect(probe).toHaveBeenCalledTimes(1);
   });
 });
