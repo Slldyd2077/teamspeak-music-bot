@@ -668,17 +668,21 @@ export class BotInstance extends EventEmitter {
         // continuous FIFO/PCM stream, so per-track playback is just a REST
         // playTrack — the stream keeps flowing.
         await this.spotifyController.playTrack(result.url);
-        // C4: only ATTACH the persistent PCM stream when coming from a
-        // non-spotify source. playPcmStream internally fences the prior
-        // url-ffmpeg (so NO player.stop() here). On a spotify→spotify handoff
-        // the sidecar changes tracks into the SAME FIFO — re-attaching would
-        // tear down and re-subscribe the shared stream and silence playback.
-        if (!this.currentSourceIsSpotify) {
+        // Only ATTACH the persistent PCM stream when the player is NOT already
+        // attached to it. Gate on the player's ACTUAL external state, not the
+        // currentSourceIsSpotify flag: command paths (cmdPlay/cmdPlaylist/…)
+        // call player.stop() (which detaches the external stream) WITHOUT
+        // clearing the flag, so a stale-true flag would skip the re-attach and
+        // silence playback. playPcmStream internally fences the prior url-ffmpeg
+        // (so NO player.stop() here). On the gapless auto-advance path the
+        // player is still attached (isExternalActive() === true) so we do NOT
+        // re-attach — the sidecar rolls the SAME FIFO into the next track.
+        if (!this.player.isExternalActive()) {
           this.player.playPcmStream(this.spotifyController.getPcmStream(), {
             // The sidecar PCM pipe is long-lived; per-track end arrives via the
             // controller "trackEnded" WS event, not stream EOF. A real EOF here
-            // means the sidecar died — recovery is the controller's job.
-            onExternalEnd: () => {},
+            // means the sidecar died — surface it rather than silently swallow.
+            onExternalEnd: () => this.logger.warn("Spotify PCM stream ended unexpectedly"),
           });
         }
         this.currentSourceIsSpotify = true;
@@ -1361,13 +1365,15 @@ export class BotInstance extends EventEmitter {
    * external — AudioPlayer.seek would respawn ffmpeg on the `spotify:` sentinel
    * and collide with the running stream), otherwise to the URL player.
    */
-  seek(ms: number): void {
+  seek(seconds: number): void {
     if (this.queue.current()?.platform === "spotify") {
-      this.spotifyController.seek(ms).catch((err) =>
+      // The web route + AudioPlayer.seek are seconds-based, but
+      // SpotifyController.seek expects milliseconds — convert here.
+      this.spotifyController.seek(seconds * 1000).catch((err) =>
         this.logger.warn({ err }, "Spotify seek failed"));
       return;
     }
-    this.player.seek(ms);
+    this.player.seek(seconds);
   }
 
   getQueueManager(): PlayQueue {

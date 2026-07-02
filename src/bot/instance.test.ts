@@ -241,7 +241,7 @@ const handleOccupancy = (BotInstance.prototype as any).handleOccupancy as (
   this: unknown,
   userCount: number,
 ) => void;
-const seek = (BotInstance.prototype as any).seek as (this: unknown, ms: number) => void;
+const seek = (BotInstance.prototype as any).seek as (this: unknown, seconds: number) => void;
 
 function makeController() {
   return {
@@ -256,13 +256,18 @@ function makeController() {
   };
 }
 function makePlayer() {
+  // `externalActive` mirrors the real AudioPlayer: playPcmStream attaches the
+  // external stream (true), and both stop() and play() detach it (false). The
+  // re-attach guard reads isExternalActive(), so this must track that state.
+  let externalActive = false;
   return {
-    play: vi.fn(),
-    stop: vi.fn(),
-    playPcmStream: vi.fn(),
+    play: vi.fn((..._args: any[]) => { externalActive = false; }),
+    stop: vi.fn(() => { externalActive = false; }),
+    playPcmStream: vi.fn((..._args: any[]) => { externalActive = true; }),
     pause: vi.fn(),
     resume: vi.fn(),
     seek: vi.fn(),
+    isExternalActive: vi.fn(() => externalActive),
   };
 }
 function makeResolveCtx(opts: {
@@ -368,6 +373,35 @@ describe("BotInstance.resolveAndPlay — Spotify routing (C4)", () => {
     expect(player.playPcmStream).toHaveBeenCalledTimes(1); // NOT re-attached
     expect(controller.playTrack).toHaveBeenCalledTimes(2); // both tracks played
     expect(player.stop).not.toHaveBeenCalled();
+  });
+
+  it("RE-attaches on a spotify -> (command player.stop) -> spotify sequence (does not stay silent)", async () => {
+    // Regression: command paths (cmdPlay/cmdPlaylist/cmdAlbum/cmdFm) call
+    // player.stop() — which DETACHES the external stream — WITHOUT clearing the
+    // currentSourceIsSpotify flag. Gating re-attach on the stale flag skipped
+    // playPcmStream, silencing the next spotify track. We now gate on the
+    // player's actual external state, so the re-attach happens.
+    const controller = makeController();
+    const player = makePlayer();
+    const ctx = makeResolveCtx({
+      controller, player, url: "spotify:track:abc", currentSourceIsSpotify: false,
+    });
+
+    // First spotify track attaches the persistent PCM stream.
+    await resolveAndPlay.call(ctx, spotifySong());
+    expect(player.playPcmStream).toHaveBeenCalledTimes(1);
+    expect(player.isExternalActive()).toBe(true);
+
+    // A command path stops the player (detaches the stream) but leaves the
+    // spotify flag stale-true — exactly the state that used to cause silence.
+    player.stop();
+    expect(player.isExternalActive()).toBe(false);
+    expect(ctx.currentSourceIsSpotify).toBe(true); // flag NOT cleared by stop()
+
+    // Next spotify track MUST re-attach (gate on player external state, not flag).
+    await resolveAndPlay.call(ctx, spotifySong());
+    expect(player.playPcmStream).toHaveBeenCalledTimes(2);
+    expect(player.isExternalActive()).toBe(true);
   });
 
   it("pauses the sidecar and clears the flag when switching to a non-spotify track", async () => {
@@ -523,14 +557,15 @@ describe("BotInstance.seek — spotify routing (C4)", () => {
     } as any;
   }
 
-  it("routes seek to the controller for a spotify track", () => {
+  it("routes seek to the controller for a spotify track, converting seconds -> ms", () => {
     const ctx = makeSeekCtx("spotify");
-    seek.call(ctx, 30);
-    expect(ctx.spotifyController.seek).toHaveBeenCalledWith(30);
+    seek.call(ctx, 30); // 30 seconds
+    // SpotifyController.seek is millisecond-based: 30s -> 30000ms (not 30).
+    expect(ctx.spotifyController.seek).toHaveBeenCalledWith(30000);
     expect(ctx.player.seek).not.toHaveBeenCalled();
   });
 
-  it("routes seek to the player for a non-spotify track", () => {
+  it("routes seek to the player (seconds-based) for a non-spotify track", () => {
     const ctx = makeSeekCtx("netease");
     seek.call(ctx, 30);
     expect(ctx.player.seek).toHaveBeenCalledWith(30);

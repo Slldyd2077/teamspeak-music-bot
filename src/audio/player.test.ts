@@ -377,6 +377,21 @@ describe("AudioPlayer external-PCM mode (playPcmStream)", () => {
     player.stop();
   });
 
+  it("isExternalActive() is false initially, true after playPcmStream, false after stop()", () => {
+    const player = new AudioPlayer(silentLogger);
+    // Idle: never attached.
+    expect(player.isExternalActive()).toBe(false);
+
+    const stream = openPcmReadable();
+    player.playPcmStream(stream, {});
+    // Attached to the external sidecar stream.
+    expect(player.isExternalActive()).toBe(true);
+
+    player.stop();
+    // Detached again — the orchestrator uses this to know it must re-attach.
+    expect(player.isExternalActive()).toBe(false);
+  });
+
   it("pause()/resume() still gate local emission in external mode (unchanged semantics)", async () => {
     const player = new AudioPlayer(silentLogger);
     const stream = openPcmReadable();

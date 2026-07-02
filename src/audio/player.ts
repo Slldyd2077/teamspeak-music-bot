@@ -746,4 +746,8 @@ export class AudioPlayer extends EventEmitter {
   setVolume(vol: number): void { this.volume = Math.max(0, Math.min(100, vol)); }
   getVolume(): number { return this.volume; }
   getState(): PlayerState { return this.state; }
+  // True only while attached to an external (Spotify sidecar) PCM stream. Used
+  // by the orchestrator to decide whether to re-attach: stop() detaches (sets
+  // externalMode=false) so this is false after any player.stop().
+  isExternalActive(): boolean { return this.externalMode; }
 }
