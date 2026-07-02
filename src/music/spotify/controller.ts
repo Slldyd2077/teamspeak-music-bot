@@ -105,6 +105,12 @@ export class SpotifyController extends EventEmitter {
   private readonly connect: SpotifyConnectApi;
 
   private backend: SpotifyAudioBackend | null = null;
+  // The in-flight backend during a start() that has not yet completed. A
+  // stop()/handleBackendError() DURING start() clears (or replaces) this so the
+  // mid-start sidecar is torn down and a completing start is discarded by the
+  // ensureStarted post-await guard instead of resurrecting a backend the caller
+  // already tore down (Bug I1).
+  private pendingBackend: SpotifyAudioBackend | null = null;
   private started = false;
   private startPromise: Promise<boolean> | null = null;
 
@@ -218,28 +224,73 @@ export class SpotifyController extends EventEmitter {
     if (this.startPromise) return this.startPromise;
 
     this.startPromise = (async () => {
+      const backend = this.buildBackend(kind);
+      // Publish the in-flight backend BEFORE the (potentially ~20s) start()
+      // await so a concurrent stop()/handleBackendError() can reach and tear
+      // down this mid-start sidecar (Bug I1).
+      this.pendingBackend = backend;
+      backend.on("trackEnded", (e: SpotifyTrackEndedEvent) =>
+        this.emit("trackEnded", e),
+      );
+      backend.on("metadata", (m: SpotifyNowPlaying) =>
+        this.emit("metadata", m),
+      );
+      // C3: do NOT re-emit "error". Log and mark not-ready so the next
+      // ensureStarted() relaunches a fresh backend.
+      backend.on("error", (err?: unknown) => this.handleBackendError(err));
       try {
-        const backend = this.buildBackend(kind);
-        backend.on("trackEnded", (e: SpotifyTrackEndedEvent) =>
-          this.emit("trackEnded", e),
-        );
-        backend.on("metadata", (m: SpotifyNowPlaying) =>
-          this.emit("metadata", m),
-        );
-        // C3: do NOT re-emit "error". Log and mark not-ready so the next
-        // ensureStarted() relaunches a fresh backend.
-        backend.on("error", (err?: unknown) => this.handleBackendError(err));
         await backend.start();
-        this.backend = backend;
-        this.started = true;
-        return true;
       } catch (err) {
         this.logger.error({ err }, "Spotify backend failed to start");
+        if (this.pendingBackend === backend) this.pendingBackend = null;
         this.startPromise = null;
         return false;
       }
+      // Post-await guard (Bug I1): if teardown ran DURING start() — stop() or
+      // handleBackendError() cleared/replaced pendingBackend — do NOT promote
+      // this backend. Tear the just-started sidecar down so it is neither
+      // leaked nor resurrected, and report failure to the caller.
+      if (this.pendingBackend !== backend) {
+        this.teardownBackend(
+          backend,
+          "Spotify backend stop() threw tearing down a superseded start",
+        );
+        return false;
+      }
+      this.pendingBackend = null;
+      this.backend = backend;
+      this.started = true;
+      return true;
     })();
     return this.startPromise;
+  }
+
+  /**
+   * Stop a backend and detach ALL its listeners, swallowing+logging any throw
+   * from stop() so teardown never propagates. Shared by the error/stop paths
+   * and the ensureStarted post-await guard.
+   */
+  private teardownBackend(be: SpotifyAudioBackend, stopMsg: string): void {
+    try {
+      be.stop();
+    } catch (stopErr) {
+      this.logger.error({ err: stopErr }, stopMsg);
+    }
+    (be as unknown as EventEmitter).removeAllListeners();
+  }
+
+  /**
+   * Tear down an in-flight (mid-start) backend so a start() still awaiting is
+   * discarded by ensureStarted's post-await guard rather than promoted, and its
+   * spawned sidecar is killed rather than orphaned (Bug I1).
+   */
+  private teardownPendingBackend(): void {
+    if (!this.pendingBackend) return;
+    this.teardownBackend(
+      this.pendingBackend,
+      "Spotify backend stop() threw tearing down in-flight start",
+    );
+    this.pendingBackend = null;
   }
 
   /**
@@ -249,16 +300,15 @@ export class SpotifyController extends EventEmitter {
    */
   private handleBackendError(err: unknown): void {
     this.logger.error({ err }, "Spotify backend error; marking not-ready");
-    try {
-      this.backend?.stop();
-    } catch (stopErr) {
-      this.logger.error(
-        { err: stopErr },
+    if (this.backend) {
+      this.teardownBackend(
+        this.backend,
         "Spotify backend stop() threw during error teardown",
       );
     }
-    (this.backend as unknown as EventEmitter | null)?.removeAllListeners();
     this.backend = null;
+    // Also kill an in-flight start so its post-await guard discards it.
+    this.teardownPendingBackend();
     this.started = false;
     this.startPromise = null;
   }
@@ -301,16 +351,16 @@ export class SpotifyController extends EventEmitter {
    * a fresh backend.
    */
   stop(): void {
-    try {
-      this.backend?.stop();
-    } catch (stopErr) {
-      this.logger.error(
-        { err: stopErr },
+    if (this.backend) {
+      this.teardownBackend(
+        this.backend,
         "Spotify backend stop() threw during teardown",
       );
     }
-    (this.backend as unknown as EventEmitter | null)?.removeAllListeners();
     this.backend = null;
+    // Also kill an in-flight start so its post-await guard discards it rather
+    // than resurrecting the sidecar this stop() just tore down (Bug I1).
+    this.teardownPendingBackend();
     this.started = false;
     this.startPromise = null;
   }

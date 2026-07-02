@@ -2,7 +2,7 @@ import { describe, it, expect, vi } from "vitest";
 import { EventEmitter } from "node:events";
 import { PassThrough } from "node:stream";
 import pino from "pino";
-import { RustLibrespotBackend } from "./rust-librespot.js";
+import { RustLibrespotBackend, type RustLibrespotBackendDeps } from "./rust-librespot.js";
 
 const log = pino({ level: "silent" });
 
@@ -36,7 +36,9 @@ function makeOAuth() {
   };
 }
 
-function makeHarness(over: { connect?: any; oauth?: any } = {}) {
+function makeHarness(
+  over: { connect?: any; oauth?: any; deps?: Partial<RustLibrespotBackendDeps> } = {},
+) {
   const calls: string[] = [];
   const librespotChild = makeFakeChild();
   const ffmpegChild = makeFakeChild();
@@ -68,6 +70,7 @@ function makeHarness(over: { connect?: any; oauth?: any } = {}) {
       readyTimeoutMs: 100,
       // huge so the background setInterval never fires; tests drive pollState() directly.
       statePollIntervalMs: 10_000_000,
+      ...over.deps,
     },
   });
 
@@ -277,6 +280,117 @@ describe("RustLibrespotBackend track-end poll loop", () => {
     await (h.backend as any).pollState(); // finishes
     expect(ended).toHaveBeenCalledTimes(1);
     expect(ended).toHaveBeenCalledWith({ uri: "spotify:track:ours", reason: "ended" });
+  });
+});
+
+describe("RustLibrespotBackend playback-start watchdog (I4 degrade-to-skip)", () => {
+  /** A controllable timer seam matching the file's injected-deps style. */
+  function makeFakeTimer() {
+    const pending: Array<{ cb: () => void; ms: number; handle: object }> = [];
+    const setTimer = vi.fn((cb: () => void, ms: number) => {
+      const handle = {};
+      pending.push({ cb, ms, handle });
+      return handle;
+    });
+    const clearTimer = vi.fn((h: unknown) => {
+      const i = pending.findIndex((p) => p.handle === h);
+      if (i >= 0) pending.splice(i, 1);
+    });
+    // "advance fake timers": run (and drain) every armed callback.
+    const advance = () => pending.splice(0).forEach((p) => p.cb());
+    return { setTimer, clearTimer, advance, pending };
+  }
+
+  it("emits exactly ONE trackEnded{reason:'error'} when playback never starts", async () => {
+    const timer = makeFakeTimer();
+    const h = makeHarness({
+      deps: {
+        playbackStartTimeoutMs: 8000,
+        setTimeout: timer.setTimer as any,
+        clearTimeout: timer.clearTimer as any,
+      },
+    });
+    const ended = vi.fn();
+    h.backend.on("trackEnded", ended);
+
+    // The connect layer NEVER reports our track playing (204 / idle).
+    h.connect.getPlaybackState.mockResolvedValue(null);
+    await h.backend.playTrack("spotify:track:stuck");
+    // Polls that never observe playback must NOT emit anything on their own.
+    await (h.backend as any).pollState();
+    await (h.backend as any).pollState();
+    expect(ended).not.toHaveBeenCalled();
+
+    // The watchdog is armed exactly once; advance past playbackStartTimeoutMs.
+    expect(timer.pending).toHaveLength(1);
+    expect(timer.pending[0].ms).toBe(8000);
+    timer.advance();
+
+    // Degraded-to-skip: one trackEnded with reason "error" for our uri.
+    expect(ended).toHaveBeenCalledTimes(1);
+    expect(ended).toHaveBeenCalledWith({ uri: "spotify:track:stuck", reason: "error" });
+
+    // A late idle poll after the watchdog fired does not double-emit.
+    await (h.backend as any).pollState();
+    expect(ended).toHaveBeenCalledTimes(1);
+    h.backend.stop();
+  });
+
+  it("does NOT fire the watchdog when the device actually starts playing", async () => {
+    const timer = makeFakeTimer();
+    const h = makeHarness({
+      deps: {
+        playbackStartTimeoutMs: 8000,
+        setTimeout: timer.setTimer as any,
+        clearTimeout: timer.clearTimer as any,
+      },
+    });
+    const ended = vi.fn();
+    h.backend.on("trackEnded", ended);
+
+    await h.backend.playTrack("spotify:track:ok");
+    // Our device reports the track actually playing -> watchdog is disarmed.
+    h.connect.getPlaybackState.mockResolvedValue({
+      isPlaying: true,
+      progressMs: 1000,
+      trackUri: "spotify:track:ok",
+      durationMs: 200000,
+    });
+    await (h.backend as any).pollState();
+
+    // Real playback observed -> the watchdog was cleared, not left armed.
+    expect(timer.clearTimer).toHaveBeenCalled();
+    expect(timer.pending).toHaveLength(0);
+    // Even if a stale timer somehow fired, no "error" end must be emitted.
+    timer.advance();
+    expect(ended).not.toHaveBeenCalledWith(
+      expect.objectContaining({ reason: "error" }),
+    );
+    h.backend.stop();
+  });
+
+  it("a new playTrack() cancels the previous track's watchdog (at-most-one per track)", async () => {
+    const timer = makeFakeTimer();
+    const h = makeHarness({
+      deps: {
+        playbackStartTimeoutMs: 8000,
+        setTimeout: timer.setTimer as any,
+        clearTimeout: timer.clearTimer as any,
+      },
+    });
+    const ended = vi.fn();
+    h.backend.on("trackEnded", ended);
+    h.connect.getPlaybackState.mockResolvedValue(null);
+
+    await h.backend.playTrack("spotify:track:one");
+    await h.backend.playTrack("spotify:track:two");
+    // The first track's watchdog was cleared; only the second remains armed.
+    expect(timer.clearTimer).toHaveBeenCalled();
+    expect(timer.pending).toHaveLength(1);
+    timer.advance();
+    expect(ended).toHaveBeenCalledTimes(1);
+    expect(ended).toHaveBeenCalledWith({ uri: "spotify:track:two", reason: "error" });
+    h.backend.stop();
   });
 });
 

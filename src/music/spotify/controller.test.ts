@@ -97,10 +97,14 @@ class FakeBackend extends EventEmitter implements SpotifyAudioBackend {
   ready = false;
   startShouldReject = false;
   playShouldReject = false;
+  /** When set, start() awaits this before resolving — lets a test interleave
+   *  stop()/error DURING a mid-flight start (Bug I1). */
+  startGate?: Promise<void>;
   readonly pcm = Readable.from([Buffer.alloc(0)]);
 
   async start(): Promise<void> {
     this.startCalls++;
+    if (this.startGate) await this.startGate;
     if (this.startShouldReject) throw new Error("start boom");
     this.ready = true;
   }
@@ -463,6 +467,40 @@ describe("SpotifyController.stop", () => {
     const { ctrl, be } = makeCtrl();
     expect(() => ctrl.stop()).not.toThrow();
     expect(be.stopCalls).toBe(0);
+  });
+
+  it("Bug I1: stop() DURING a mid-flight start tears the sidecar down instead of resurrecting it", async () => {
+    // A Deferred the test resolves to complete backend.start() on demand.
+    let resolveStart!: () => void;
+    const startGate = new Promise<void>((res) => {
+      resolveStart = res;
+    });
+    const be = new FakeBackend();
+    be.startGate = startGate;
+    const { ctrl } = makeCtrl({ backendFactory: () => be });
+
+    // Kick off ensureStarted but DO NOT await — start() is parked on the gate.
+    const startedP = ctrl.ensureStarted();
+    // Let the ensureStarted IIFE run up to `await backend.start()`.
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(be.startCalls).toBe(1); // start() was entered and is now pending
+
+    // Caller tears the controller down while start() is still in flight
+    // (a user `!stop`/disconnect). Pre-fix this.backend is still null so this
+    // is a no-op and the spawned sidecar is orphaned.
+    ctrl.stop();
+
+    // Now let start() finally resolve. Pre-fix the IIFE would set this.backend
+    // and started=true, RESURRECTING the sidecar the caller already stopped.
+    resolveStart();
+    const result = await startedP;
+
+    // Post-fix: the mid-flight backend is torn down, not promoted.
+    expect(result).toBe(false);
+    expect(be.stopCalls).toBeGreaterThanOrEqual(1); // the fake WAS stopped
+    expect(be.listenerCount("trackEnded")).toBe(0); // listeners detached
+    expect(() => ctrl.getPcmStream()).toThrow(); // not resurrected
   });
 });
 

@@ -40,6 +40,15 @@ export interface RustLibrespotBackendDeps {
   readyPollIntervalMs?: number;
   readyTimeoutMs?: number;
   statePollIntervalMs?: number;
+  /**
+   * I4 (§13): bounded window after playTrack() within which our own track must
+   * be observed playing, else we degrade-to-skipped (emit trackEnded
+   * reason:"error"). Injectable timer seams (default real setTimeout, unref'd)
+   * let tests advance it deterministically.
+   */
+  playbackStartTimeoutMs?: number;
+  setTimeout?: (cb: () => void, ms: number) => unknown;
+  clearTimeout?: (handle: unknown) => void;
 }
 
 const DEFAULT_READY_POLL_MS = 500;
@@ -47,6 +56,13 @@ const DEFAULT_READY_TIMEOUT_MS = 20_000;
 const DEFAULT_STATE_POLL_MS = 2_000;
 /** How close to the end (ms) counts as "track finished" when polling player state. */
 const END_OF_TRACK_WINDOW_MS = 1_500;
+/**
+ * I4 (§13): if our own track has not been observed playing within this window
+ * after playTrack(), degrade-to-skipped so the queue advances instead of
+ * stalling on a persistently-failing play (403 non-Premium, 404 outliving
+ * retries). Bounded and injectable for tests.
+ */
+const DEFAULT_PLAYBACK_START_TIMEOUT_MS = 8_000;
 
 const defaultSleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
@@ -60,6 +76,9 @@ export class RustLibrespotBackend extends EventEmitter implements SpotifyAudioBa
   private proc: ChildProcess | null = null;
   private ffmpeg: ChildProcess | null = null;
   private pollTimer: ReturnType<typeof setInterval> | null = null;
+  // I4 (§13): "did our track actually start playing?" watchdog handle (opaque —
+  // produced by the injectable setTimeout seam). null when disarmed.
+  private watchdogTimer: unknown = null;
   private ready = false;
   private positionMs = 0;
 
@@ -253,7 +272,11 @@ export class RustLibrespotBackend extends EventEmitter implements SpotifyAudioBa
       this.emit("metadata", np);
     }
 
-    if (state.isPlaying) this.hasPlayed = true;
+    if (state.isPlaying) {
+      this.hasPlayed = true;
+      // Real playback observed -> the I4 degrade-to-skip watchdog is moot.
+      this.clearPlaybackWatchdog();
+    }
     if (!this.currentUri || this.endedForCurrent) return;
 
     // C3.4: EVERY end condition is gated on hasPlayed so no end can fire until
@@ -289,6 +312,9 @@ export class RustLibrespotBackend extends EventEmitter implements SpotifyAudioBa
     // uri playing. currentUri is cleared so the next poll re-detects the track
     // (fresh metadata) rather than treating it as unchanged. Arming here is the
     // primary guarantee that no end/metadata can fire before the bot plays.
+    // Cancel the previous track's degrade-to-skip watchdog first (at-most-one
+    // trackEnded per track, I4).
+    this.clearPlaybackWatchdog();
     this.currentUri = null;
     this.hasPlayed = false;
     this.endedForCurrent = false;
@@ -298,6 +324,58 @@ export class RustLibrespotBackend extends EventEmitter implements SpotifyAudioBa
     // begin playback.
     await this.connect.transfer(deviceId, false);
     await this.connect.play(deviceId, uri);
+    // I4 (§13): arm the "did it actually start playing?" watchdog. If our own
+    // track is never seen playing within the window, degrade-to-skipped so the
+    // queue advances instead of hanging on a silent, persistently-failing play.
+    this.armPlaybackWatchdog(uri);
+  }
+
+  /**
+   * I4 (§13) degrade-to-skip watchdog. Arms a bounded timer; if our own track
+   * has not been observed playing by the time it fires, emit a single
+   * trackEnded{reason:"error"} so the controller re-emits it and BotInstance
+   * advances the queue. Cleared when real playback is observed, on stop(), and
+   * at the start of a new playTrack().
+   */
+  private armPlaybackWatchdog(uri: string): void {
+    this.clearPlaybackWatchdog();
+    const timeoutMs = this.deps.playbackStartTimeoutMs ?? DEFAULT_PLAYBACK_START_TIMEOUT_MS;
+    const setTimer =
+      this.deps.setTimeout ??
+      ((cb: () => void, ms: number) => {
+        const t = setTimeout(cb, ms);
+        (t as { unref?: () => void }).unref?.();
+        return t;
+      });
+    this.watchdogTimer = setTimer(() => {
+      this.watchdogTimer = null;
+      this.onPlaybackStartTimeout(uri);
+    }, timeoutMs);
+  }
+
+  private clearPlaybackWatchdog(): void {
+    if (this.watchdogTimer == null) return;
+    const clearTimer =
+      this.deps.clearTimeout ??
+      ((h: unknown) => clearTimeout(h as ReturnType<typeof setTimeout>));
+    clearTimer(this.watchdogTimer);
+    this.watchdogTimer = null;
+  }
+
+  /**
+   * Fired when the playback-start window elapses with no observed playback.
+   * C3.6: never throws up the queue path. Guarded by the same endedForCurrent
+   * latch as normal end-detection so at most one trackEnded per track (no
+   * double-emit with the poll-loop end detection).
+   */
+  private onPlaybackStartTimeout(uri: string): void {
+    // Real playback was seen (hasPlayed) or the track already ended -> moot.
+    if (this.hasPlayed || this.endedForCurrent) return;
+    this.endedForCurrent = true; // latch
+    this.currentUri = null;
+    this.positionMs = 0;
+    const e: SpotifyTrackEndedEvent = { uri, reason: "error" };
+    this.emit("trackEnded", e);
   }
 
   async pause(): Promise<void> {
@@ -325,6 +403,8 @@ export class RustLibrespotBackend extends EventEmitter implements SpotifyAudioBa
 
   stop(): void {
     this.ready = false;
+    // Disarm the I4 degrade-to-skip watchdog so a stopped backend never emits.
+    this.clearPlaybackWatchdog();
     // Clear the state poll interval FIRST so no poll fires mid-teardown.
     if (this.pollTimer) {
       clearInterval(this.pollTimer);
