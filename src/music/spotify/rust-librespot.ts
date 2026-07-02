@@ -67,6 +67,11 @@ export class RustLibrespotBackend extends EventEmitter implements SpotifyAudioBa
   private currentUri: string | null = null;
   private hasPlayed = false;
   private endedForCurrent = false;
+  // C3.4: end-detection is DISARMED until our own playTrack() runs. A poll that
+  // fires before the bot ever asks to play (e.g. at startup) must produce no
+  // side effects at all, so a foreign track already near its end can't emit a
+  // spurious trackEnded/metadata and wrongly advance the queue.
+  private armed = false;
 
   constructor(o: RustLibrespotBackendOptions) {
     super();
@@ -205,6 +210,15 @@ export class RustLibrespotBackend extends EventEmitter implements SpotifyAudioBa
       return;
     }
 
+    // C3.4: detection is armed ONLY by our own playTrack(). Until then a poll
+    // must have NO side effects — no metadata/trackEnded emit and no mutation of
+    // currentUri/hasPlayed/positionMs. This single gate covers the null-state
+    // (C3.5 post-play-204) branch, the metadata-emit block, and every end
+    // heuristic below, so a foreign track sitting near its end at startup can
+    // never spuriously advance the queue. (Device-readiness polling via
+    // getDevices is separate and stays active regardless of this flag.)
+    if (!this.armed) return;
+
     if (!state) {
       // C3.5: a 204 / no-active-device response. AFTER our own track has been
       // seen playing, librespot going idle means the track ended — emit once so
@@ -214,6 +228,7 @@ export class RustLibrespotBackend extends EventEmitter implements SpotifyAudioBa
         this.endedForCurrent = true;
         const endedUri = this.currentUri;
         this.currentUri = null;
+        this.positionMs = 0;
         const e: SpotifyTrackEndedEvent = { uri: endedUri, reason: "ended" };
         this.emit("trackEnded", e);
       }
@@ -256,6 +271,7 @@ export class RustLibrespotBackend extends EventEmitter implements SpotifyAudioBa
       this.endedForCurrent = true; // latch: emit at most once per track
       const endedUri = this.currentUri;
       this.currentUri = null;
+      this.positionMs = 0;
       const e: SpotifyTrackEndedEvent = { uri: endedUri, reason: "ended" };
       this.emit("trackEnded", e);
     }
@@ -271,10 +287,12 @@ export class RustLibrespotBackend extends EventEmitter implements SpotifyAudioBa
     // Reset the track-end state machine for the new track: clear the once-only
     // latch and drop hasPlayed so no end can fire until a poll re-confirms this
     // uri playing. currentUri is cleared so the next poll re-detects the track
-    // (fresh metadata) rather than treating it as unchanged.
+    // (fresh metadata) rather than treating it as unchanged. Arming here is the
+    // primary guarantee that no end/metadata can fire before the bot plays.
     this.currentUri = null;
     this.hasPlayed = false;
     this.endedForCurrent = false;
+    this.armed = true;
     // transfer(false) activates our device WITHOUT starting audio; play() then
     // actually starts the uri. The two-step is required — transfer alone won't
     // begin playback.

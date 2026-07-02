@@ -189,6 +189,8 @@ describe("RustLibrespotBackend track-end poll loop", () => {
     const meta = vi.fn();
     h.backend.on("trackEnded", ended);
     h.backend.on("metadata", meta);
+    // Arm detection the way production does — via our own playTrack().
+    await h.backend.playTrack("spotify:track:A");
     h.connect.getPlaybackState
       .mockResolvedValueOnce({ isPlaying: true, progressMs: 1000, trackUri: "spotify:track:A", durationMs: 200000 })
       .mockResolvedValueOnce({ isPlaying: true, progressMs: 199000, trackUri: "spotify:track:A", durationMs: 200000 });
@@ -204,6 +206,7 @@ describe("RustLibrespotBackend track-end poll loop", () => {
     const h = makeHarness();
     const ended = vi.fn();
     h.backend.on("trackEnded", ended);
+    await h.backend.playTrack("spotify:track:A");
     h.connect.getPlaybackState
       .mockResolvedValueOnce({ isPlaying: true, progressMs: 5000, trackUri: "spotify:track:A", durationMs: 200000 })
       .mockResolvedValueOnce({ isPlaying: false, progressMs: 5000, trackUri: "spotify:track:A", durationMs: 200000 })
@@ -219,6 +222,7 @@ describe("RustLibrespotBackend track-end poll loop", () => {
     const h = makeHarness();
     const ended = vi.fn();
     h.backend.on("trackEnded", ended);
+    await h.backend.playTrack("spotify:track:A");
     h.connect.getPlaybackState
       .mockResolvedValueOnce({ isPlaying: true, progressMs: 1000, trackUri: "spotify:track:A", durationMs: 200000 })
       .mockResolvedValueOnce({ isPlaying: true, progressMs: 0, trackUri: null, durationMs: 0 });
@@ -234,6 +238,45 @@ describe("RustLibrespotBackend track-end poll loop", () => {
     h.connect.getPlaybackState.mockResolvedValue(null);
     await (h.backend as any).pollState();
     expect(ended).not.toHaveBeenCalled();
+  });
+
+  it("C3.4: a startup poll before playTrack never emits (foreign track near its end)", async () => {
+    const h = makeHarness();
+    const ended = vi.fn();
+    const meta = vi.fn();
+    h.backend.on("trackEnded", ended);
+    h.backend.on("metadata", meta);
+    // Backend started, but playTrack has NOT been called => detection disarmed.
+    await h.backend.start();
+    // First poll observes a FOREIGN track that is actively playing near its end.
+    h.connect.getPlaybackState.mockResolvedValue({
+      isPlaying: true,
+      progressMs: 199000,
+      trackUri: "spotify:foreign",
+      durationMs: 200000,
+    });
+    await (h.backend as any).pollState();
+    // No spurious end-of-track and no bogus metadata before the bot ever plays.
+    expect(ended).not.toHaveBeenCalled();
+    expect(meta).not.toHaveBeenCalled();
+    expect(h.backend.getPositionMs()).toBe(0);
+    h.backend.stop();
+  });
+
+  it("after playTrack, a normal finish emits trackEnded exactly once for our uri", async () => {
+    const h = makeHarness();
+    const ended = vi.fn();
+    h.backend.on("trackEnded", ended);
+    // Arm detection via our own play, then confirm-then-finish our uri.
+    await h.backend.playTrack("spotify:track:ours");
+    h.connect.getPlaybackState
+      .mockResolvedValueOnce({ isPlaying: true, progressMs: 1000, trackUri: "spotify:track:ours", durationMs: 200000 })
+      .mockResolvedValueOnce({ isPlaying: true, progressMs: 199000, trackUri: "spotify:track:ours", durationMs: 200000 });
+    await (h.backend as any).pollState(); // confirms our uri playing
+    expect(ended).not.toHaveBeenCalled();
+    await (h.backend as any).pollState(); // finishes
+    expect(ended).toHaveBeenCalledTimes(1);
+    expect(ended).toHaveBeenCalledWith({ uri: "spotify:track:ours", reason: "ended" });
   });
 });
 
