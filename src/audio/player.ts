@@ -47,7 +47,7 @@ const resolvedFfmpeg: string = (() => {
   return "ffmpeg";
 })();
 
-function getFfmpegCommand(): string {
+export function getFfmpegCommand(): string {
   return resolvedFfmpeg;
 }
 
