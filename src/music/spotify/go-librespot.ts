@@ -105,66 +105,89 @@ export class GoLibrespotBackend extends EventEmitter implements SpotifyAudioBack
     if (existsSync(this.fifoPath)) unlinkSync(this.fifoPath);
     execFileSync("mkfifo", [this.fifoPath]);
 
-    // 3. Spawn ffmpeg FIRST so the PCM reader is attached to the FIFO before
-    //    go-librespot (the writer) starts pushing raw 44.1k s16le into it.
-    //    Opening the FIFO for writing before a reader exists errors with ENXIO.
-    this.ffmpeg = spawn(
-      ffmpegCommand,
-      [
-        "-hide_banner", "-loglevel", "error",
-        "-f", "s16le", "-ar", "44100", "-ac", "2", "-i", this.fifoPath,
-        "-f", "s16le", "-ar", "48000", "-ac", "2", "-acodec", "pcm_s16le", "pipe:1",
-      ],
-      { stdio: ["ignore", "pipe", "pipe"] },
-    );
-    this.ffmpeg.stderr?.on("data", (b: Buffer) =>
-      this.log.debug({ ffmpeg: b.toString().trim() }, "ffmpeg"),
-    );
-    this.ffmpeg.on("error", (err) => this.emit("error", err));
+    // Everything past this point spawns processes / opens sockets. If any step
+    // throws (e.g. the readiness poll times out), tear down whatever was already
+    // created via stop() (kill ffmpeg + go-librespot, close WS, remove FIFO) so
+    // we don't leak child processes or leave the FIFO on disk, then rethrow.
+    try {
+      // 3. Spawn ffmpeg FIRST so the PCM reader is attached to the FIFO before
+      //    go-librespot (the writer) starts pushing raw 44.1k s16le into it.
+      //    Opening the FIFO for writing before a reader exists errors with ENXIO.
+      this.ffmpeg = spawn(
+        ffmpegCommand,
+        [
+          "-hide_banner", "-loglevel", "error",
+          "-f", "s16le", "-ar", "44100", "-ac", "2", "-i", this.fifoPath,
+          "-f", "s16le", "-ar", "48000", "-ac", "2", "-acodec", "pcm_s16le", "pipe:1",
+        ],
+        { stdio: ["ignore", "pipe", "pipe"] },
+      );
+      this.ffmpeg.stderr?.on("data", (b: Buffer) =>
+        this.log.debug({ ffmpeg: b.toString().trim() }, "ffmpeg"),
+      );
+      this.ffmpeg.on("error", (err) => this.emitError(err));
 
-    // 4. Render + write config.yml into the config dir.
-    const yml = renderConfigYml({
-      deviceName: this.opts.deviceName,
-      bitrate: this.opts.bitrate,
-      fifoPath: this.fifoPath,
-      apiAddress: "0.0.0.0",
-      apiPort: this.apiPort,
-      callbackPort: DEFAULT_CALLBACK_PORT,
-    });
-    writeFileSync(posixPath.join(this.opts.configDir, "config.yml"), yml, "utf8");
+      // 4. Render + write config.yml into the config dir.
+      const yml = renderConfigYml({
+        deviceName: this.opts.deviceName,
+        bitrate: this.opts.bitrate,
+        fifoPath: this.fifoPath,
+        apiAddress: "0.0.0.0",
+        apiPort: this.apiPort,
+        callbackPort: DEFAULT_CALLBACK_PORT,
+      });
+      writeFileSync(posixPath.join(this.opts.configDir, "config.yml"), yml, "utf8");
 
-    // 5. Spawn go-librespot AFTER ffmpeg is listening on the FIFO. Its stdout/
-    //    stderr carry the interactive OAuth URL on first run — surface via logger.
-    const bin = findBinary();
-    this.proc = spawn(bin, ["--config_dir", this.opts.configDir], {
-      stdio: ["ignore", "pipe", "pipe"],
-    });
-    const onLog = (b: Buffer) => this.log.info({ golibrespot: b.toString().trim() }, "go-librespot");
-    this.proc.stdout?.on("data", onLog);
-    this.proc.stderr?.on("data", onLog);
-    this.proc.on("error", (err) => this.emit("error", err));
-    this.proc.on("exit", (code, signal) => {
-      this.ready = false;
-      this.log.warn({ code, signal }, "go-librespot exited");
-    });
+      // 5. Spawn go-librespot AFTER ffmpeg is listening on the FIFO. Its stdout/
+      //    stderr carry the interactive OAuth URL on first run — surface via logger.
+      const bin = findBinary();
+      this.proc = spawn(bin, ["--config_dir", this.opts.configDir], {
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+      const onLog = (b: Buffer) => this.log.info({ golibrespot: b.toString().trim() }, "go-librespot");
+      this.proc.stdout?.on("data", onLog);
+      this.proc.stderr?.on("data", onLog);
+      this.proc.on("error", (err) => this.emitError(err));
+      this.proc.on("exit", (code, signal) => {
+        this.ready = false;
+        this.log.warn({ code, signal }, "go-librespot exited");
+      });
 
-    // 6. REST client, then poll GET / until the HTTP server answers.
-    const baseUrl = `http://127.0.0.1:${this.apiPort}`;
-    this.rest = this.deps.makeRest
-      ? this.deps.makeRest(baseUrl)
-      : new GoLibrespotRestClient(baseUrl);
-    await this.waitUntilReady();
+      // 6. REST client, then poll GET / until the HTTP server answers.
+      const baseUrl = `http://127.0.0.1:${this.apiPort}`;
+      this.rest = this.deps.makeRest
+        ? this.deps.makeRest(baseUrl)
+        : new GoLibrespotRestClient(baseUrl);
+      await this.waitUntilReady();
 
-    // 7. Connect the WebSocket event stream and wire event mapping.
-    const wsUrl = `ws://127.0.0.1:${this.apiPort}/events`;
-    this.events = this.deps.makeEvents
-      ? this.deps.makeEvents(wsUrl)
-      : new GoLibrespotEventClient(wsUrl);
-    this.wireEvents(this.events);
-    this.events.start();
+      // 7. Connect the WebSocket event stream and wire event mapping.
+      const wsUrl = `ws://127.0.0.1:${this.apiPort}/events`;
+      this.events = this.deps.makeEvents
+        ? this.deps.makeEvents(wsUrl)
+        : new GoLibrespotEventClient(wsUrl);
+      this.wireEvents(this.events);
+      this.events.start();
 
-    this.ready = true;
-    this.emit("ready");
+      this.ready = true;
+      this.emit("ready");
+    } catch (e) {
+      this.stop();
+      throw e;
+    }
+  }
+
+  /**
+   * Re-emit a child-process "error" only when a consumer is listening; Node
+   * throws on an unhandled "error" event (can crash the process), so with no
+   * listener we log via the injected logger instead. Mirrors the WS client's
+   * listenerCount("error") gate in go-librespot-api.ts.
+   */
+  private emitError(err: unknown): void {
+    if (this.listenerCount("error") > 0) {
+      this.emit("error", err);
+    } else {
+      this.log.error({ err }, "go-librespot backend error (no listener)");
+    }
   }
 
   private async waitUntilReady(): Promise<void> {

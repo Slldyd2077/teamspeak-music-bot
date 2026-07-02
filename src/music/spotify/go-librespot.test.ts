@@ -219,3 +219,43 @@ describe("GoLibrespotBackend.stop", () => {
     expect(h.backend.isReady()).toBe(false);
   });
 });
+
+describe("GoLibrespotBackend.start failure cleanup", () => {
+  it("tears down ffmpeg, go-librespot, and the FIFO when readiness polling never succeeds", async () => {
+    const h = makeHarness();
+    // ping() never returns true → waitUntilReady() times out → start() rejects
+    // AFTER both processes were spawned and the FIFO was created.
+    h.rest.ping.mockResolvedValue(false);
+    // FIFO present so the cleanup path unlinks it.
+    h.existsSync.mockReturnValue(true);
+
+    await expect(h.backend.start()).rejects.toThrow(/did not become ready/);
+
+    expect(h.ffmpegChild.kill).toHaveBeenCalled(); // ffmpeg killed on failed startup
+    expect(h.gliChild.kill).toHaveBeenCalled(); // go-librespot killed on failed startup
+    expect(h.unlinkSync).toHaveBeenCalledWith("/tmp/work/go-librespot.fifo"); // FIFO removed
+    expect(h.backend.isReady()).toBe(false);
+  });
+});
+
+describe("GoLibrespotBackend child-process error handling", () => {
+  it("does not throw when a child 'error' is emitted with no backend 'error' listener attached", async () => {
+    const h = makeHarness();
+    await h.backend.start();
+    // No "error" listener on the backend: an unhandled 'error' event would crash
+    // Node, so the backend must swallow+log it instead of re-emitting.
+    expect(h.backend.listenerCount("error")).toBe(0);
+    expect(() => h.ffmpegChild.emit("error", new Error("ffmpeg boom"))).not.toThrow();
+    expect(() => h.gliChild.emit("error", new Error("gli boom"))).not.toThrow();
+  });
+
+  it("re-emits a child 'error' to an attached backend 'error' listener", async () => {
+    const h = makeHarness();
+    await h.backend.start();
+    const onErr = vi.fn();
+    h.backend.on("error", onErr);
+    const err = new Error("ffmpeg boom");
+    h.ffmpegChild.emit("error", err);
+    expect(onErr).toHaveBeenCalledWith(err);
+  });
+});
