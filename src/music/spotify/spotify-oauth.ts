@@ -51,7 +51,7 @@ export interface SpotifyOAuthOptions {
    */
   redirectUri?: string;
   store: OAuthTokenStore;
-  deps?: { http?: AxiosInstance };
+  deps?: { http?: AxiosInstance; now?: () => number };
 }
 
 /** 64 random chars from the PKCE unreserved set (43-128 allowed by the spec). */
@@ -111,8 +111,20 @@ export class SpotifyOAuth {
   private redirectUri: string;
   private store: OAuthTokenStore;
   private http: AxiosInstance;
+  // Injectable clock (tests drive a mutable now); defaults to Date.now.
+  private now: () => number;
   // Pending PKCE verifiers keyed by state, awaiting the loopback redirect back.
-  private pendingVerifiers = new Map<string, string>();
+  private pendingVerifiers = new Map<
+    string,
+    { verifier: string; expiresAt: number }
+  >();
+  // A verifier is abandoned if the redirect never returns; drop it after TTL and
+  // cap the map so parallel logins can't grow it without bound.
+  private static readonly VERIFIER_TTL_MS = 10 * 60 * 1000;
+  private static readonly VERIFIER_MAX = 32;
+  // Collapse concurrent refreshes into one POST (rotation invalidates the token
+  // a second in-flight refresh would send); cleared in .finally().
+  private refreshInFlight: Promise<string | null> | null = null;
 
   constructor(o: SpotifyOAuthOptions) {
     this.clientId = o.clientId ?? "";
@@ -120,6 +132,20 @@ export class SpotifyOAuth {
     this.store = o.store;
     this.http =
       o.deps?.http ?? axios.create({ baseURL: ACCOUNTS_BASE, timeout: 15_000 });
+    this.now = o.deps?.now ?? (() => Date.now());
+  }
+
+  private evictStaleVerifiers(): void {
+    const t = this.now();
+    for (const [state, e] of this.pendingVerifiers) {
+      if (e.expiresAt < t) this.pendingVerifiers.delete(state);
+    }
+    // Bound memory even if all are unexpired: drop oldest (insertion order).
+    while (this.pendingVerifiers.size >= SpotifyOAuth.VERIFIER_MAX) {
+      const oldest = this.pendingVerifiers.keys().next().value;
+      if (oldest === undefined) break;
+      this.pendingVerifiers.delete(oldest);
+    }
   }
 
   getClientId(): string {
@@ -142,7 +168,11 @@ export class SpotifyOAuth {
     }
     const state = randomBytes(16).toString("hex");
     const verifier = generateCodeVerifier();
-    this.pendingVerifiers.set(state, verifier);
+    this.evictStaleVerifiers();
+    this.pendingVerifiers.set(state, {
+      verifier,
+      expiresAt: this.now() + SpotifyOAuth.VERIFIER_TTL_MS,
+    });
     const params = new URLSearchParams({
       client_id: this.clientId,
       response_type: "code",
@@ -156,8 +186,13 @@ export class SpotifyOAuth {
   }
 
   async handleCallback(code: string, state: string): Promise<boolean> {
-    const verifier = this.pendingVerifiers.get(state);
-    if (!verifier) return false; // unknown/expired state -> CSRF guard
+    const entry = this.pendingVerifiers.get(state);
+    if (!entry || entry.expiresAt < this.now()) {
+      // unknown/expired state -> CSRF guard (drop any stale entry too)
+      this.pendingVerifiers.delete(state);
+      return false;
+    }
+    const verifier = entry.verifier;
     // C3.7: drop the state->verifier entry on EVERY terminal path (success,
     // rejected token exchange, or throw) so a failed login can't leak/replay it.
     try {
@@ -185,10 +220,16 @@ export class SpotifyOAuth {
     if (!this.clientId) return null; // C3.2: no app => nothing to mint against
     const tokens = this.store.load();
     if (!tokens?.refreshToken) return null; // unauthorized
-    if (tokens.accessToken && Date.now() < tokens.expiresAt) {
+    if (tokens.accessToken && this.now() < tokens.expiresAt) {
       return tokens.accessToken;
     }
-    return this.refresh(tokens);
+    // Collapse concurrent refreshes: rotation makes a second in-flight refresh
+    // use a refresh token the first one already invalidated.
+    if (this.refreshInFlight) return this.refreshInFlight;
+    this.refreshInFlight = this.refresh(tokens).finally(() => {
+      this.refreshInFlight = null;
+    });
+    return this.refreshInFlight;
   }
 
   private async refresh(current: OAuthTokens): Promise<string | null> {
@@ -218,7 +259,7 @@ export class SpotifyOAuth {
     return {
       accessToken: data.access_token,
       refreshToken,
-      expiresAt: Date.now() + (data.expires_in ?? 3600) * 1000 - EXPIRY_SKEW_MS,
+      expiresAt: this.now() + (data.expires_in ?? 3600) * 1000 - EXPIRY_SKEW_MS,
       scope: scope ?? SPOTIFY_CONTROL_SCOPES,
     };
   }

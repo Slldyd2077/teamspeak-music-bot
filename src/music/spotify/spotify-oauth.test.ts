@@ -37,6 +37,17 @@ function memStore(
   return s;
 }
 
+/** A manually-settled promise, to hold a token POST "in flight" during a test. */
+function deferred<T>() {
+  let resolve!: (v: T) => void;
+  let reject!: (e: unknown) => void;
+  const promise = new Promise<T>((res, rej) => {
+    resolve = res;
+    reject = rej;
+  });
+  return { promise, resolve, reject };
+}
+
 describe("PKCE helpers", () => {
   it("generateCodeVerifier returns 64 chars from the unreserved set", () => {
     const v = generateCodeVerifier();
@@ -270,6 +281,131 @@ describe("SpotifyOAuth.getAccessToken", () => {
     expect(await oauth.getAccessToken()).toBeNull();
     expect(oauth.isAuthorized()).toBe(false);
     expect(http.post).not.toHaveBeenCalled();
+  });
+});
+
+// S4.3: refresh-token rotation makes two concurrent refreshes race — the second
+// would POST with a token the first already invalidated. Collapse them into one.
+describe("SpotifyOAuth.getAccessToken (in-flight refresh, S4.3)", () => {
+  it("collapses concurrent refreshes into a single token POST", async () => {
+    let t = 0;
+    const now = () => t;
+    const store = memStore({
+      accessToken: "old",
+      refreshToken: "r1",
+      expiresAt: 0, // now()=0 is not < 0 -> expired -> must refresh
+      scope: "s",
+    });
+    const d = deferred<any>();
+    const http = { post: vi.fn().mockReturnValue(d.promise) } as any;
+    const oauth = new SpotifyOAuth({
+      clientId: CLIENT_ID,
+      store,
+      deps: { http, now },
+    });
+
+    // Fire two calls while the POST is still pending.
+    const p1 = oauth.getAccessToken();
+    const p2 = oauth.getAccessToken();
+    expect(http.post).toHaveBeenCalledTimes(1); // collapsed to ONE POST
+
+    d.resolve({
+      data: { access_token: "a2", refresh_token: "r2", expires_in: 3600 },
+    });
+    expect(await p1).toBe("a2");
+    expect(await p2).toBe("a2");
+    expect(http.post).toHaveBeenCalledTimes(1);
+    expect(store.value?.refreshToken).toBe("r2"); // rotated once, not twice
+  });
+
+  it("clears the in-flight refresh after it settles, allowing a later refresh", async () => {
+    let t = 0;
+    const now = () => t;
+    const store = memStore({
+      accessToken: "old",
+      refreshToken: "r1",
+      expiresAt: 0,
+      scope: "s",
+    });
+    const http = {
+      post: vi
+        .fn()
+        .mockResolvedValueOnce({
+          data: { access_token: "a2", refresh_token: "r2", expires_in: 3600 },
+        })
+        .mockResolvedValueOnce({
+          data: { access_token: "a3", refresh_token: "r3", expires_in: 3600 },
+        }),
+    } as any;
+    const oauth = new SpotifyOAuth({
+      clientId: CLIENT_ID,
+      store,
+      deps: { http, now },
+    });
+
+    expect(await oauth.getAccessToken()).toBe("a2");
+    expect(http.post).toHaveBeenCalledTimes(1);
+
+    // toTokens now uses this.now(): saved expiresAt = 0 + 3600s - 30s skew.
+    // Still valid at t=0 -> cached, no new POST.
+    expect(await oauth.getAccessToken()).toBe("a2");
+    expect(http.post).toHaveBeenCalledTimes(1);
+
+    // Advance past the newly-saved expiry -> in-flight was cleared, so a fresh
+    // refresh fires (proves .finally() reset refreshInFlight).
+    t = 3600 * 1000;
+    expect(await oauth.getAccessToken()).toBe("a3");
+    expect(http.post).toHaveBeenCalledTimes(2);
+    expect(store.value?.refreshToken).toBe("r3");
+  });
+});
+
+// S4.3: bound the PKCE verifier map so abandoned logins can't accumulate.
+describe("SpotifyOAuth PKCE verifier TTL + cap (S4.3)", () => {
+  it("expires a pending verifier after the TTL (handleCallback returns false)", async () => {
+    let t = 0;
+    const now = () => t;
+    const http = { post: vi.fn() } as any;
+    const oauth = new SpotifyOAuth({
+      clientId: CLIENT_ID,
+      redirectUri: REDIRECT_URI,
+      store: memStore(),
+      deps: { http, now },
+    });
+    const { state } = oauth.buildAuthorizeUrl();
+
+    t = 10 * 60 * 1000 + 1; // VERIFIER_TTL_MS + 1
+    expect(await oauth.handleCallback("CODE", state)).toBe(false);
+    expect(http.post).not.toHaveBeenCalled(); // never reached the token step
+  });
+
+  it("caps the verifier map, evicting the oldest state (behavioral)", async () => {
+    let t = 0;
+    const now = () => t;
+    const http = {
+      post: vi.fn().mockResolvedValue({
+        data: { access_token: "a1", refresh_token: "r1", expires_in: 3600 },
+      }),
+    } as any;
+    const oauth = new SpotifyOAuth({
+      clientId: CLIENT_ID,
+      redirectUri: REDIRECT_URI,
+      store: memStore(),
+      deps: { http, now },
+    });
+
+    // First (oldest) state, then enough more to exceed VERIFIER_MAX (32).
+    const first = oauth.buildAuthorizeUrl().state;
+    let last = first;
+    for (let i = 0; i < 32; i++) last = oauth.buildAuthorizeUrl().state;
+
+    // The oldest was evicted -> unknown state -> CSRF guard, no token POST.
+    expect(await oauth.handleCallback("CODE", first)).toBe(false);
+    expect(http.post).not.toHaveBeenCalled();
+
+    // A still-pending (newest) state DOES resolve -> only the oldest was dropped.
+    expect(await oauth.handleCallback("CODE", last)).toBe(true);
+    expect(http.post).toHaveBeenCalledTimes(1);
   });
 });
 
