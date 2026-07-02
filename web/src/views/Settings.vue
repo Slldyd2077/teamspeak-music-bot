@@ -449,6 +449,106 @@
       </div>
     </section>
 
+    <!-- Spotify (Connect) playback via librespot — requires platform.auth -->
+    <section v-if="can('platform.auth')" class="settings-section">
+      <h2 class="section-title">Spotify 播放（实验性）</h2>
+      <p class="spotify-disclaimer">{{ SPOTIFY_DISCLAIMER }}</p>
+
+      <div class="account-card">
+        <div class="account-header">
+          <Icon icon="mdi:spotify" class="account-icon spotify-icon" />
+          <div class="account-info">
+            <div class="account-name">Spotify (librespot)</div>
+            <div class="account-status" :class="`tone-${spotifyStatusSummary.tone}`">
+              {{ spotifyStatusSummary.label }}
+            </div>
+          </div>
+        </div>
+
+        <!-- Enable -->
+        <label class="profile-toggle behavior-toggle spotify-toggle">
+          <div class="profile-toggle-text">
+            <div class="profile-toggle-label">启用 Spotify 播放</div>
+            <div class="profile-toggle-hint">开启后可通过 librespot 后端播放 Spotify（需 Premium 账号 + 你自己注册的开发者应用凭据）。默认关闭。</div>
+          </div>
+          <input v-model="spotifyForm.enabled" type="checkbox" class="profile-toggle-switch" />
+        </label>
+
+        <!-- Backend -->
+        <div class="setting-row spotify-row">
+          <div class="setting-label">播放后端</div>
+          <div class="spotify-btn-group">
+            <button
+              v-for="b in SPOTIFY_BACKENDS"
+              :key="b.value"
+              class="spotify-choice"
+              :class="{ active: spotifyForm.backend === b.value }"
+              @click="spotifyForm.backend = b.value"
+            >
+              {{ b.label }}
+            </button>
+          </div>
+        </div>
+
+        <!-- Bitrate -->
+        <div class="setting-row spotify-row">
+          <div class="setting-label">比特率 (kbps)</div>
+          <div class="spotify-btn-group">
+            <button
+              v-for="rate in SPOTIFY_BITRATES"
+              :key="rate"
+              class="spotify-choice"
+              :class="{ active: spotifyForm.bitrate === rate }"
+              @click="spotifyForm.bitrate = rate"
+            >
+              {{ rate }}
+            </button>
+          </div>
+        </div>
+
+        <!-- Client ID -->
+        <div class="form-group">
+          <label>Client ID</label>
+          <input v-model="spotifyForm.clientId" class="input" autocomplete="off" placeholder="Spotify 开发者应用 Client ID" />
+        </div>
+
+        <!-- Client Secret (write-only) -->
+        <div class="form-group">
+          <label>
+            Client Secret
+            <span class="spotify-secret-hint" :class="{ set: spotifyHasSecret }">
+              {{ spotifyHasSecret ? '已设置' : '未设置' }}
+            </span>
+          </label>
+          <input
+            v-model="spotifyForm.clientSecret"
+            class="input"
+            type="password"
+            autocomplete="off"
+            placeholder="留空表示不修改已保存的 Secret"
+          />
+        </div>
+
+        <!-- Device name -->
+        <div class="form-group">
+          <label>设备名称</label>
+          <input v-model="spotifyForm.deviceName" class="input" autocomplete="off" placeholder="TSMusicBot" />
+        </div>
+
+        <div class="spotify-actions">
+          <button class="btn-primary" :disabled="spotifySaving" @click="saveSpotify">
+            {{ spotifySaving ? '保存中…' : '保存' }}
+          </button>
+          <button class="btn-secondary spotify-connect" :disabled="spotifyConnecting" @click="connectSpotify">
+            <Icon icon="mdi:spotify" />
+            {{ spotifyConnecting ? '跳转中…' : '连接 Spotify' }}
+          </button>
+        </div>
+
+        <p v-if="spotifyMessage" class="spotify-message" :class="`tone-${spotifyMessageTone}`">{{ spotifyMessage }}</p>
+      </div>
+    </section>
+
     <!-- Audio Quality requires quality -->
     <section v-if="can('quality')" class="settings-section">
       <h2 class="section-title">音质设置</h2>
@@ -812,7 +912,7 @@
 </template>
 
 <script setup lang="ts">
-import { ref, reactive, onMounted, onUnmounted } from 'vue';
+import { ref, reactive, computed, onMounted, onUnmounted } from 'vue';
 import { Icon } from '@iconify/vue';
 import axios from 'axios';
 import AvatarUpload from '../components/AvatarUpload.vue';
@@ -820,6 +920,14 @@ import CustomAvatarRow from '../components/CustomAvatarRow.vue';
 import QRCode from 'qrcode';
 import { usePlayerStore } from '../stores/player.js';
 import { useSession } from '../composables/useSession.js';
+import {
+  buildSpotifyPayload,
+  parseSpotifyRedirect,
+  statusSummary,
+  SPOTIFY_DISCLAIMER,
+  type SpotifyConfigForm,
+  type SpotifyStatus,
+} from '../composables/useSpotifySettings.js';
 
 const store = usePlayerStore();
 
@@ -1144,6 +1252,7 @@ async function loadIdleTimeout() {
     localAudioEnabled.value = res.data.localAudioEnabled ?? true;
     applyGuestModeFromServer(res.data.guestMode);
     applyAdminGroupsFromServer(res.data.adminGroups);
+    applySpotifyConfig(res.data.spotify);
   } catch { /* ignore */ }
 }
 
@@ -1164,6 +1273,97 @@ async function saveLocalAudioEnabled() {
     const res = await axios.post('/api/bot/settings', { localAudioEnabled: localAudioEnabled.value });
     localAudioEnabled.value = res.data.localAudioEnabled ?? localAudioEnabled.value;
   } catch { /* ignore */ }
+}
+
+// --- Spotify (Connect) settings (§8) ---
+// NOTE: This card's status comes ONLY from /api/spotify/status (playback OAuth
+// `authorized`). It is deliberately NOT wired to the player store's
+// authStatus.spotify (which reflects /api/auth/status?platform=spotify — the
+// separate metadata Web-API login). Keep the two concepts distinct.
+const spotifyForm = reactive<SpotifyConfigForm>({
+  enabled: false,
+  backend: 'auto',
+  clientId: '',
+  clientSecret: '',
+  deviceName: 'TSMusicBot',
+  bitrate: 320,
+});
+const spotifyHasSecret = ref(false);
+const spotifyStatus = ref<SpotifyStatus | null>(null);
+const spotifySaving = ref(false);
+const spotifyConnecting = ref(false);
+const spotifyMessage = ref('');
+const spotifyMessageTone = ref<'ok' | 'warn'>('ok');
+
+const SPOTIFY_BACKENDS: { value: SpotifyConfigForm['backend']; label: string }[] = [
+  { value: 'auto', label: '自动' },
+  { value: 'go-librespot', label: 'go-librespot' },
+  { value: 'librespot', label: 'librespot' },
+];
+const SPOTIFY_BITRATES = [96, 160, 320];
+
+const spotifyStatusSummary = computed(() => statusSummary(spotifyStatus.value, spotifyForm.enabled));
+
+// Populate the form from the masked GET /api/bot/settings response. The raw
+// clientSecret is write-only and never returned — only `hasClientSecret`.
+function applySpotifyConfig(sp: any) {
+  if (!sp || typeof sp !== 'object') return;
+  spotifyForm.enabled = Boolean(sp.enabled);
+  if (sp.backend === 'auto' || sp.backend === 'go-librespot' || sp.backend === 'librespot') {
+    spotifyForm.backend = sp.backend;
+  }
+  spotifyForm.clientId = typeof sp.clientId === 'string' ? sp.clientId : '';
+  spotifyForm.deviceName = typeof sp.deviceName === 'string' ? sp.deviceName : '';
+  if (typeof sp.bitrate === 'number') spotifyForm.bitrate = sp.bitrate;
+  spotifyForm.clientSecret = ''; // always blank on load; blank on save = unchanged
+  spotifyHasSecret.value = Boolean(sp.hasClientSecret);
+}
+
+async function loadSpotifyStatus() {
+  try {
+    const res = await axios.get('/api/spotify/status');
+    spotifyStatus.value = res.data;
+  } catch {
+    spotifyStatus.value = null;
+  }
+}
+
+async function saveSpotify() {
+  spotifySaving.value = true;
+  try {
+    const res = await axios.post('/api/bot/settings', buildSpotifyPayload(spotifyForm));
+    applySpotifyConfig(res.data?.spotify);
+    await loadSpotifyStatus();
+  } catch { /* ignore */ } finally {
+    spotifySaving.value = false;
+  }
+}
+
+async function connectSpotify() {
+  spotifyConnecting.value = true;
+  spotifyMessage.value = '';
+  try {
+    const { data } = await axios.get('/api/spotify/login');
+    window.location.href = data.url;
+  } catch (err: any) {
+    spotifyConnecting.value = false;
+    spotifyMessageTone.value = 'warn';
+    spotifyMessage.value = err?.response?.status === 403
+      ? '没有权限执行平台登录（需要 platform.auth）'
+      : '无法开始 Spotify 授权，请稍后重试';
+  }
+}
+
+// On mount, surface the ?spotify=success|error redirect result, then strip the
+// param so a refresh doesn't re-show it.
+function handleSpotifyRedirect() {
+  const r = parseSpotifyRedirect(window.location.search);
+  if (!r) return;
+  spotifyMessageTone.value = r === 'success' ? 'ok' : 'warn';
+  spotifyMessage.value = r === 'success' ? 'Spotify 授权成功' : 'Spotify 授权失败或被取消';
+  const url = new URL(window.location.href);
+  url.searchParams.delete('spotify');
+  history.replaceState(null, '', url.pathname + url.search + url.hash);
 }
 
 // --- Guest mode (admin only) ---
@@ -1630,7 +1830,9 @@ onMounted(() => {
   store.fetchBots(); // Refresh bot status on page visit
   checkAuthStatus();
   loadQuality();
-  loadIdleTimeout();
+  loadIdleTimeout(); // also populates the Spotify config form (same endpoint)
+  loadSpotifyStatus();
+  handleSpotifyRedirect();
   if (session.isAdmin.value) {
     loadUsers();
     loadAudit();
@@ -1889,6 +2091,79 @@ onUnmounted(() => {
 
 .btn-save {
   align-self: flex-end;
+}
+
+// --- Spotify (Connect) card ---
+.spotify-disclaimer {
+  font-size: 13px;
+  line-height: 1.6;
+  color: var(--color-paused);
+  background: var(--color-paused-15);
+  border-radius: var(--radius-sm);
+  padding: 12px 14px;
+  margin: -4px 0 16px;
+}
+
+.spotify-icon { color: #1db954; }
+
+.account-status {
+  &.tone-ok { color: var(--color-online); }
+  &.tone-warn { color: var(--color-paused); }
+  &.tone-off { color: var(--text-tertiary); }
+}
+
+.spotify-toggle { padding-top: 0; margin-bottom: 4px; }
+.spotify-row { margin-top: 4px; }
+
+.spotify-btn-group {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.spotify-choice {
+  padding: 8px 16px;
+  background: var(--bg-card);
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-sm);
+  font-size: 13px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: all var(--transition-fast);
+
+  &:hover { border-color: var(--color-primary); color: var(--color-primary); }
+  &.active {
+    background: var(--color-primary-10);
+    border-color: var(--color-primary);
+    color: var(--color-primary);
+  }
+}
+
+.spotify-secret-hint {
+  margin-left: 8px;
+  font-size: 11px;
+  font-weight: 500;
+  color: var(--text-tertiary);
+  &.set { color: var(--color-online); }
+}
+
+.spotify-actions {
+  display: flex;
+  gap: 10px;
+  margin-top: 8px;
+}
+
+.spotify-connect {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.spotify-message {
+  margin: 10px 0 0;
+  font-size: 13px;
+  &.tone-ok { color: var(--color-online); }
+  &.tone-warn { color: #e26a6a; }
 }
 
 // Shared
