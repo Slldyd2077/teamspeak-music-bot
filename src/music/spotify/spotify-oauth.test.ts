@@ -1,0 +1,297 @@
+import { describe, it, expect, vi } from "vitest";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import {
+  SpotifyOAuth,
+  SPOTIFY_CONTROL_SCOPES,
+  generateCodeVerifier,
+  codeChallengeS256,
+  createFileOAuthTokenStore,
+  type OAuthTokens,
+  type OAuthTokenStore,
+} from "./spotify-oauth.js";
+
+// Correction C3.2: the control OAuth REQUIRES a user-provided client_id (their
+// own Spotify Developer app) + caller-supplied loopback redirect. There is NO
+// librespot public-client / :5588 default.
+const CLIENT_ID = "test-client-id";
+const REDIRECT_URI = "http://127.0.0.1:8888/api/spotify/callback";
+
+/** In-memory store exposing `.value` so tests can assert persistence. */
+function memStore(
+  initial: OAuthTokens | null = null,
+): OAuthTokenStore & { value: OAuthTokens | null } {
+  const s = {
+    value: initial,
+    load() {
+      return s.value;
+    },
+    save(t: OAuthTokens) {
+      s.value = t;
+    },
+    clear() {
+      s.value = null;
+    },
+  };
+  return s;
+}
+
+describe("PKCE helpers", () => {
+  it("generateCodeVerifier returns 64 chars from the unreserved set", () => {
+    const v = generateCodeVerifier();
+    expect(v).toHaveLength(64);
+    expect(v).toMatch(/^[A-Za-z0-9\-._~]{64}$/);
+    expect(generateCodeVerifier()).not.toBe(v); // random
+  });
+
+  it("codeChallengeS256 is base64url(sha256) with no padding (43 chars)", () => {
+    const c = codeChallengeS256("abc123");
+    expect(c).toHaveLength(43); // 32-byte digest -> 43 base64url chars
+    expect(c).not.toContain("=");
+    expect(c).toMatch(/^[A-Za-z0-9_-]+$/);
+  });
+});
+
+describe("SpotifyOAuth.buildAuthorizeUrl", () => {
+  it("builds accounts.spotify.com/authorize with the caller's clientId + redirectUri + S256", () => {
+    const oauth = new SpotifyOAuth({
+      clientId: CLIENT_ID,
+      redirectUri: REDIRECT_URI,
+      store: memStore(),
+    });
+    const { url, state } = oauth.buildAuthorizeUrl();
+    const u = new URL(url);
+    expect(u.origin + u.pathname).toBe("https://accounts.spotify.com/authorize");
+    const p = u.searchParams;
+    expect(p.get("client_id")).toBe(CLIENT_ID);
+    expect(p.get("response_type")).toBe("code");
+    expect(p.get("redirect_uri")).toBe(REDIRECT_URI);
+    expect(p.get("code_challenge_method")).toBe("S256");
+    expect(p.get("code_challenge")).toHaveLength(43);
+    expect(p.get("scope")).toBe(SPOTIFY_CONTROL_SCOPES);
+    expect(p.get("state")).toBe(state);
+    expect(state).toMatch(/^[0-9a-f]{32}$/);
+    expect(oauth.getClientId()).toBe(CLIENT_ID);
+    expect(oauth.getRedirectUri()).toBe(REDIRECT_URI);
+  });
+
+  // Correction C3.2: no clientId => cannot start OAuth; throw a clear message.
+  it("throws a clear error when clientId is empty", () => {
+    const oauth = new SpotifyOAuth({ redirectUri: REDIRECT_URI, store: memStore() });
+    expect(() => oauth.buildAuthorizeUrl()).toThrow(/Client ID/i);
+  });
+});
+
+describe("SpotifyOAuth.isAuthorized (C3.2)", () => {
+  it("is false without a clientId even if a refresh token is stored", () => {
+    const store = memStore({
+      accessToken: "a",
+      refreshToken: "r",
+      expiresAt: Date.now() + 60_000,
+      scope: "s",
+    });
+    const oauth = new SpotifyOAuth({ redirectUri: REDIRECT_URI, store });
+    expect(oauth.isAuthorized()).toBe(false);
+  });
+
+  it("is true with a clientId and a stored refresh token", () => {
+    const store = memStore({
+      accessToken: "a",
+      refreshToken: "r",
+      expiresAt: Date.now() + 60_000,
+      scope: "s",
+    });
+    const oauth = new SpotifyOAuth({ clientId: CLIENT_ID, store });
+    expect(oauth.isAuthorized()).toBe(true);
+  });
+});
+
+describe("SpotifyOAuth.handleCallback", () => {
+  it("exchanges the code (PKCE verifier matches the authorize challenge) and persists tokens", async () => {
+    const store = memStore();
+    const http = {
+      post: vi.fn().mockResolvedValue({
+        data: {
+          access_token: "a1",
+          refresh_token: "r1",
+          expires_in: 3600,
+          scope: SPOTIFY_CONTROL_SCOPES,
+        },
+      }),
+    } as any;
+    const oauth = new SpotifyOAuth({
+      clientId: CLIENT_ID,
+      redirectUri: REDIRECT_URI,
+      store,
+      deps: { http },
+    });
+
+    const { url, state } = oauth.buildAuthorizeUrl();
+    const challenge = new URL(url).searchParams.get("code_challenge")!;
+
+    const ok = await oauth.handleCallback("CODE123", state);
+    expect(ok).toBe(true);
+
+    const [path, bodyStr, cfg] = http.post.mock.calls[0];
+    expect(path).toBe("/api/token");
+    expect(cfg.headers["Content-Type"]).toBe("application/x-www-form-urlencoded");
+    const body = new URLSearchParams(bodyStr as string);
+    expect(body.get("grant_type")).toBe("authorization_code");
+    expect(body.get("code")).toBe("CODE123");
+    expect(body.get("redirect_uri")).toBe(REDIRECT_URI);
+    expect(body.get("client_id")).toBe(CLIENT_ID);
+    // The verifier sent MUST hash to the challenge advertised in the authorize URL.
+    const verifier = body.get("code_verifier")!;
+    expect(codeChallengeS256(verifier)).toBe(challenge);
+
+    expect(store.value?.accessToken).toBe("a1");
+    expect(store.value?.refreshToken).toBe("r1");
+    expect(store.value?.expiresAt).toBeGreaterThan(Date.now());
+    expect(oauth.isAuthorized()).toBe(true);
+  });
+
+  it("rejects an unknown state without calling the token endpoint (CSRF guard)", async () => {
+    const http = { post: vi.fn() } as any;
+    const oauth = new SpotifyOAuth({
+      clientId: CLIENT_ID,
+      redirectUri: REDIRECT_URI,
+      store: memStore(),
+      deps: { http },
+    });
+    expect(await oauth.handleCallback("CODE", "not-a-real-state")).toBe(false);
+    expect(http.post).not.toHaveBeenCalled();
+  });
+
+  // Correction C3.7: the state->verifier entry is deleted on EVERY terminal
+  // path (finally), so a failed login never leaks it and cannot be replayed.
+  it("deletes the pending verifier even when the token exchange fails", async () => {
+    const http = {
+      post: vi.fn().mockRejectedValue({
+        response: { status: 400, data: { error: "invalid_grant" } },
+      }),
+    } as any;
+    const oauth = new SpotifyOAuth({
+      clientId: CLIENT_ID,
+      redirectUri: REDIRECT_URI,
+      store: memStore(),
+      deps: { http },
+    });
+    const { state } = oauth.buildAuthorizeUrl();
+
+    // First attempt fails at the network/token step.
+    expect(await oauth.handleCallback("CODE", state)).toBe(false);
+    expect(http.post).toHaveBeenCalledTimes(1);
+
+    // Replaying the same state now fails the CSRF guard (verifier was deleted),
+    // WITHOUT hitting the token endpoint again.
+    expect(await oauth.handleCallback("CODE", state)).toBe(false);
+    expect(http.post).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("SpotifyOAuth.getAccessToken", () => {
+  it("returns the cached token without refreshing when still valid", async () => {
+    const http = { post: vi.fn() } as any;
+    const store = memStore({
+      accessToken: "cached",
+      refreshToken: "r1",
+      expiresAt: Date.now() + 60_000,
+      scope: "s",
+    });
+    const oauth = new SpotifyOAuth({ clientId: CLIENT_ID, store, deps: { http } });
+    expect(await oauth.getAccessToken()).toBe("cached");
+    expect(http.post).not.toHaveBeenCalled();
+  });
+
+  it("refreshes when expired and persists the ROTATED refresh token", async () => {
+    const store = memStore({
+      accessToken: "old",
+      refreshToken: "r1",
+      expiresAt: Date.now() - 1000,
+      scope: "s",
+    });
+    const http = {
+      post: vi.fn().mockResolvedValue({
+        data: { access_token: "a2", refresh_token: "r2", expires_in: 3600 },
+      }),
+    } as any;
+    const oauth = new SpotifyOAuth({ clientId: CLIENT_ID, store, deps: { http } });
+
+    expect(await oauth.getAccessToken()).toBe("a2");
+    const body = new URLSearchParams(http.post.mock.calls[0][1] as string);
+    expect(body.get("grant_type")).toBe("refresh_token");
+    expect(body.get("refresh_token")).toBe("r1");
+    expect(body.get("client_id")).toBe(CLIENT_ID);
+    expect(store.value?.refreshToken).toBe("r2"); // rotated + persisted
+    expect(store.value?.accessToken).toBe("a2");
+  });
+
+  it("keeps the old refresh token when the refresh response omits a new one", async () => {
+    const store = memStore({
+      accessToken: "old",
+      refreshToken: "r1",
+      expiresAt: Date.now() - 1000,
+      scope: "s",
+    });
+    const http = {
+      post: vi.fn().mockResolvedValue({ data: { access_token: "a2", expires_in: 3600 } }),
+    } as any;
+    const oauth = new SpotifyOAuth({ clientId: CLIENT_ID, store, deps: { http } });
+    expect(await oauth.getAccessToken()).toBe("a2");
+    expect(store.value?.refreshToken).toBe("r1");
+  });
+
+  it("clears the store and returns null on invalid_grant (expired refresh token)", async () => {
+    const store = memStore({
+      accessToken: "old",
+      refreshToken: "r1",
+      expiresAt: Date.now() - 1000,
+      scope: "s",
+    });
+    const http = {
+      post: vi.fn().mockRejectedValue({
+        response: { status: 400, data: { error: "invalid_grant" } },
+      }),
+    } as any;
+    const oauth = new SpotifyOAuth({ clientId: CLIENT_ID, store, deps: { http } });
+    expect(await oauth.getAccessToken()).toBeNull();
+    expect(store.value).toBeNull();
+    expect(oauth.isAuthorized()).toBe(false);
+  });
+
+  it("returns null when unauthorized (no stored refresh token)", async () => {
+    const http = { post: vi.fn() } as any;
+    const oauth = new SpotifyOAuth({
+      clientId: CLIENT_ID,
+      store: memStore(),
+      deps: { http },
+    });
+    expect(await oauth.getAccessToken()).toBeNull();
+    expect(oauth.isAuthorized()).toBe(false);
+    expect(http.post).not.toHaveBeenCalled();
+  });
+});
+
+describe("createFileOAuthTokenStore", () => {
+  it("round-trips save/load and clear() removes it", () => {
+    const dir = mkdtempSync(join(tmpdir(), "sp-oauth-"));
+    const file = join(dir, "nested", "tokens.json");
+    try {
+      const store = createFileOAuthTokenStore(file);
+      expect(store.load()).toBeNull(); // missing file
+      const t: OAuthTokens = {
+        accessToken: "a",
+        refreshToken: "r",
+        expiresAt: 123,
+        scope: "s",
+      };
+      store.save(t);
+      expect(store.load()).toEqual(t);
+      store.clear();
+      expect(store.load()).toBeNull();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
