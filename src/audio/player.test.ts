@@ -405,4 +405,59 @@ describe("AudioPlayer external-PCM mode (playPcmStream)", () => {
     expect(player.getState()).toBe("playing");
     player.stop();
   });
+
+  // CORRECTION C1 (whole-branch): mixed queue [spotifyA, neteaseB, spotifyC].
+  // Advancing A -> B (a NON-spotify track) calls stop(), whose detachExternalStream()
+  // PAUSES the backend's long-lived SHARED readable (state.flowing = false). When the
+  // LATER spotify track C reuses the SAME backend, the orchestrator re-attaches that
+  // SAME readable via playPcmStream(). Node's Readable.on('data') only auto-resumes
+  // when flowing !== false, so without an explicit resume() the shared stream stays
+  // paused, onData never fires, pcmBuffer stays empty, and C plays only silence frames.
+  // Regression: after re-attach the shared stream MUST be flowing again and real PCM
+  // MUST reach the player.
+  it("(C1) resumes a re-attached, previously-paused SHARED stream so a later Spotify track isn't silent", async () => {
+    const player = new AudioPlayer(silentLogger);
+    const frames: Buffer[] = [];
+    player.on("frame", (f) => frames.push(f));
+
+    // The backend's long-lived, SHARED readable, reused across every track.
+    const shared = openPcmReadable();
+
+    // --- Spotify track A: first attach (auto-resumes, flowing was null !== false).
+    player.playPcmStream(shared, {});
+    shared.push(Buffer.alloc(FRAME_BYTES * 4));
+    await wait(120);
+    expect(frames.length).toBeGreaterThan(0);
+
+    // --- Advance to a NON-spotify track (neteaseB): play(url) begins with stop(),
+    // which detaches AND pauses the shared stream (state.flowing = false).
+    player.stop();
+    expect(shared.isPaused()).toBe(true); // shared stream is now paused
+    expect(player.getState()).toBe("idle");
+
+    // --- Spotify track C reuses the SAME backend: isExternalActive() is false so the
+    // orchestrator re-attaches the SAME (paused) shared readable.
+    expect(player.isExternalActive()).toBe(false);
+
+    // Spy on the shared stream to observe whether real PCM actually flows to the
+    // player. Adding a 'data' listener while flowing===false does NOT resume it
+    // (Node semantics), so this spy cannot mask the bug — pre-fix it stays at 0.
+    let spyBytes = 0;
+    shared.on("data", (c: Buffer) => {
+      spyBytes += c.length;
+    });
+
+    player.playPcmStream(shared, {}); // re-attach the SAME shared readable
+
+    // The re-attached stream must be flowing again, or track C is silent.
+    expect(shared.isPaused()).toBe(false);
+
+    shared.push(Buffer.alloc(FRAME_BYTES * 4)); // "track C" PCM
+    await wait(120);
+
+    // onData must have run (real PCM reached the player), not just silence frames.
+    expect(spyBytes).toBeGreaterThan(0);
+    expect(player.getState()).toBe("playing");
+    player.stop();
+  });
 });

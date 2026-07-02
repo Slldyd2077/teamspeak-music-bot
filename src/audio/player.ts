@@ -478,6 +478,15 @@ export class AudioPlayer extends EventEmitter {
     readable.on("end", onEnd);
     readable.on("error", onError);
 
+    // CORRECTION C1: explicitly resume a re-attached, previously-paused Readable.
+    // The backend's SHARED stdout is reused across every track; a prior non-spotify
+    // advance ran stop() -> detachExternalStream() which pause()d it (state.flowing =
+    // false). Node's Readable.on('data') only auto-resumes when flowing !== false, so
+    // re-attaching a paused stream would leave it stuck: onData never fires, pcmBuffer
+    // stays empty, and a later Spotify track plays only silence. resume() is safe/
+    // idempotent on a first attach (never-paused/already-flowing) stream.
+    readable.resume();
+
     this.state = "playing";
     this.startFrameLoop();
   }
