@@ -38,6 +38,7 @@ export class BiliBiliProvider implements MusicProvider {
   private buvidInitialized = false;
   private wbiMixinKey = "";
   private wbiKeyFetchedAt = 0;
+  private mid = ""; // 我的 B 站 uid（登录后从 nav 取并缓存，供收藏夹 API 用）
 
   constructor() {
     this.api = axios.create({
@@ -291,6 +292,8 @@ export class BiliBiliProvider implements MusicProvider {
           this.cookie = setCookieHeaders
             .map((c: string) => c.split(";")[0])
             .join("; ");
+          // 登录/换号后旧 mid 失效，清空以便下次 ensureMid 重取
+          this.mid = "";
         }
         // Also check if cookie is returned in response data
         if (res.data?.data?.url) {
@@ -330,8 +333,30 @@ export class BiliBiliProvider implements MusicProvider {
     return { loggedIn: false };
   }
 
+  /**
+   * 取当前登录账号的 B 站 uid（mid）并缓存，供收藏夹 API 使用。
+   * 复用 nav 接口；未登录抛错（收藏功能必须登录）。cookie 变更（重新登录）
+   * 后 mid 会随 ensureLogin 注入新 cookie 而需要重取——登录流程里已 reset。
+   */
+  private async ensureMid(): Promise<string> {
+    if (this.mid) return this.mid;
+    if (!this.cookie) throw new Error("Bilibili not logged in");
+    const res = await this.api.get("/x/web-interface/nav", {
+      headers: this.cookieHeaders,
+      validateStatus: () => true,
+    });
+    const data = res.data?.data;
+    if (!data?.isLogin || !data.mid) {
+      throw new Error("Bilibili not logged in");
+    }
+    this.mid = String(data.mid);
+    return this.mid;
+  }
+
   setCookie(cookie: string): void {
     this.cookie = cookie;
+    // cookie 变更（登录/换号）后旧的 mid 失效，清空以便下次 ensureMid 重取
+    this.mid = "";
   }
 
   getCookie(): string {
@@ -421,11 +446,55 @@ export class BiliBiliProvider implements MusicProvider {
     }
   }
 
-  // --- 不适用于B站 ---
+  // --- 收藏夹（需登录，复用 cookie） ---
 
-  async getPlaylistSongs(_playlistId: string): Promise<Song[]> {
-    return [];
+  /** 我的收藏夹列表（映射为 Playlist[]；需登录） */
+  async getUserPlaylists(): Promise<Playlist[]> {
+    try {
+      const mid = await this.ensureMid();
+      const res = await this.api.get("/x/v3/fav/folder/created/list-all", {
+        params: { up_mid: mid },
+        headers: this.cookieHeaders,
+      });
+      const list = res.data?.data?.list ?? [];
+      return list.map((f: any) => ({
+        id: String(f.id),
+        name: f.title ?? "",
+        coverUrl: this.normalizeCover(f.cover ?? ""),
+        songCount: f.media_count ?? 0,
+        platform: "bilibili" as const,
+      }));
+    } catch {
+      return [];
+    }
   }
+
+  /** 收藏夹内视频（playlistId = 收藏夹 media_id；过滤失效视频） */
+  async getPlaylistSongs(playlistId: string): Promise<Song[]> {
+    try {
+      const res = await this.api.get("/x/v3/fav/resource/list", {
+        params: { media_id: playlistId, pn: 1, ps: 20, order: "mtime" },
+        headers: this.cookieHeaders,
+      });
+      const medias = res.data?.data?.medias ?? [];
+      // 失效视频的 bvid 为空、标题含「失效」，过滤掉（否则点播会失败）
+      return medias
+        .filter((m: any) => m.bvid && !(m.title ?? "").includes("失效"))
+        .map((m: any) => ({
+          id: String(m.bvid),
+          name: m.title ?? "",
+          artist: m.upper?.name ?? "",
+          album: "",
+          duration: m.duration ?? 0,
+          coverUrl: this.normalizeCover(m.cover ?? m.pic ?? ""),
+          platform: "bilibili" as const,
+        }));
+    } catch {
+      return [];
+    }
+  }
+
+  // --- 不适用于B站 ---
 
   async getAlbumSongs(_albumId: string): Promise<Song[]> {
     return [];
