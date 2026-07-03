@@ -64,6 +64,28 @@ export function shouldUsePowerShellDownload(
   return platform === "win32" && url.includes("/jdymusic/");
 }
 
+/**
+ * Absolute path to Windows PowerShell, resolved independent of PATH.
+ *
+ * The bot process can run with a PATH that omits System32\WindowsPowerShell
+ * (e.g. launched from a stripped environment via the .bat launcher), which
+ * makes a bare `spawn("powershell")` fail with ENOENT and leaves jdymusic
+ * songs silently stuck at 0 / idle (the error is logged but never surfaced).
+ * Resolve the canonical install location via %SystemRoot% and only fall back
+ * to PATH lookup ("powershell") if it is somehow not there.
+ */
+const POWERSHELL_EXE: string = (() => {
+  if (process.platform !== "win32") return "powershell";
+  const root = process.env.SystemRoot || process.env.windir || "C:\\Windows";
+  const full = `${root}\\System32\\WindowsPowerShell\\v1.0\\powershell.exe`;
+  try {
+    accessSync(full, constants.F_OK);
+    return full;
+  } catch {
+    return "powershell";
+  }
+})();
+
 export function cleanupTempDir(dir: string): void {
   try {
     rmSync(dir, { recursive: true, force: true });
@@ -282,7 +304,7 @@ export class AudioPlayer extends EventEmitter {
     this.logger.debug({ sessionId, tempFile }, "Downloading via PowerShell (jdymusic CDN)");
 
     const ps = spawn(
-      "powershell",
+      POWERSHELL_EXE,
       ["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", psScript],
       {
         env: {
