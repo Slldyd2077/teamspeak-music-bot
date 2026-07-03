@@ -9,6 +9,14 @@ export interface SpotifyCreds {
 const ACCOUNTS_BASE = "https://accounts.spotify.com";
 const API_BASE = "https://api.spotify.com";
 
+// Spotify pages collection tracks at 100 (playlists) / 50 (albums). Follow the
+// paging links, but bound the fan-out so a pathological 10k-track collection
+// can't explode into dozens of API calls; stop once the cap is reached.
+const PLAYLIST_PAGE_SIZE = 100;
+const ALBUM_PAGE_SIZE = 50;
+const MAX_PLAYLIST_TRACKS = 500;
+const MAX_ALBUM_TRACKS = 500;
+
 function artistsToString(artists: unknown): string {
   return Array.isArray(artists)
     ? artists.map((a: any) => a?.name).filter(Boolean).join(", ")
@@ -147,7 +155,14 @@ export class SpotifyWebApi {
     });
     if (!data) return { songs: [], playlists: [], albums: [] };
     return {
-      songs: mapSpotifyTracks(data?.tracks?.items),
+      // Mirror the album/playlist filtering: a null entry (unavailable/relinked
+      // track) must not become a bogus id:'' "Unknown" Song. Drop empty ids too.
+      songs: Array.isArray(data?.tracks?.items)
+        ? data.tracks.items
+            .filter(Boolean)
+            .map(mapSpotifyTrack)
+            .filter((s: Song) => s.id !== "")
+        : [],
       albums: Array.isArray(data?.albums?.items)
         ? data.albums.items.filter(Boolean).map(mapSpotifyAlbum)
         : [],
@@ -167,22 +182,47 @@ export class SpotifyWebApi {
     const album = await this.get(`/v1/albums/${albumId}`);
     const cover = album?.images?.[0]?.url ?? "";
     const albumName = album?.name ?? "";
-    const items = album?.tracks?.items;
-    if (!Array.isArray(items)) return [];
-    return items.filter(Boolean).map((t: any) => ({
-      ...mapSpotifyTrack(t),
-      album: albumName,
-      coverUrl: cover,
-    }));
+
+    // Page 1 (up to 50 tracks) is embedded in the album payload; the embedded
+    // paging object caps at 50, so follow its `next` via the dedicated
+    // /albums/{id}/tracks endpoint until exhausted or the cap is reached.
+    const songs: Song[] = [];
+    let page = album?.tracks;
+    let offset = ALBUM_PAGE_SIZE;
+    while (page && Array.isArray(page.items)) {
+      for (const t of page.items.filter(Boolean)) {
+        songs.push({ ...mapSpotifyTrack(t), album: albumName, coverUrl: cover });
+      }
+      if (!page.next || songs.length >= MAX_ALBUM_TRACKS) break;
+      page = await this.get(`/v1/albums/${albumId}/tracks`, {
+        limit: ALBUM_PAGE_SIZE,
+        offset,
+      });
+      offset += ALBUM_PAGE_SIZE;
+    }
+    return songs.slice(0, MAX_ALBUM_TRACKS);
   }
 
   async getPlaylistTracks(playlistId: string): Promise<Song[]> {
-    const data = await this.get(`/v1/playlists/${playlistId}/tracks`, { limit: 100 });
-    const items = data?.items;
-    if (!Array.isArray(items)) return [];
-    return items
-      .map((it: any) => it?.track)
-      .filter((t: any) => t && t.id)
-      .map(mapSpotifyTrack);
+    // A single limit:100 page silently truncates 100+ track playlists. Follow
+    // `data.next` (advancing offset) until exhausted or the cap is reached, so a
+    // 10k-track playlist can't fan out into 100 API calls.
+    const songs: Song[] = [];
+    for (let offset = 0; offset < MAX_PLAYLIST_TRACKS; offset += PLAYLIST_PAGE_SIZE) {
+      const data = await this.get(`/v1/playlists/${playlistId}/tracks`, {
+        limit: PLAYLIST_PAGE_SIZE,
+        offset,
+      });
+      const items = data?.items;
+      if (!Array.isArray(items)) break;
+      // Keep the null / {track:null} / id-less filtering across ALL pages.
+      const mapped = items
+        .map((it: any) => it?.track)
+        .filter((t: any) => t && t.id)
+        .map(mapSpotifyTrack);
+      songs.push(...mapped);
+      if (!data.next) break;
+    }
+    return songs.slice(0, MAX_PLAYLIST_TRACKS);
   }
 }

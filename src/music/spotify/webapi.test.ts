@@ -408,3 +408,137 @@ describe("SpotifyWebApi catalog mappers", () => {
     });
   });
 });
+
+// R2-3: getPlaylistTracks must paginate (follow data.next) rather than silently
+// truncating to the first 100 tracks, and must stop at a bounded cap so a
+// pathological 10k-track playlist can't fan out into dozens of API calls.
+describe("getPlaylistTracks pagination (R2-3)", () => {
+  const trackItem = (i: number) => ({
+    track: { id: `p${i}`, name: `Song ${i}`, artists: [{ name: "X" }], duration_ms: 1000 },
+  });
+
+  it("follows data.next across pages, returning all tracks in order with nulls filtered", async () => {
+    const auth = {
+      post: vi.fn().mockResolvedValue({ data: { access_token: "t", expires_in: 3600 } }),
+    } as any;
+    const page1 = {
+      items: Array.from({ length: 100 }, (_, i) => trackItem(i)),
+      next: "https://api.spotify.com/v1/playlists/pl1/tracks?offset=100&limit=100",
+    };
+    // Nulls / {track:null} / id-less rows on page 2 prove cross-page filtering.
+    const page2 = {
+      items: [null, { track: null }, { track: { name: "NoId", artists: [], duration_ms: 1 } }, trackItem(100), trackItem(101)],
+      next: null,
+    };
+    const http = {
+      get: vi.fn().mockResolvedValueOnce({ data: page1 }).mockResolvedValueOnce({ data: page2 }),
+    } as any;
+    const api = new SpotifyWebApi(() => ({ clientId: "a", clientSecret: "b" }), { http, auth });
+    const out = await api.getPlaylistTracks("pl1");
+
+    expect(http.get).toHaveBeenCalledTimes(2);
+    expect(out).toHaveLength(102); // 100 (page 1) + 2 real (page 2, three junk rows dropped)
+    expect(out[0].id).toBe("p0");
+    expect(out[99].id).toBe("p99");
+    expect(out[100].id).toBe("p100"); // page 2 appended in order
+    expect(out[101].id).toBe("p101");
+    expect(out.every((s) => s.id !== "")).toBe(true);
+  });
+
+  it("stops at the bounded cap when pages never end (call count bounded)", async () => {
+    const auth = {
+      post: vi.fn().mockResolvedValue({ data: { access_token: "t", expires_in: 3600 } }),
+    } as any;
+    // Every page is full (100) and always advertises a further next page.
+    const http = {
+      get: vi.fn().mockImplementation((_path: string, cfg: any) => {
+        const offset = Number(cfg?.params?.offset ?? 0);
+        return Promise.resolve({
+          data: {
+            items: Array.from({ length: 100 }, (_, i) => trackItem(offset + i)),
+            next: `https://api.spotify.com/v1/playlists/pl1/tracks?offset=${offset + 100}`,
+          },
+        });
+      }),
+    } as any;
+    const api = new SpotifyWebApi(() => ({ clientId: "a", clientSecret: "b" }), { http, auth });
+    const out = await api.getPlaylistTracks("pl1");
+
+    expect(out.length).toBeLessThanOrEqual(500); // never exceeds the cap
+    expect(out).toHaveLength(500); // and reaches it exactly
+    expect(http.get.mock.calls.length).toBeLessThanOrEqual(5); // 500 cap / 100 per page
+  });
+});
+
+// R2-6: getAlbumTracks must page beyond the 50-track embedded cap via the
+// dedicated /albums/{id}/tracks endpoint, still injecting album name + cover.
+describe("getAlbumTracks pagination (R2-6)", () => {
+  const albTrack = (i: number) => ({ id: `a${i}`, name: `T${i}`, artists: [{ name: "Queen" }], duration_ms: 1000 });
+
+  it("pages beyond the embedded 50-track cap, injecting album name/cover", async () => {
+    const auth = {
+      post: vi.fn().mockResolvedValue({ data: { access_token: "t", expires_in: 3600 } }),
+    } as any;
+    const albumPayload = {
+      name: "Big Compilation",
+      images: [{ url: "https://i.scdn.co/big.jpg" }],
+      tracks: {
+        items: Array.from({ length: 50 }, (_, i) => albTrack(i)),
+        next: "https://api.spotify.com/v1/albums/alb1/tracks?offset=50&limit=50",
+      },
+    };
+    const page2 = { items: [albTrack(50), albTrack(51), null, albTrack(52)], next: null };
+    const http = {
+      get: vi
+        .fn()
+        .mockResolvedValueOnce({ data: albumPayload }) // GET /v1/albums/alb1
+        .mockResolvedValueOnce({ data: page2 }), // GET /v1/albums/alb1/tracks
+    } as any;
+    const api = new SpotifyWebApi(() => ({ clientId: "a", clientSecret: "b" }), { http, auth });
+    const out = await api.getAlbumTracks("alb1");
+
+    expect(http.get).toHaveBeenCalledTimes(2);
+    expect(out).toHaveLength(53); // 50 + 3 real (one null dropped)
+    for (const t of out) {
+      expect(t.album).toBe("Big Compilation");
+      expect(t.coverUrl).toBe("https://i.scdn.co/big.jpg");
+      expect(t.platform).toBe("spotify");
+    }
+    expect(out[0].id).toBe("a0");
+    expect(out[49].id).toBe("a49");
+    expect(out[50].id).toBe("a50"); // page 2 appended in order
+    expect(out[52].id).toBe("a52");
+  });
+});
+
+// R2-7: search() must null-filter tracks.items like its album/playlist siblings so
+// an unavailable/relinked null track never becomes a bogus id:'' "Unknown" Song.
+describe("search track null-filtering (R2-7)", () => {
+  it("drops null and id-less track entries (never emits an empty-id 'Unknown' song)", async () => {
+    const auth = {
+      post: vi.fn().mockResolvedValue({ data: { access_token: "t", expires_in: 3600 } }),
+    } as any;
+    const http = {
+      get: vi.fn().mockResolvedValue({
+        data: {
+          tracks: {
+            items: [
+              null, // unavailable/relinked track
+              { id: "t1", name: "Real", artists: [{ name: "X" }], duration_ms: 1000 },
+              {}, // id-less → maps to {id:'', name:'Unknown'}, must also be dropped
+            ],
+          },
+          albums: { items: [] },
+          playlists: { items: [] },
+        },
+      }),
+    } as any;
+    const api = new SpotifyWebApi(() => ({ clientId: "a", clientSecret: "b" }), { http, auth });
+    const out = await api.search("x");
+
+    expect(out.songs).toHaveLength(1);
+    expect(out.songs[0].id).toBe("t1");
+    expect(out.songs.some((s) => s.id === "")).toBe(false);
+    expect(out.songs.some((s) => s.name === "Unknown")).toBe(false);
+  });
+});
