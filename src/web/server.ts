@@ -21,6 +21,7 @@ import { createAuditRouter } from "./api/audit.js";
 import { createFavoritesRouter } from "./api/favorites.js";
 import { createSpotifyRouter } from "./api/spotify.js";
 import type { SpotifyOAuth } from "../music/spotify/spotify-oauth.js";
+import type { SpotifyProvider } from "../music/spotify/provider.js";
 import { resolveSpotifyBackendKind } from "../music/spotify/backend-select.js";
 import {
   isGoLibrespotPresent,
@@ -135,6 +136,11 @@ export function createWebServer(options: WebServerOptions): WebServer {
       // I2: so saving a Client ID in Settings re-configures the live OAuth
       // (no restart needed for the UI-entered-creds -> Connect flow).
       options.spotifyOAuth,
+      // R2-4: so saving Spotify creds in Settings also refreshes the live Web API
+      // search provider (search + getAuthStatus) without a process restart. The
+      // runtime object is a SpotifyProvider (see index.ts); WebServerOptions types
+      // it as the wider MusicProvider, so narrow it here for the setCreds contract.
+      options.spotifyProvider as SpotifyProvider,
     )
   );
   app.use(

@@ -20,6 +20,11 @@ export function createBotRouter(
   // I2: the single process-wide OAuth, so a UI-entered Client ID reaches the
   // live instance on save (no restart). Structural type = SpotifyOAuth.configure.
   spotifyOAuth?: { configure(clientId?: string, redirectUri?: string): void },
+  // R2-4: the process-wide Web API SEARCH provider. Boot only wires creds when
+  // spotify.enabled is already true, so a fresh install that enables Spotify via
+  // Settings must push creds here too, or search stays empty until a restart.
+  // Structural type = SpotifyProvider.setCreds.
+  spotifyProvider?: { setCreds(clientId: string, clientSecret: string): void },
 ): Router {
   const router = Router();
 
@@ -135,6 +140,10 @@ export function createBotRouter(
         ? `http://127.0.0.1:${config.webPort}/api/spotify/callback`
         : undefined;
       spotifyOAuth?.configure(config.spotify.clientId, redirectUri);
+      // R2-4: also refresh the live Web API search provider so search/getAuthStatus
+      // work without a restart. Uses the post-merge values so a masked/omitted
+      // secret keeps the stored one. The secret is never logged.
+      spotifyProvider?.setCreds(config.spotify.clientId, config.spotify.clientSecret);
     }
 
     // Guest-mode changed: tear down / re-scope in-flight guest WS sockets so a

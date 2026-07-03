@@ -405,6 +405,97 @@ describe("bot router /settings applies spotify creds to the live OAuth (I2)", ()
   });
 });
 
+// R2-4: saving Spotify creds in Settings must also refresh the Web API SEARCH
+// provider (spotifyProvider.setCreds), not only the OAuth playback path. Without
+// this, a fresh install (enabled defaults false) keeps empty search creds until a
+// full process restart even after an admin enters Client ID + Secret.
+describe("bot router /settings refreshes the Web API search provider creds (R2-4)", () => {
+  let botDb: BotDatabase;
+  let app: express.Express;
+  let cookie: string;
+  let config: BotConfig;
+  let configPath: string;
+  let tmpDir: string;
+  let setCredsCalls: Array<[string, string]>;
+  let configureCalls: Array<[string | undefined, string | undefined]>;
+
+  beforeEach(async () => {
+    botDb = createDatabase(":memory:");
+    const users = createUserStore(botDb.db);
+    const sessions = createSessionStore(botDb.db);
+    const alice = await users.createUser("alice", "pw-alice", "admin");
+    cookie = `${SESSION_COOKIE_NAME}=${sessions.createSession(alice.id).token}`;
+
+    tmpDir = mkdtempSync(join(tmpdir(), "botsettings-provider-"));
+    configPath = join(tmpDir, "config.json");
+    config = getDefaultConfig();
+
+    const fakeManager = { getAllBots: () => [] } as unknown as BotManager;
+    const avatarStore = createAvatarStore(tmpDir);
+
+    // Fake search provider recording every setCreds(clientId, clientSecret) call.
+    setCredsCalls = [];
+    const fakeProvider = {
+      setCreds(clientId: string, clientSecret: string) {
+        setCredsCalls.push([clientId, clientSecret]);
+      },
+    };
+    // Fake OAuth so we can assert the playback path is still wired alongside.
+    configureCalls = [];
+    const fakeOAuth = {
+      configure(clientId?: string, redirectUri?: string) {
+        configureCalls.push([clientId, redirectUri]);
+      },
+    };
+
+    app = express();
+    app.use(express.json());
+    app.use(cookieParser());
+    app.use("/api", createRequireAuth(sessions, createPermissionStore(botDb.db), () => getDefaultConfig().guestMode));
+    app.use(
+      "/api/bot",
+      createBotRouter(fakeManager, config, configPath, pino({ level: "silent" }), botDb, avatarStore, undefined, fakeOAuth, fakeProvider),
+    );
+  });
+
+  afterEach(() => {
+    botDb.close();
+    rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  it("calls setCreds once with (clientId, clientSecret) when a spotify block is saved (and OAuth is still configured)", async () => {
+    const res = await request(app)
+      .post("/api/bot/settings")
+      .set("Cookie", cookie)
+      .send({ spotify: { clientId: "cid", clientSecret: "sec", enabled: true } });
+    expect(res.status).toBe(200);
+    expect(setCredsCalls).toEqual([["cid", "sec"]]);
+    // The OAuth playback path is still wired on the same save.
+    expect(configureCalls.length).toBe(1);
+  });
+
+  it("does NOT call setCreds when the request has no spotify block", async () => {
+    const res = await request(app)
+      .post("/api/bot/settings")
+      .set("Cookie", cookie)
+      .send({ autoPauseOnEmpty: false });
+    expect(res.status).toBe(200);
+    expect(setCredsCalls).toEqual([]);
+  });
+
+  it("calls setCreds with the PRESERVED stored secret when the spotify block omits/blanks clientSecret", async () => {
+    config.spotify.clientId = "cid0";
+    config.spotify.clientSecret = "stored-secret";
+    const res = await request(app)
+      .post("/api/bot/settings")
+      .set("Cookie", cookie)
+      .send({ spotify: { clientId: "cid0", clientSecret: "", enabled: true } });
+    expect(res.status).toBe(200);
+    // Post-merge values: masked/blank secret must keep the stored one, never "".
+    expect(setCredsCalls).toEqual([["cid0", "stored-secret"]]);
+  });
+});
+
 describe("bot router /settings guest-mode gating + persistence", () => {
   let tmpDir: string;
   let configPath: string;
