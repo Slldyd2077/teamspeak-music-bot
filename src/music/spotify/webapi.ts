@@ -127,7 +127,11 @@ export class SpotifyWebApi {
       // Spotify rate-limits on a rolling 30s window (429 + Retry-After seconds).
       // Retry once after the advised delay before giving up.
       if (retryOn429 && err?.response?.status === 429) {
-        const retryAfter = Number(err.response.headers?.["retry-after"] ?? 1);
+        // Retry-After may be a non-numeric HTTP-date or empty string; Number(...)
+        // then yields NaN/0 and fires the single retry at 0ms, ignoring the advised
+        // backoff. Guard for a finite positive value (mirrors connect-api.ts).
+        const raw = Number(err.response?.headers?.["retry-after"]);
+        const retryAfter = Number.isFinite(raw) && raw > 0 ? raw : 1;
         await new Promise((r) => setTimeout(r, Math.min(retryAfter, 10) * 1000));
         return this.get(path, params, false);
       }

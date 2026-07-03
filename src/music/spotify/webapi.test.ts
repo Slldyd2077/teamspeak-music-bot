@@ -176,6 +176,121 @@ describe("SpotifyWebApi rate-limit handling", () => {
     }
   });
 
+  // Corner-case: a non-numeric Retry-After (HTTP-date) must NOT coerce to NaN and
+  // fire the retry at 0ms. `Number("Wed, 21 Oct 2025 07:28:00 GMT")` is NaN, so the
+  // pre-fix `Math.min(NaN,10)*1000` schedules an immediate (or never-firing) retry
+  // that ignores the advised backoff. Post-fix falls back to a finite 1s wait: the
+  // retry stays scheduled at exactly the fallback, still bounded to ONE retry.
+  it("falls back to a finite 1s wait when Retry-After is an HTTP-date (not NaN/immediate)", async () => {
+    vi.useFakeTimers();
+    try {
+      const auth = {
+        post: vi.fn().mockResolvedValue({ data: { access_token: "t", expires_in: 3600 } }),
+      } as any;
+      let call = 0;
+      const http = {
+        get: vi.fn().mockImplementation(() => {
+          call += 1;
+          if (call === 1) {
+            return Promise.reject({
+              response: {
+                status: 429,
+                headers: { "retry-after": "Wed, 21 Oct 2025 07:28:00 GMT" },
+              },
+            });
+          }
+          return Promise.resolve({
+            data: { tracks: { items: [{ id: "t1", name: "n", artists: [], duration_ms: 1000 }] } },
+          });
+        }),
+      } as any;
+      const api = new SpotifyWebApi(() => ({ clientId: "a", clientSecret: "b" }), { http, auth });
+      const p = api.search("queen");
+
+      // Let the token fetch + first (429) call settle and schedule the wait.
+      await vi.advanceTimersByTimeAsync(999); // < 1s fallback → retry has NOT fired yet
+      expect(http.get).toHaveBeenCalledTimes(1);
+
+      await vi.advanceTimersByTimeAsync(1); // now 1s total → finite fallback reached, retry fires
+      const out = await p;
+      expect(http.get).toHaveBeenCalledTimes(2); // exactly one bounded retry
+      expect(out.songs[0].id).toBe("t1");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  // Corner-case sibling: an empty Retry-After coerces to 0 (`Number("")` === 0), so
+  // pre-fix `Math.min(0,10)*1000` fires the retry immediately at 0ms. Post-fix guards
+  // `raw > 0`, so it falls back to the same finite 1s wait rather than firing at 0.
+  it("falls back to a finite 1s wait when Retry-After is empty (not 0/immediate)", async () => {
+    vi.useFakeTimers();
+    try {
+      const auth = {
+        post: vi.fn().mockResolvedValue({ data: { access_token: "t", expires_in: 3600 } }),
+      } as any;
+      let call = 0;
+      const http = {
+        get: vi.fn().mockImplementation(() => {
+          call += 1;
+          if (call === 1) {
+            return Promise.reject({ response: { status: 429, headers: { "retry-after": "" } } });
+          }
+          return Promise.resolve({
+            data: { tracks: { items: [{ id: "t1", name: "n", artists: [], duration_ms: 1000 }] } },
+          });
+        }),
+      } as any;
+      const api = new SpotifyWebApi(() => ({ clientId: "a", clientSecret: "b" }), { http, auth });
+      const p = api.search("queen");
+
+      await vi.advanceTimersByTimeAsync(999); // < 1s fallback → retry must NOT have fired at 0ms
+      expect(http.get).toHaveBeenCalledTimes(1);
+
+      await vi.advanceTimersByTimeAsync(1); // 1s total → fallback reached, retry fires
+      const out = await p;
+      expect(http.get).toHaveBeenCalledTimes(2);
+      expect(out.songs[0].id).toBe("t1");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  // Regression guard: a NORMAL numeric Retry-After ("3") is finite/positive, so the
+  // guard is transparent — the advised ~3s wait (below the 10s cap) is honored intact.
+  it("still honors a normal numeric Retry-After (~3s, below the 10s cap)", async () => {
+    vi.useFakeTimers();
+    try {
+      const auth = {
+        post: vi.fn().mockResolvedValue({ data: { access_token: "t", expires_in: 3600 } }),
+      } as any;
+      let call = 0;
+      const http = {
+        get: vi.fn().mockImplementation(() => {
+          call += 1;
+          if (call === 1) {
+            return Promise.reject({ response: { status: 429, headers: { "retry-after": "3" } } });
+          }
+          return Promise.resolve({
+            data: { tracks: { items: [{ id: "t1", name: "n", artists: [], duration_ms: 1000 }] } },
+          });
+        }),
+      } as any;
+      const api = new SpotifyWebApi(() => ({ clientId: "a", clientSecret: "b" }), { http, auth });
+      const p = api.search("queen");
+
+      await vi.advanceTimersByTimeAsync(2_999); // < 3s advised → retry has NOT fired yet
+      expect(http.get).toHaveBeenCalledTimes(1);
+
+      await vi.advanceTimersByTimeAsync(1); // 3s total → advised wait reached, retry fires
+      const out = await p;
+      expect(http.get).toHaveBeenCalledTimes(2);
+      expect(out.songs[0].id).toBe("t1");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("returns empty results when unconfigured (no creds → no token)", async () => {
     const api = new SpotifyWebApi(() => ({ clientId: "", clientSecret: "" }));
     expect(await api.search("queen")).toEqual({ songs: [], playlists: [], albums: [] });
