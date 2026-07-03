@@ -292,7 +292,12 @@ export class RustLibrespotBackend extends EventEmitter implements SpotifyAudioBa
       // seen playing, librespot going idle means the track ended — emit once so
       // the queue advances instead of stalling. BEFORE any play (hasPlayed
       // false), a null state is just "nothing active yet" and is ignored.
-      if (this.hasPlayed && this.currentUri && !this.endedForCurrent) {
+      // C1(pause-skip) residual: while WE hold a self-initiated pause, a long
+      // pause can let the Connect device idle out to 204/null. That is still
+      // "paused", NOT a track end — do nothing this poll, or we'd skip the
+      // paused track. Once resume() clears `paused`, a genuinely-dead device
+      // (persistent null) is detected and skipped on the next poll as before.
+      if (this.hasPlayed && this.currentUri && !this.endedForCurrent && !this.paused) {
         this.endedForCurrent = true;
         const endedUri = this.currentUri;
         this.currentUri = null;
@@ -340,8 +345,14 @@ export class RustLibrespotBackend extends EventEmitter implements SpotifyAudioBa
     // `durationMs - window` is negative, so the old `> 0` guard made this
     // unconditionally true and finished the track on its first poll. A
     // sub-window track instead relies on normal stop/next-track detection.
+    // C1(pause-skip) residual: a self-initiated pause within the final window
+    // freezes progress at >= dur-window with is_playing:false and the SAME uri;
+    // without `!this.paused` this near-end heuristic would fire and skip the
+    // paused track. resume() clears `paused`, so a genuine natural end is still
+    // detected afterwards.
     const finishedByProgress =
       this.hasPlayed &&
+      !this.paused &&
       state.durationMs > END_OF_TRACK_WINDOW_MS &&
       state.progressMs >= state.durationMs - END_OF_TRACK_WINDOW_MS;
     // C1(pause-skip): a self-initiated pause (this.paused) reports is_playing:false

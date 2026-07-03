@@ -287,6 +287,86 @@ describe("RustLibrespotBackend track-end poll loop", () => {
     expect(ended).not.toHaveBeenCalled();
   });
 
+  // C1(pause-skip) residual: a self-initiated pause within the FINAL
+  // END_OF_TRACK_WINDOW_MS freezes progress at >= dur-window with is_playing:false
+  // and the SAME uri. The finishedByProgress near-end heuristic must NOT fire
+  // while paused (it would skip the paused track). After resume(), the track
+  // plays on and finishes exactly once.
+  it("does NOT skip when the user PAUSES within the final end-of-track window, but ends once after resume", async () => {
+    const h = makeHarness();
+    const ended = vi.fn();
+    h.backend.on("trackEnded", ended);
+    await h.backend.playTrack("spotify:track:A");
+    // Observe our track actually playing first (mid-track).
+    h.connect.getPlaybackState.mockResolvedValueOnce({
+      isPlaying: true, progressMs: 5000, trackUri: "spotify:track:A", durationMs: 200000,
+    });
+    await (h.backend as any).pollState();
+    // User pauses within the final ~1.5s: frozen progress >= dur-window,
+    // is_playing:false, SAME uri, across every subsequent paused poll.
+    await h.backend.pause();
+    h.connect.getPlaybackState.mockResolvedValue({
+      isPlaying: false, progressMs: 199000, trackUri: "spotify:track:A", durationMs: 200000,
+    });
+    await (h.backend as any).pollState();
+    await (h.backend as any).pollState(); // stays paused across multiple polls
+    expect(ended).not.toHaveBeenCalled();
+    // Resume -> the track plays on to its natural end and finishes exactly once.
+    await h.backend.resume();
+    h.connect.getPlaybackState.mockResolvedValue({
+      isPlaying: true, progressMs: 199000, trackUri: "spotify:track:A", durationMs: 200000,
+    });
+    await (h.backend as any).pollState();
+    expect(ended).toHaveBeenCalledTimes(1);
+    expect(ended).toHaveBeenCalledWith({ uri: "spotify:track:A", reason: "ended" });
+  });
+
+  // C1(pause-skip) residual: during a LONG self-initiated pause the Connect
+  // device can idle out to a 204 / null playback state. That null state while
+  // paused must NOT be read as a track end (it would skip the paused track).
+  // After resume() a genuinely dead device (persistent null) IS detected.
+  it("does NOT skip a PAUSED track when the device idles out to null/204, but DOES after resume", async () => {
+    const h = makeHarness();
+    const ended = vi.fn();
+    h.backend.on("trackEnded", ended);
+    await h.backend.playTrack("spotify:track:A");
+    // Observe our track actually playing first.
+    h.connect.getPlaybackState.mockResolvedValueOnce({
+      isPlaying: true, progressMs: 5000, trackUri: "spotify:track:A", durationMs: 200000,
+    });
+    await (h.backend as any).pollState();
+    // Pause, then the Connect device idles out to a 204 / null state.
+    await h.backend.pause();
+    h.connect.getPlaybackState.mockResolvedValue(null as any);
+    await (h.backend as any).pollState();
+    await (h.backend as any).pollState(); // stays paused across multiple null polls
+    expect(ended).not.toHaveBeenCalled();
+    // Resume -> a genuinely dead device (persistent null) is now detected once.
+    await h.backend.resume();
+    await (h.backend as any).pollState();
+    expect(ended).toHaveBeenCalledTimes(1);
+    expect(ended).toHaveBeenCalledWith({ uri: "spotify:track:A", reason: "ended" });
+  });
+
+  // Regression: a NON-paused track that idles out to a null/204 state after
+  // having played must STILL emit exactly one trackEnded (the pause gate must
+  // not suppress genuine device death for a non-paused track).
+  it("regression: a NON-paused track that idles out to null/204 after playing still emits exactly one trackEnded", async () => {
+    const h = makeHarness();
+    const ended = vi.fn();
+    h.backend.on("trackEnded", ended);
+    await h.backend.playTrack("spotify:track:A");
+    h.connect.getPlaybackState.mockResolvedValueOnce({
+      isPlaying: true, progressMs: 5000, trackUri: "spotify:track:A", durationMs: 200000,
+    });
+    await (h.backend as any).pollState(); // observed playing, not paused
+    h.connect.getPlaybackState.mockResolvedValue(null as any); // device idles out
+    await (h.backend as any).pollState();
+    await (h.backend as any).pollState(); // idempotent: no second emit
+    expect(ended).toHaveBeenCalledTimes(1);
+    expect(ended).toHaveBeenCalledWith({ uri: "spotify:track:A", reason: "ended" });
+  });
+
   it("emits trackEnded when the track uri transitions to null after playing", async () => {
     const h = makeHarness();
     const ended = vi.fn();
