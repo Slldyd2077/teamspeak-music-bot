@@ -98,6 +98,26 @@ export function getDefaultConfig(): BotConfig {
   };
 }
 
+/**
+ * Move an unusable config aside to a timestamped `*.corrupt-*` backup so the data
+ * stays recoverable (it is NEVER deleted), for both the corrupt-JSON case and the
+ * parses-but-not-an-object case. Prefer an atomic same-dir rename; if that fails,
+ * copy instead. If it can't be preserved at all, rethrow rather than let the caller
+ * overwrite unrecoverable data.
+ */
+function backupCorruptConfig(path: string): void {
+  const backup = `${path}.corrupt-${Date.now()}`;
+  try {
+    renameSync(path, backup);
+  } catch {
+    try {
+      copyFileSync(path, backup);
+    } catch (backupErr) {
+      throw backupErr;
+    }
+  }
+}
+
 export function loadConfig(path: string): BotConfig {
   const defaults = getDefaultConfig();
 
@@ -120,26 +140,25 @@ export function loadConfig(path: string): BotConfig {
     throw err; // (b) transient/permission error on an existing file — do not clobber it
   }
 
-  let partial: Partial<BotConfig>;
+  let parsed: unknown;
   try {
-    partial = JSON.parse(raw) as Partial<BotConfig>;
+    parsed = JSON.parse(raw);
   } catch {
     // (c) Corrupt content: move the unreadable file aside to a timestamped backup
-    // so the data stays recoverable, then fall back to defaults. Prefer an atomic
-    // same-dir rename; if that fails, copy instead. If it can't be preserved at
-    // all, rethrow rather than let the caller overwrite unrecoverable data.
-    const backup = `${path}.corrupt-${Date.now()}`;
-    try {
-      renameSync(path, backup);
-    } catch {
-      try {
-        copyFileSync(path, backup);
-      } catch (backupErr) {
-        throw backupErr;
-      }
-    }
+    // so the data stays recoverable, then fall back to defaults.
+    backupCorruptConfig(path);
     return defaults;
   }
+
+  // (d) Parses cleanly but is NOT a non-null object (e.g. `null`, `42`, `"str"`,
+  // `[]`). The per-field sanitize below assumes an object and would throw a raw
+  // TypeError (or silently spread junk), bypassing the corrupt-backup path. Treat
+  // it EXACTLY like corrupt JSON: back it up (never delete), then return defaults.
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+    backupCorruptConfig(path);
+    return defaults;
+  }
+  const partial = parsed as Partial<BotConfig>;
 
   {
     // Normalize/sanitize guestMode on load. The WRITE path (POST /api/bot/settings)

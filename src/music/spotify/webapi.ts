@@ -185,7 +185,11 @@ export class SpotifyWebApi {
 
     // Page 1 (up to 50 tracks) is embedded in the album payload; the embedded
     // paging object caps at 50, so follow its `next` via the dedicated
-    // /albums/{id}/tracks endpoint until exhausted or the cap is reached.
+    // /albums/{id}/tracks endpoint until exhausted or the cap is reached. The
+    // offset bound is a HARD termination guarantee (mirrors the playlist loop):
+    // a malformed/proxy response of { items: [], next: <non-null> } never grows
+    // songs.length nor nulls `next`, so a loop bounded only by songs.length would
+    // spin forever — the offset cap stops it regardless of items/next.
     const songs: Song[] = [];
     let page = album?.tracks;
     let offset = ALBUM_PAGE_SIZE;
@@ -193,7 +197,7 @@ export class SpotifyWebApi {
       for (const t of page.items.filter(Boolean)) {
         songs.push({ ...mapSpotifyTrack(t), album: albumName, coverUrl: cover });
       }
-      if (!page.next || songs.length >= MAX_ALBUM_TRACKS) break;
+      if (!page.next || songs.length >= MAX_ALBUM_TRACKS || offset >= MAX_ALBUM_TRACKS) break;
       page = await this.get(`/v1/albums/${albumId}/tracks`, {
         limit: ALBUM_PAGE_SIZE,
         offset,

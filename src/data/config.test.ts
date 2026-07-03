@@ -411,4 +411,43 @@ describe("loadConfig error handling", () => {
     // The corrupt original is preserved verbatim (recoverable, never deleted).
     expect(readFileSync(join(dir, backups[0]), "utf-8")).toBe(garbage);
   });
+
+  // (d)/(e) Valid JSON that is NOT a non-null object (null / [] / 42 / "str") passes
+  // JSON.parse but would throw a raw TypeError in the per-field sanitize block
+  // (property access on a non-object), bypassing the corrupt-backup path. It must be
+  // treated EXACTLY like corrupt JSON: back up to *.corrupt-* (original preserved),
+  // return defaults — NOT a thrown TypeError, and NOT a silent defaults-with-no-backup.
+  it("(d) a `null` config is treated as corrupt: defaults + *.corrupt-* backup (original preserved)", () => {
+    const dir = makeTmpDir();
+    const path = join(dir, "config.json");
+    writeFileSync(path, "null", "utf-8");
+
+    let loaded: ReturnType<typeof getDefaultConfig>;
+    expect(() => {
+      loaded = loadConfig(path);
+    }).not.toThrow();
+
+    expect(loaded!).toEqual(getDefaultConfig());
+    const backups = readdirSync(dir).filter((f) => f.includes(".corrupt-"));
+    expect(backups.length).toBeGreaterThan(0);
+    expect(readFileSync(join(dir, backups[0]), "utf-8")).toBe("null");
+  });
+
+  it("(e) a non-object config (`[]` / `42`) is backed up + defaults, not a thrown TypeError", () => {
+    for (const content of ["[]", "42"]) {
+      const dir = makeTmpDir();
+      const path = join(dir, "config.json");
+      writeFileSync(path, content, "utf-8");
+
+      let loaded: ReturnType<typeof getDefaultConfig>;
+      expect(() => {
+        loaded = loadConfig(path);
+      }).not.toThrow();
+
+      expect(loaded!).toEqual(getDefaultConfig());
+      const backups = readdirSync(dir).filter((f) => f.includes(".corrupt-"));
+      expect(backups.length).toBeGreaterThan(0);
+      expect(readFileSync(join(dir, backups[0]), "utf-8")).toBe(content);
+    }
+  });
 });

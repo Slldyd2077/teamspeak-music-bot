@@ -509,6 +509,39 @@ describe("getAlbumTracks pagination (R2-6)", () => {
     expect(out[50].id).toBe("a50"); // page 2 appended in order
     expect(out[52].id).toBe("a52");
   });
+
+  // Robustness: a malformed/proxy response of { items: [], next: <non-null> } never
+  // grows songs.length nor nulls `next`, so a while-loop bounded ONLY by
+  // songs.length >= cap spins forever. getAlbumTracks must have a hard offset/page
+  // bound (mirroring the playlist loop) so it TERMINATES regardless of items/next.
+  it("terminates on a { items: [], next: <non-null> } response (bounded call count, no hang)", async () => {
+    const auth = {
+      post: vi.fn().mockResolvedValue({ data: { access_token: "t", expires_in: 3600 } }),
+    } as any;
+    const http = {
+      get: vi.fn().mockImplementation((path: string) => {
+        if (path === "/v1/albums/alb1") {
+          // Even the embedded first page is malformed: empty items, non-null next.
+          return Promise.resolve({
+            data: {
+              name: "Broken",
+              images: [{ url: "https://i.scdn.co/broken.jpg" }],
+              tracks: { items: [], next: "http://x/next" },
+            },
+          });
+        }
+        // Every /albums/{id}/tracks page keeps advertising a further page forever.
+        return Promise.resolve({ data: { items: [], next: "http://x/next" } });
+      }),
+    } as any;
+    const api = new SpotifyWebApi(() => ({ clientId: "a", clientSecret: "b" }), { http, auth });
+    const out = await api.getAlbumTracks("alb1");
+
+    // Returns what it has (nothing) rather than hanging.
+    expect(out).toEqual([]);
+    // Bounded: 1 album GET + at most MAX_ALBUM_TRACKS/ALBUM_PAGE_SIZE (=10) page fetches.
+    expect(http.get.mock.calls.length).toBeLessThanOrEqual(12);
+  });
 });
 
 // R2-7: search() must null-filter tracks.items like its album/playlist siblings so
