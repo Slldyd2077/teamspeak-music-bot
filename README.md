@@ -640,6 +640,7 @@ OAuth 相关端点：`/api/spotify/login`、`/api/spotify/callback`、`/api/spot
 
 - 在多租户/共享主机上，librespot 通过命令行参数接收访问令牌，同机其他本地进程理论上可读取（令牌约 1 小时有效，需本地访问权限）。
 - Spotify 连续播放（gapless spotify→spotify）时，网页进度条的"已播放时间"可能不准确（以后端上报的播放进度为准）。
+- 运行多个启用 Spotify 的 bot 时，若两个 bot 的 id 端口哈希发生冲突（同一 % 1000 桶），第二个 go-librespot 边车会因端口占用而启动失败、该 bot 的 Spotify 不可用（后续将改为按需分配空闲端口）。
 
 ## 配置文件
 

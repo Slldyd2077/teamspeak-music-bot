@@ -50,11 +50,18 @@ function stableHash(s: string): number {
 }
 
 /**
- * STABLE per-bot go-librespot ports derived from the bot id. A second
- * Spotify-enabled bot's sidecar must not collide on the control-API or OAuth
- * callback ports; deriving them from the id keeps them fixed across restarts.
- * The two ranges (37xx / 87xx) are disjoint so the API and callback ports for
- * a given bot never clash with each other.
+ * STABLE per-bot go-librespot ports derived from the bot id, kept fixed across
+ * restarts. The two ranges (37xx / 87xx) are disjoint so a single bot's API and
+ * callback ports never clash with each other.
+ *
+ * NOTE: the hash (`% 1000`) only REDUCES collisions between bots — it does NOT
+ * guarantee uniqueness. Two Spotify-enabled bots whose ids collide mod 1000
+ * (birthday-bound: likely well below 1000 bots) get IDENTICAL ports; the second
+ * bot's go-librespot sidecar then fails to bind 127.0.0.1:<apiPort>, start()
+ * throws, and that bot's Spotify stays permanently unavailable. Proper fix (out
+ * of scope here): assign each Spotify-enabled bot a unique free port —
+ * manager-coordinated allocation or bind-retry on EADDRINUSE — instead of a
+ * pure hash.
  */
 export function spotifyPortsForBotId(id: string): { apiPort: number; callbackPort: number } {
   const off = stableHash(id) % 1000;
@@ -172,8 +179,10 @@ export class BotInstance extends EventEmitter {
       options.spotifyDataDir ?? path.join(process.cwd(), "data", "spotify");
     const spotifyWorkDir = path.join(spotifyBase, this.id, "work");
     const spotifyConfigDir = path.join(spotifyBase, this.id, "config");
-    // Distinct, stable per-bot ports so a second Spotify-enabled bot's sidecar
-    // doesn't fail to bind the go-librespot control API / OAuth callback.
+    // Stable per-bot ports for the go-librespot control API / OAuth callback.
+    // These only reduce (not eliminate) cross-bot collisions: two bot ids that
+    // hash to the same % 1000 bucket share ports and the second sidecar fails to
+    // bind — see spotifyPortsForBotId() for the recommended per-bot free-port fix.
     const { apiPort: spotifyApiPort, callbackPort: spotifyCallbackPort } =
       spotifyPortsForBotId(this.id);
     const buildController =
