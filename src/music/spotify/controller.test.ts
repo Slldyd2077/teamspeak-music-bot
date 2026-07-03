@@ -75,7 +75,7 @@ vi.mock("./go-librespot.js", async () => {
 });
 
 // Import AFTER vi.mock so the mocked binary module is used.
-const { SpotifyController } = await import("./controller.js");
+const { SpotifyController, perBotDeviceName } = await import("./controller.js");
 
 const existingBin = join(tmpdir(), `tsmb-golibrespot-${process.pid}`);
 const missingBin = join(tmpdir(), `tsmb-golibrespot-missing-${process.pid}`);
@@ -529,6 +529,49 @@ describe("SpotifyController per-bot ports (Fix 3)", () => {
     expect(await ctrl.ensureStarted()).toBe(true);
     expect(goLibrespotCtor).toHaveBeenCalledWith(
       expect.objectContaining({ apiPort: 3712, callbackPort: 8712 }),
+    );
+  });
+});
+
+describe("perBotDeviceName (corner-case R2-5)", () => {
+  it("suffixes the base name with the instanceId", () => {
+    expect(perBotDeviceName("TSMusicBot", "bot1")).toBe("TSMusicBot-bot1");
+  });
+  it("returns the base name unchanged when no instanceId is given", () => {
+    expect(perBotDeviceName("TSMusicBot", undefined)).toBe("TSMusicBot");
+  });
+});
+
+describe("SpotifyController per-bot device name (corner-case R2-5)", () => {
+  it("applies the per-bot suffix to the backend deviceName when instanceId is set", async () => {
+    goLibrespotCtor.mockClear();
+    // No injected backendFactory → the controller builds the (mocked) real backend.
+    const ctrl = new SpotifyController({
+      config: cfg(),
+      workDir: "/tmp/work",
+      configDir: "/tmp/cfg",
+      logger: silentLogger,
+      instanceId: "bot1",
+    });
+    expect(await ctrl.ensureStarted()).toBe(true);
+    // The Connect identity is UNIQUE per bot ("<base>-<id>") so two bots under
+    // one account never register the same name (misroute / false-readiness).
+    expect(goLibrespotCtor).toHaveBeenCalledWith(
+      expect.objectContaining({ deviceName: "TSMusicBot-bot1" }),
+    );
+  });
+
+  it("leaves the base deviceName unchanged when no instanceId (behavior-preserving)", async () => {
+    goLibrespotCtor.mockClear();
+    const ctrl = new SpotifyController({
+      config: cfg(),
+      workDir: "/tmp/work",
+      configDir: "/tmp/cfg",
+      logger: silentLogger,
+    });
+    expect(await ctrl.ensureStarted()).toBe(true);
+    expect(goLibrespotCtor).toHaveBeenCalledWith(
+      expect.objectContaining({ deviceName: "TSMusicBot" }),
     );
   });
 });

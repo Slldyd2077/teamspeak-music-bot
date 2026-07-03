@@ -94,6 +94,7 @@ export interface BotInstanceOptions {
     workDir: string;
     configDir: string;
     logger: Logger;
+    instanceId: string;
     apiPort: number;
     callbackPort: number;
     oauth?: SpotifyOAuth;
@@ -193,6 +194,10 @@ export class BotInstance extends EventEmitter {
       workDir: spotifyWorkDir,
       configDir: spotifyConfigDir,
       logger: this.logger,
+      // Per-bot id → unique Spotify Connect device name ("<base>-<id>"), so two
+      // bots under the one shared account never register the same name and
+      // misroute Connect commands (corner-case R2-5).
+      instanceId: this.id,
       apiPort: spotifyApiPort,
       callbackPort: spotifyCallbackPort,
       oauth: options.spotifyOAuth,

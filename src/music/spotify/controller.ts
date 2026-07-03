@@ -31,6 +31,26 @@ import {
 export type { SpotifyBackendKind }; // keep the name exported for existing importers
 
 /**
+ * Derive the per-bot Spotify Connect device name from the user-configured base.
+ *
+ * `config.spotify` is a single process-wide object shared by every BotInstance,
+ * so `config.spotify.deviceName` is identical for all bots. On the Rust
+ * (librespot) backend each bot would otherwise spawn `librespot --name <base>`
+ * with NO uniqueness, registering TWO Connect devices with the SAME name under
+ * the one shared Premium account — so `findDeviceByName` / `waitForDevice`
+ * (which match by name) could target the OTHER bot's device, misrouting
+ * transfer()+play() and reporting false readiness (corner-case R2-5).
+ *
+ * Suffixing the base with the bot's instanceId makes the Connect identity
+ * unique per bot. Pure + deterministic: same inputs → same name across
+ * restarts. Returns the base unchanged when no instanceId is supplied (keeps
+ * existing single-bot / non-injected behavior byte-for-byte).
+ */
+export function perBotDeviceName(base: string, instanceId?: string): string {
+  return instanceId ? `${base}-${instanceId}` : base;
+}
+
+/**
  * Minimal file-backed OAuth token store used when the caller does not inject a
  * SpotifyOAuth. Persists the rotating refresh-token JSON next to the bot config
  * (0600). All IO is lazy + guarded so construction never throws and a
@@ -64,6 +84,10 @@ export interface SpotifyControllerOptions {
   workDir: string;
   configDir: string;
   logger: Logger;
+  /** Owning bot's id; suffixed onto the shared base deviceName so each bot's
+   *  Spotify Connect identity is unique (avoids multi-bot device collision /
+   *  misroute — corner-case R2-5). Omitted → the base name is used unchanged. */
+  instanceId?: string;
   /** Per-bot go-librespot control-API port (distinct per bot to avoid binds). */
   apiPort?: number;
   /** Per-bot go-librespot OAuth callback port (distinct per bot). */
@@ -93,6 +117,7 @@ export class SpotifyController extends EventEmitter {
   private readonly workDir: string;
   private readonly configDir: string;
   private readonly logger: Logger;
+  private readonly instanceId?: string;
   private readonly apiPort?: number;
   private readonly callbackPort?: number;
   private readonly injectedFactory?: () => SpotifyAudioBackend;
@@ -115,6 +140,7 @@ export class SpotifyController extends EventEmitter {
     this.workDir = o.workDir;
     this.configDir = o.configDir;
     this.logger = o.logger;
+    this.instanceId = o.instanceId;
     this.apiPort = o.apiPort;
     this.callbackPort = o.callbackPort;
     this.injectedFactory = o.backendFactory;
@@ -179,9 +205,16 @@ export class SpotifyController extends EventEmitter {
   /** Build the concrete backend for the chosen kind (or the injected fake). */
   private buildBackend(kind: SpotifyBackendKind): SpotifyAudioBackend {
     if (this.injectedFactory) return this.injectedFactory();
+    // Compute the effective (per-bot-unique) Connect device name ONCE and pass
+    // the SAME value to whichever backend we build, so `librespot --name`,
+    // findDeviceByName(), and waitForDevice() all key on one identity — that
+    // consistency is what prevents the multi-bot misroute / false-readiness
+    // (corner-case R2-5). The user-configured base (config.deviceName) is left
+    // untouched; the suffix is applied only to the backend/Connect identity.
+    const deviceName = perBotDeviceName(this.config.deviceName, this.instanceId);
     if (kind === "librespot") {
       return new RustLibrespotBackend({
-        deviceName: this.config.deviceName,
+        deviceName,
         bitrate: this.config.bitrate,
         cacheDir: join(this.workDir, "librespot-cache"),
         oauth: this.oauth,
@@ -190,7 +223,7 @@ export class SpotifyController extends EventEmitter {
       });
     }
     return new GoLibrespotBackend({
-      deviceName: this.config.deviceName,
+      deviceName,
       bitrate: this.config.bitrate,
       workDir: this.workDir,
       configDir: this.configDir,

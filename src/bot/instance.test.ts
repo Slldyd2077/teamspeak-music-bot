@@ -626,9 +626,9 @@ describe("BotInstance.seek — spotify routing (C4)", () => {
 describe("BotInstance — spotifyOAuth threading to the controller factory (C3.1)", () => {
   function makeInstanceOptions(over: Partial<BotInstanceOptions> = {}): {
     options: BotInstanceOptions;
-    captured: { param?: { oauth?: SpotifyOAuth } };
+    captured: { param?: { oauth?: SpotifyOAuth; instanceId?: string } };
   } {
-    const captured: { param?: { oauth?: SpotifyOAuth } } = {};
+    const captured: { param?: { oauth?: SpotifyOAuth; instanceId?: string } } = {};
     const provider = { platform: "netease" } as unknown as MusicProvider;
     const logger: any = {
       info() {}, warn() {}, error() {}, debug() {},
@@ -676,6 +676,17 @@ describe("BotInstance — spotifyOAuth threading to the controller factory (C3.1
     new BotInstance(options);
     expect(captured.param).toBeDefined();
     expect(captured.param?.oauth).toBeUndefined();
+  });
+
+  // R2-5: the bot id must reach the controller as `instanceId` so the backend
+  // derives a UNIQUE Spotify Connect device name (<base>-<id>). Without it two
+  // bots share the process-global deviceName and Connect commands misroute.
+  it("forwards the bot id to the controller factory as `instanceId` (corner-case R2-5)", () => {
+    const { options, captured } = makeInstanceOptions({ id: "bot-xyz" });
+    // eslint-disable-next-line no-new
+    new BotInstance(options);
+    expect(captured.param).toBeDefined();
+    expect(captured.param?.instanceId).toBe("bot-xyz");
   });
 });
 
