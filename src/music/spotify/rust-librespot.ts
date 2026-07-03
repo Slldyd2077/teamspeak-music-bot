@@ -91,6 +91,21 @@ export class RustLibrespotBackend extends EventEmitter implements SpotifyAudioBa
   // side effects at all, so a foreign track already near its end can't emit a
   // spurious trackEnded/metadata and wrongly advance the queue.
   private armed = false;
+  // C1(pause-skip): our own pause state. A self-initiated pause makes the
+  // Connect device report is_playing:false with the SAME uri; without tracking
+  // it we'd misread that as a track end and SKIP the paused track (breaking the
+  // pause command and occupancy auto-pause-when-alone on the Rust backend). Set
+  // by pause(), cleared by resume() and playTrack().
+  private paused = false;
+  // Robustness: a genuine external stop must be confirmed across TWO consecutive
+  // non-paused is_playing:false polls before we emit trackEnded, so a momentary
+  // mid-track is_playing:false (buffering) can't false-skip. Set on the first
+  // such poll; reset whenever the track is playing again or the track changes.
+  private stopSeen = false;
+  // I(pipe): one teardown per broken librespot->ffmpeg pipe. Both stream ends
+  // (ffmpeg.stdin write side, proc.stdout read side) can report the same EPIPE;
+  // this guard prevents a double teardown / double error-emit.
+  private pipeBroke = false;
 
   constructor(o: RustLibrespotBackendOptions) {
     super();
@@ -121,6 +136,7 @@ export class RustLibrespotBackend extends EventEmitter implements SpotifyAudioBa
     // Everything past here spawns children / opens the state poll. On any
     // failure (e.g. the device never appears), tear it all down via stop().
     try {
+      this.pipeBroke = false; // fresh pipe for this start()
       // 1. Spawn ffmpeg FIRST (the reader) so its stdin pipe is ready before
       //    librespot starts pushing raw 44.1k s16le PCM into it.
       this.ffmpeg = spawn(
@@ -135,6 +151,12 @@ export class RustLibrespotBackend extends EventEmitter implements SpotifyAudioBa
         this.log.debug({ ffmpeg: b.toString().trim() }, "ffmpeg"),
       );
       this.ffmpeg.on("error", (err) => this.emitError(err));
+      // I(pipe): if ffmpeg dies mid-track while librespot keeps producing PCM,
+      // the next write into its stdin hits the now-closed pipe -> EPIPE 'error'
+      // on stdin. With no listener Node escalates that to process
+      // 'uncaughtException' (the global handler logs but leaves undefined
+      // state). Handle it in-band: tear down cleanly and surface via emitError.
+      this.ffmpeg.stdin?.on("error", (err) => this.onPipeError(err));
 
       // 2. Spawn librespot: --backend pipe with NO --device => raw s16le/44100/2
       //    on stdout, NO --passthrough (that would emit raw Ogg). --access-token
@@ -160,6 +182,10 @@ export class RustLibrespotBackend extends EventEmitter implements SpotifyAudioBa
       // stdout carries PCM — pipe it, never attach a data listener that consumes it.
       if (this.proc.stdout && this.ffmpeg.stdin) {
         this.proc.stdout.pipe(this.ffmpeg.stdin);
+        // Guard the read side too: a broken pipe can surface as an 'error' on
+        // proc.stdout when ffmpeg's stdin closes underneath it. Same handler,
+        // guarded against a double teardown.
+        this.proc.stdout.on("error", (err) => this.onPipeError(err));
       }
       this.proc.stderr?.on("data", (b: Buffer) =>
         this.log.info({ librespot: b.toString().trim() }, "librespot"),
@@ -194,6 +220,25 @@ export class RustLibrespotBackend extends EventEmitter implements SpotifyAudioBa
     } else {
       this.log.error({ err }, "rust-librespot backend error (no listener)");
     }
+  }
+
+  /**
+   * I(pipe): the librespot->ffmpeg PCM pipe broke — typically ffmpeg died
+   * mid-track and librespot's next write hit the closed pipe (EPIPE), or the
+   * stream was destroyed (ERR_STREAM_DESTROYED). Both are expected teardown
+   * signals, not programming errors. Log, tear down cleanly (stop() is
+   * idempotent), then surface via emitError so a listening controller reacts.
+   * Guarded so both stream ends reporting the same break don't double-teardown.
+   */
+  private onPipeError(err: unknown): void {
+    if (this.pipeBroke) return;
+    this.pipeBroke = true;
+    this.log.warn(
+      { err },
+      "rust-librespot: librespot->ffmpeg pipe broke (ffmpeg died?) — tearing down",
+    );
+    this.stop();
+    this.emitError(err);
   }
 
   private async waitForDevice(): Promise<void> {
@@ -265,6 +310,7 @@ export class RustLibrespotBackend extends EventEmitter implements SpotifyAudioBa
       this.currentUri = state.trackUri;
       this.hasPlayed = false;
       this.endedForCurrent = false;
+      this.stopSeen = false; // new track -> drop any pending stop confirmation
       const np: SpotifyNowPlaying = {
         uri: state.trackUri,
         name: "",
@@ -278,6 +324,8 @@ export class RustLibrespotBackend extends EventEmitter implements SpotifyAudioBa
 
     if (state.isPlaying) {
       this.hasPlayed = true;
+      // Playing again -> any earlier is_playing:false was transient, not a stop.
+      this.stopSeen = false;
       // Real playback observed -> the I4 degrade-to-skip watchdog is moot.
       this.clearPlaybackWatchdog();
     }
@@ -287,11 +335,29 @@ export class RustLibrespotBackend extends EventEmitter implements SpotifyAudioBa
     // the bot's own track has actually been observed playing. Without this, the
     // first poll (before playTrack) could observe the account's stale/paused
     // track sitting near its end and spuriously emit "trackEnded".
+    // m(sub-window): only apply the near-end window when the track is LONGER
+    // than the window. For durationMs in [1, END_OF_TRACK_WINDOW_MS],
+    // `durationMs - window` is negative, so the old `> 0` guard made this
+    // unconditionally true and finished the track on its first poll. A
+    // sub-window track instead relies on normal stop/next-track detection.
     const finishedByProgress =
       this.hasPlayed &&
-      state.durationMs > 0 &&
+      state.durationMs > END_OF_TRACK_WINDOW_MS &&
       state.progressMs >= state.durationMs - END_OF_TRACK_WINDOW_MS;
-    const finishedByStop = this.hasPlayed && !state.isPlaying;
+    // C1(pause-skip): a self-initiated pause (this.paused) reports is_playing:false
+    // with the SAME uri — that is NOT a track end, so never finish while paused.
+    // And even for a genuine external stop, require it to persist across two
+    // consecutive polls (stopSeen) so a momentary mid-track is_playing:false
+    // (buffering) doesn't false-skip. Confirmed stops still emit within ~one
+    // extra poll interval.
+    let finishedByStop = false;
+    if (this.hasPlayed && !state.isPlaying && !this.paused) {
+      if (this.stopSeen) {
+        finishedByStop = true;
+      } else {
+        this.stopSeen = true; // first non-paused stop poll — await confirmation
+      }
+    }
     const finishedByNull = this.hasPlayed && state.trackUri === null;
 
     if (finishedByProgress || finishedByStop || finishedByNull) {
@@ -323,6 +389,10 @@ export class RustLibrespotBackend extends EventEmitter implements SpotifyAudioBa
     this.hasPlayed = false;
     this.endedForCurrent = false;
     this.armed = true;
+    // A newly-started track is not paused, and carries no pending stop
+    // confirmation from the previous track. (C1 pause-skip.)
+    this.paused = false;
+    this.stopSeen = false;
     // transfer(false) activates our device WITHOUT starting audio; play() then
     // actually starts the uri. The two-step is required — transfer alone won't
     // begin playback.
@@ -384,10 +454,15 @@ export class RustLibrespotBackend extends EventEmitter implements SpotifyAudioBa
 
   async pause(): Promise<void> {
     await this.connect.pause();
+    // C1(pause-skip): mark our own pause so the next poll's is_playing:false
+    // (same uri) is not misread as a track end and skipped.
+    this.paused = true;
   }
 
   async resume(): Promise<void> {
     await this.connect.resume();
+    // Resumed -> normal end-detection applies again.
+    this.paused = false;
   }
 
   async seek(ms: number): Promise<void> {

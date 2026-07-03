@@ -205,7 +205,41 @@ describe("RustLibrespotBackend track-end poll loop", () => {
     expect(ended).toHaveBeenCalledWith({ uri: "spotify:track:A", reason: "ended" });
   });
 
-  it("emits trackEnded once when playback stops (!isPlaying) after having played", async () => {
+  // C1(pause-skip): a USER pause reports is_playing:false with the SAME uri on
+  // the Rust backend. That MUST NOT be read as a track end (it would skip the
+  // paused track and break pause + occupancy auto-pause). Formerly the
+  // "!isPlaying after having played" test asserted the opposite — that encoded
+  // the bug; it is now split into this pause-no-skip test plus the two-poll
+  // external-stop test below.
+  it("does NOT emit trackEnded when the user PAUSES (self-initiated pause is not a track end)", async () => {
+    const h = makeHarness();
+    const ended = vi.fn();
+    h.backend.on("trackEnded", ended);
+    await h.backend.playTrack("spotify:track:A");
+    // Observe our track actually playing first.
+    h.connect.getPlaybackState.mockResolvedValueOnce({
+      isPlaying: true, progressMs: 5000, trackUri: "spotify:track:A", durationMs: 200000,
+    });
+    await (h.backend as any).pollState();
+    // User pauses: the Connect device stays loaded but reports is_playing:false
+    // with the SAME uri across every subsequent poll while paused.
+    await h.backend.pause();
+    h.connect.getPlaybackState.mockResolvedValue({
+      isPlaying: false, progressMs: 5000, trackUri: "spotify:track:A", durationMs: 200000,
+    });
+    await (h.backend as any).pollState();
+    await (h.backend as any).pollState(); // stays paused across multiple polls
+    expect(ended).not.toHaveBeenCalled();
+    // Resuming keeps the same track playing — still no spurious end.
+    await h.backend.resume();
+    h.connect.getPlaybackState.mockResolvedValue({
+      isPlaying: true, progressMs: 6000, trackUri: "spotify:track:A", durationMs: 200000,
+    });
+    await (h.backend as any).pollState();
+    expect(ended).not.toHaveBeenCalled();
+  });
+
+  it("emits trackEnded once on an EXTERNAL stop only after TWO consecutive !isPlaying polls (a transient mid-track !isPlaying is not a skip)", async () => {
     const h = makeHarness();
     const ended = vi.fn();
     h.backend.on("trackEnded", ended);
@@ -214,11 +248,43 @@ describe("RustLibrespotBackend track-end poll loop", () => {
       .mockResolvedValueOnce({ isPlaying: true, progressMs: 5000, trackUri: "spotify:track:A", durationMs: 200000 })
       .mockResolvedValueOnce({ isPlaying: false, progressMs: 5000, trackUri: "spotify:track:A", durationMs: 200000 })
       .mockResolvedValue({ isPlaying: false, progressMs: 5000, trackUri: "spotify:track:A", durationMs: 200000 });
-    await (h.backend as any).pollState();
-    await (h.backend as any).pollState();
+    await (h.backend as any).pollState(); // observed playing
+    await (h.backend as any).pollState(); // FIRST !isPlaying -> unconfirmed (could be transient buffering)
+    expect(ended).not.toHaveBeenCalled();
+    await (h.backend as any).pollState(); // SECOND consecutive !isPlaying -> confirmed external stop
     await (h.backend as any).pollState(); // idempotent: no second emit for same track
     expect(ended).toHaveBeenCalledTimes(1);
     expect(ended).toHaveBeenCalledWith({ uri: "spotify:track:A", reason: "ended" });
+  });
+
+  it("a transient single !isPlaying poll followed by playing again does NOT emit trackEnded (buffering hiccup)", async () => {
+    const h = makeHarness();
+    const ended = vi.fn();
+    h.backend.on("trackEnded", ended);
+    await h.backend.playTrack("spotify:track:A");
+    h.connect.getPlaybackState
+      .mockResolvedValueOnce({ isPlaying: true, progressMs: 5000, trackUri: "spotify:track:A", durationMs: 200000 })
+      .mockResolvedValueOnce({ isPlaying: false, progressMs: 5000, trackUri: "spotify:track:A", durationMs: 200000 })
+      .mockResolvedValue({ isPlaying: true, progressMs: 6000, trackUri: "spotify:track:A", durationMs: 200000 });
+    await (h.backend as any).pollState(); // playing
+    await (h.backend as any).pollState(); // momentary !isPlaying (buffering)
+    await (h.backend as any).pollState(); // playing again -> stop confirmation reset
+    expect(ended).not.toHaveBeenCalled();
+  });
+
+  // m(sub-window): a track SHORTER than the end-of-track window must not be
+  // declared finished on its first observed-playing poll (durationMs - window
+  // is negative, so the old near-end check fired unconditionally).
+  it("does NOT false-finish a sub-window (< END_OF_TRACK_WINDOW_MS) duration on the first playing poll", async () => {
+    const h = makeHarness();
+    const ended = vi.fn();
+    h.backend.on("trackEnded", ended);
+    await h.backend.playTrack("spotify:track:short");
+    h.connect.getPlaybackState.mockResolvedValue({
+      isPlaying: true, progressMs: 100, trackUri: "spotify:track:short", durationMs: 1200,
+    });
+    await (h.backend as any).pollState();
+    expect(ended).not.toHaveBeenCalled();
   });
 
   it("emits trackEnded when the track uri transitions to null after playing", async () => {
@@ -435,6 +501,42 @@ describe("RustLibrespotBackend child-process error handling", () => {
     const err = new Error("ffmpeg boom");
     h.ffmpegChild.emit("error", err);
     expect(onErr).toHaveBeenCalledWith(err);
+    h.backend.stop();
+  });
+
+  // I(pipe): ffmpeg dying mid-track while librespot keeps producing PCM raises
+  // EPIPE on ffmpeg.stdin. With no stdin 'error' listener Node escalates it to
+  // process 'uncaughtException'. The backend must handle it in-band.
+  it("swallows an EPIPE 'error' on ffmpeg.stdin (ffmpeg died mid-track) without an unhandled throw", async () => {
+    const h = makeHarness();
+    await h.backend.start();
+    expect(h.backend.listenerCount("error")).toBe(0);
+    const epipe = Object.assign(new Error("write EPIPE"), { code: "EPIPE" });
+    expect(() => h.ffmpegChild.stdin.emit("error", epipe)).not.toThrow();
+    h.backend.stop(); // idempotent second teardown must not throw
+  });
+
+  it("routes an ffmpeg.stdin EPIPE to the backend 'error' listener and tears down cleanly", async () => {
+    const h = makeHarness();
+    await h.backend.start();
+    const onErr = vi.fn();
+    h.backend.on("error", onErr);
+    const epipe = Object.assign(new Error("write EPIPE"), { code: "EPIPE" });
+    expect(() => h.ffmpegChild.stdin.emit("error", epipe)).not.toThrow();
+    expect(onErr).toHaveBeenCalledWith(epipe);
+    // Broken pipe -> clean teardown: children killed, not ready.
+    expect(h.librespotChild.kill).toHaveBeenCalled();
+    expect(h.ffmpegChild.kill).toHaveBeenCalled();
+    expect(h.backend.isReady()).toBe(false);
+    h.backend.stop(); // second teardown must not throw (no double-teardown crash)
+    expect(onErr).toHaveBeenCalledTimes(1); // single emit despite both pipe ends
+  });
+
+  it("does not throw when librespot proc.stdout emits an EPIPE on the broken pipe", async () => {
+    const h = makeHarness();
+    await h.backend.start();
+    const epipe = Object.assign(new Error("read/write EPIPE"), { code: "EPIPE" });
+    expect(() => h.librespotChild.stdout.emit("error", epipe)).not.toThrow();
     h.backend.stop();
   });
 });
