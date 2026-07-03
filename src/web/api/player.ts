@@ -221,6 +221,28 @@ export function createPlayerRouter(
     }
   });
 
+  // Reorder: move a queue item from one index to another (drag-to-reorder)
+  router.post("/:botId/queue/:from/move", authorize({ capability: "player.queue" }), async (req, res) => {
+    try {
+      const bot = (req as any).bot;
+      const from = parseInt(req.params.from, 10);
+      const { to } = req.body;
+      if (Number.isNaN(from) || typeof to !== "number" || !Number.isFinite(to)) {
+        res.status(400).json({ error: "from (path) and to (number body) are required" });
+        return;
+      }
+      const queue = bot.getQueueManager();
+      const ok = queue.move(from, to);
+      if (!ok) {
+        res.status(400).json({ error: "Invalid queue index" });
+        return;
+      }
+      res.json({ success: true, queue: queue.list(), status: bot.getStatus() });
+    } catch (err) {
+      res.status(500).json({ error: (err as Error).message });
+    }
+  });
+
   // Jump to a specific index in the queue (without clearing it)
   router.post("/:botId/play-at", authorize({ capability: "player.control" }), async (req, res) => {
     try {

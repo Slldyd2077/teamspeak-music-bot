@@ -96,6 +96,33 @@ export class PlayQueue {
     return removed;
   }
 
+  /**
+   * Move a song from one position to another, keeping currentIndex /
+   * playedIndices / history / forwardStack references valid via the same
+   * index-shift idea as remove (so prev/next/random stay correct after a
+   * reorder, including when the currently-playing song is moved).
+   */
+  move(from: number, to: number): boolean {
+    if (from === to) return true;
+    if (from < 0 || from >= this.songs.length || to < 0 || to >= this.songs.length) {
+      return false;
+    }
+    const [moved] = this.songs.splice(from, 1);
+    this.songs.splice(to, 0, moved);
+
+    const shift = (i: number): number => {
+      if (i === from) return to;
+      if (from < to) return i > from && i <= to ? i - 1 : i; // 下移：中间项上移 1
+      return i >= to && i < from ? i + 1 : i;                // 上移：中间项下移 1
+    };
+
+    this.currentIndex = shift(this.currentIndex);
+    this.playedIndices = new Set([...this.playedIndices].map(shift));
+    this.history = this.history.map(shift);
+    this.forwardStack = this.forwardStack.map(shift);
+    return true;
+  }
+
   clear(): void {
     this.songs = [];
     this.currentIndex = -1;
