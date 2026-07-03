@@ -1,4 +1,12 @@
-import { readFileSync, writeFileSync, mkdirSync, existsSync, copyFileSync, rmSync } from "node:fs";
+import {
+  readFileSync,
+  writeFileSync,
+  mkdirSync,
+  existsSync,
+  copyFileSync,
+  rmSync,
+  renameSync,
+} from "node:fs";
 import { dirname } from "node:path";
 import type { BotAccess, GuestPermissions } from "./permissions.js";
 import { GUEST_PERMISSION_FLAGS } from "./permissions.js";
@@ -92,10 +100,48 @@ export function getDefaultConfig(): BotConfig {
 
 export function loadConfig(path: string): BotConfig {
   const defaults = getDefaultConfig();
-  try {
-    const raw = readFileSync(path, "utf-8");
-    const partial = JSON.parse(raw) as Partial<BotConfig>;
 
+  // Distinguish the three failure modes so a *real* on-disk config is NEVER
+  // silently replaced with defaults (the caller saveConfig()s right after load,
+  // which would otherwise erase spotify creds / adminPassword / adminGroups /
+  // guestMode permanently):
+  //   (a) file ABSENT (ENOENT) — normal first run → defaults.
+  //   (b) any OTHER read error (EBUSY/EACCES/EPERM/EISDIR/…) on an existing file —
+  //       rethrow (fail-fast at boot). A loud crash beats silent credential loss.
+  //   (c) file readable but JSON.parse fails (corrupt) — back the file up first
+  //       (never delete it), THEN return defaults so boot can proceed.
+  let raw: string;
+  try {
+    raw = readFileSync(path, "utf-8");
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") {
+      return defaults; // (a) missing file — first run
+    }
+    throw err; // (b) transient/permission error on an existing file — do not clobber it
+  }
+
+  let partial: Partial<BotConfig>;
+  try {
+    partial = JSON.parse(raw) as Partial<BotConfig>;
+  } catch {
+    // (c) Corrupt content: move the unreadable file aside to a timestamped backup
+    // so the data stays recoverable, then fall back to defaults. Prefer an atomic
+    // same-dir rename; if that fails, copy instead. If it can't be preserved at
+    // all, rethrow rather than let the caller overwrite unrecoverable data.
+    const backup = `${path}.corrupt-${Date.now()}`;
+    try {
+      renameSync(path, backup);
+    } catch {
+      try {
+        copyFileSync(path, backup);
+      } catch (backupErr) {
+        throw backupErr;
+      }
+    }
+    return defaults;
+  }
+
+  {
     // Normalize/sanitize guestMode on load. The WRITE path (POST /api/bot/settings)
     // sanitizes too, but a hand-edited/legacy/corrupt config.json reaches the gate
     // directly — so coerce it here as well, mirroring that write-path logic.
@@ -163,14 +209,33 @@ export function loadConfig(path: string): BotConfig {
       guestMode: gm,
       spotify,
     };
-  } catch {
-    return defaults;
   }
 }
 
 export function saveConfig(path: string, config: BotConfig): void {
   mkdirSync(dirname(path), { recursive: true });
-  writeFileSync(path, JSON.stringify(config, null, 2), "utf-8");
+  const json = JSON.stringify(config, null, 2);
+
+  // Atomic write: serialize to a sibling temp file in the SAME directory, then
+  // rename it onto the final path. rename is an atomic replace on POSIX and modern
+  // Windows, so a crash / power loss / ENOSPC mid-write can never leave config.json
+  // truncated — a reader always sees either the previous file or the fully-written
+  // new one, never a partial. The temp lives in the same dir so the rename stays on
+  // one filesystem (a cross-device rename would fail); pid + timestamp keep
+  // concurrent writers from colliding on the temp name.
+  const tmp = `${path}.${process.pid}.${Date.now()}.tmp`;
+  try {
+    writeFileSync(tmp, json, "utf-8");
+    renameSync(tmp, path);
+  } catch (err) {
+    // Never leave a partial temp file behind on failure.
+    try {
+      rmSync(tmp, { force: true });
+    } catch {
+      /* best-effort cleanup */
+    }
+    throw err;
+  }
 }
 
 /**
