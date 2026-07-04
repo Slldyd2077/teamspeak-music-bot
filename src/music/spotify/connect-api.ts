@@ -25,6 +25,14 @@ export interface PlaybackState {
   progressMs: number;
   trackUri: string | null;
   durationMs: number;
+  /**
+   * R4-4 (multi-bot): the id of the single ACTIVE Connect device the
+   * account-wide GET /v1/me/player is reporting (from `device.id`). Absent when
+   * Spotify omits the device block. The Rust backend uses it to tell "our
+   * device" from a foreign device another bot stole the shared session with, so
+   * it never misattributes that bot's track/stop as ours.
+   */
+  activeDeviceId?: string;
 }
 
 /**
@@ -186,6 +194,9 @@ export class SpotifyConnectApi {
         progressMs: Number(d.progress_ms ?? 0),
         trackUri: d.item?.uri ?? null,
         durationMs: Number(d.item?.duration_ms ?? 0),
+        // R4-4: expose the account's single active device so a foreign steal is
+        // distinguishable from our own device. Left undefined when absent.
+        activeDeviceId: d.device?.id ?? undefined,
       };
     } catch {
       return null;

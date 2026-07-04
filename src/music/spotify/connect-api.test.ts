@@ -141,6 +141,16 @@ describe("SpotifyConnectApi mutating calls", () => {
     });
   });
 
+  it("resume(id) forwards device_id param", async () => {
+    const http = makeHttp();
+    const api = new SpotifyConnectApi(token(), { http });
+    await api.resume("dev-1");
+    expect(http.put).toHaveBeenCalledWith("/v1/me/player/play", undefined, {
+      headers: { Authorization: "Bearer tok123" },
+      params: { device_id: "dev-1" },
+    });
+  });
+
   it("seek() PUTs /v1/me/player/seek?position_ms=", async () => {
     const http = makeHttp();
     const api = new SpotifyConnectApi(token(), { http });
@@ -323,6 +333,32 @@ describe("SpotifyConnectApi.getPlaybackState", () => {
       progressMs: 12345,
       trackUri: "spotify:track:abc",
       durationMs: 200000,
+    });
+  });
+
+  // R4-4 (multi-bot): the account-wide /v1/me/player response names the single
+  // ACTIVE Connect device. Expose it as activeDeviceId so the Rust backend can
+  // tell "our device" from a foreign device another bot stole the session with.
+  it("maps device.id -> activeDeviceId", async () => {
+    const http = makeHttp({
+      get: vi.fn().mockResolvedValue({
+        status: 200,
+        data: {
+          is_playing: true,
+          progress_ms: 1000,
+          item: { uri: "spotify:track:abc", duration_ms: 200000 },
+          device: { id: "dev-1", name: "TS Bot", is_active: true },
+        },
+      }),
+    });
+    const api = new SpotifyConnectApi(token(), { http });
+    const state = await api.getPlaybackState();
+    expect(state).toEqual({
+      isPlaying: true,
+      progressMs: 1000,
+      trackUri: "spotify:track:abc",
+      durationMs: 200000,
+      activeDeviceId: "dev-1",
     });
   });
 

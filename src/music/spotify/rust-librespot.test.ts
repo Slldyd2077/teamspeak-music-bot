@@ -173,14 +173,19 @@ describe("RustLibrespotBackend transport delegation (Connect API)", () => {
     await expect(h.backend.playTrack("spotify:track:x")).rejects.toThrow(/device/i);
   });
 
-  it("pause/resume/seek delegate to the Connect API and seek updates position", async () => {
+  // R4-4 (multi-bot): control must be scoped to OUR device. playTrack resolves
+  // and stores our device id (dev1); pause/resume/seek then pass it to the
+  // Connect API so bot A's pause/resume/seek can't act on bot B's playback (the
+  // account-wide default would pause whatever device is currently active).
+  it("pause/resume/seek delegate to the Connect API scoped to OUR device, and seek updates position", async () => {
     const h = makeHarness();
+    await h.backend.playTrack("spotify:track:go"); // stores our device id (dev1)
     await h.backend.pause();
     await h.backend.resume();
     await h.backend.seek(5000);
-    expect(h.connect.pause).toHaveBeenCalled();
-    expect(h.connect.resume).toHaveBeenCalled();
-    expect(h.connect.seek).toHaveBeenCalledWith(5000);
+    expect(h.connect.pause).toHaveBeenCalledWith("dev1");
+    expect(h.connect.resume).toHaveBeenCalledWith("dev1");
+    expect(h.connect.seek).toHaveBeenCalledWith(5000, "dev1");
     expect(h.backend.getPositionMs()).toBe(5000);
   });
 });
@@ -478,6 +483,64 @@ describe("RustLibrespotBackend track-end poll loop", () => {
     await (h.backend as any).pollState(); // finishes
     expect(ended).toHaveBeenCalledTimes(1);
     expect(ended).toHaveBeenCalledWith({ uri: "spotify:track:ours", reason: "ended" });
+  });
+});
+
+// R4-4 (multi-bot): config.spotify (and thus the Connect session) is shared by
+// every bot under one Premium account, which supports only ONE active playback
+// stream. GET /v1/me/player is account-wide, so once bot B steals the active
+// session our poll would see B's device + B's track. The backend now stores OUR
+// device id and, when the reported activeDeviceId differs, refuses to treat the
+// foreign playback as ours: no foreign metadata, no misattribution — the stolen
+// session instead advances OUR queue cleanly via the existing two-poll stop.
+describe("RustLibrespotBackend multi-bot device scoping (R4-4)", () => {
+  it("ignores foreign-device poll state: no foreign metadata, no misattribution, and a stolen session advances OUR queue once", async () => {
+    const h = makeHarness();
+    const ended = vi.fn();
+    const meta = vi.fn();
+    h.backend.on("trackEnded", ended);
+    h.backend.on("metadata", meta);
+    // Our track plays on OUR device (dev1 — the findDeviceByName mock id).
+    await h.backend.playTrack("spotify:track:ours");
+    h.connect.getPlaybackState.mockResolvedValueOnce({
+      isPlaying: true, progressMs: 5000, trackUri: "spotify:track:ours",
+      durationMs: 200000, activeDeviceId: "dev1",
+    });
+    await (h.backend as any).pollState(); // our track observed playing on our device
+    expect(meta).toHaveBeenCalledTimes(1);
+    expect(meta).toHaveBeenCalledWith(expect.objectContaining({ uri: "spotify:track:ours" }));
+    expect(h.backend.getPositionMs()).toBe(5000);
+    meta.mockClear();
+    // Bot B steals the single active Connect session: /v1/me/player now reports
+    // THEIR device (dev2) + THEIR track, and would keep doing so every poll.
+    h.connect.getPlaybackState.mockResolvedValue({
+      isPlaying: true, progressMs: 123000, trackUri: "spotify:track:foreign",
+      durationMs: 200000, activeDeviceId: "dev2",
+    });
+    await (h.backend as any).pollState(); // FIRST foreign poll -> unconfirmed stop, no side effects
+    expect(meta).not.toHaveBeenCalled();            // foreign metadata NOT surfaced as ours
+    expect(ended).not.toHaveBeenCalled();            // two-poll confirmation not met yet
+    expect(h.backend.getPositionMs()).toBe(5000);    // foreign progress NOT misattributed
+    await (h.backend as any).pollState(); // SECOND foreign poll -> confirmed -> OUR queue advances
+    await (h.backend as any).pollState(); // idempotent: no second emit for our track
+    expect(ended).toHaveBeenCalledTimes(1);
+    expect(ended).toHaveBeenCalledWith({ uri: "spotify:track:ours", reason: "ended" });
+    expect(meta).not.toHaveBeenCalled();             // never emitted metadata for the foreign uri
+  });
+
+  it("when the active device IS ours (activeDeviceId === our id), end-detection behaves exactly as today", async () => {
+    const h = makeHarness();
+    const ended = vi.fn();
+    h.backend.on("trackEnded", ended);
+    await h.backend.playTrack("spotify:track:A");
+    h.connect.getPlaybackState
+      .mockResolvedValueOnce({ isPlaying: true, progressMs: 1000, trackUri: "spotify:track:A", durationMs: 200000, activeDeviceId: "dev1" })
+      .mockResolvedValueOnce({ isPlaying: true, progressMs: 199000, trackUri: "spotify:track:A", durationMs: 200000, activeDeviceId: "dev1" });
+    await (h.backend as any).pollState(); // confirms our uri playing on our device
+    expect(ended).not.toHaveBeenCalled();
+    await (h.backend as any).pollState(); // near-end -> finishes normally
+    expect(ended).toHaveBeenCalledTimes(1);
+    expect(ended).toHaveBeenCalledWith({ uri: "spotify:track:A", reason: "ended" });
   });
 });
 

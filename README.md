@@ -641,6 +641,7 @@ OAuth 相关端点：`/api/spotify/login`、`/api/spotify/callback`、`/api/spot
 - 在多租户/共享主机上，librespot 通过命令行参数接收访问令牌，同机其他本地进程理论上可读取（令牌约 1 小时有效，需本地访问权限）。
 - Spotify 连续播放（gapless spotify→spotify）时，网页进度条的"已播放时间"可能不准确（以后端上报的播放进度为准）。
 - 运行多个启用 Spotify 的 bot 时，若两个 bot 的 id 端口哈希发生冲突（同一 % 1000 桶），第二个 go-librespot 边车会因端口占用而启动失败、该 bot 的 Spotify 不可用（后续将改为按需分配空闲端口）。
+- **一个 Spotify Premium 账号只支持「一路」正在播放的音频流**。因此若要同时运行**多个**启用 Spotify 的 bot 并让它们各自独立播放，必须为**每个 bot 配置独立的 Spotify 账号**。在 Rust（librespot）后端上，本机制已把播放控制（暂停/继续/跳转）限定到 bot 自己的设备，并在读取播放状态时忽略其它设备的状态，以避免多 bot 之间互相抢占、来回抖动（cross-control/thrash）；但受 Spotify 平台限制，**共用同一账号无法实现多路同时播放**（第二个 bot 开始播放会夺走该账号唯一的活跃会话）。go-librespot 后端为每个边车独立的本地 REST API，不受此账号级抢占影响。
 
 ## 配置文件
 

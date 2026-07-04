@@ -82,6 +82,16 @@ export class RustLibrespotBackend extends EventEmitter implements SpotifyAudioBa
   private ready = false;
   private positionMs = 0;
 
+  // R4-4 (multi-bot): OUR resolved Connect device id, captured from
+  // findDeviceByName() in playTrack(). config.spotify (hence this Connect
+  // session) is shared process-wide across every BotInstance under one Premium
+  // account, and both the control API (pause/resume/seek) and the state read
+  // (GET /v1/me/player) are ACCOUNT-wide by default. Persisting our device id
+  // lets us (a) device-scope our control commands so we only ever act on our own
+  // device, and (b) in pollState, ignore state reported for a foreign device
+  // another bot stole the single active session with. null until first playTrack.
+  private deviceId: string | null = null;
+
   // track-end poll state machine
   private currentUri: string | null = null;
   private hasPlayed = false;
@@ -332,10 +342,30 @@ export class RustLibrespotBackend extends EventEmitter implements SpotifyAudioBa
       return;
     }
 
-    this.positionMs = state.progressMs;
+    // R4-4 (multi-bot): is the account's single ACTIVE Connect device ours? The
+    // Premium account allows one active playback stream, so if another bot stole
+    // the session, GET /v1/me/player now reports THAT device + its track. Only
+    // when the active device is foreign (we know our id AND the state names a
+    // DIFFERENT active id) do we refuse to treat this poll as our own track:
+    // skip metadata/track-change (so B's now-playing isn't surfaced as ours),
+    // don't advance our position/hasPlayed off foreign playback, and feed the
+    // stop/null two-poll detection so the stolen session cleanly ends OUR track
+    // and advances OUR queue instead of thrashing/misattributing. LENIENT: if
+    // our id is unknown or activeDeviceId is absent we can't tell, so we fall
+    // back to today's behavior byte-for-byte (single-bot: activeDeviceId === ours).
+    const foreignActive =
+      this.deviceId != null &&
+      state.activeDeviceId != null &&
+      state.activeDeviceId !== this.deviceId;
 
-    // Track change -> reset the end-detection state and surface best-effort metadata.
-    if (state.trackUri && state.trackUri !== this.currentUri) {
+    // Don't misattribute a foreign device's playback position as ours.
+    if (!foreignActive) this.positionMs = state.progressMs;
+
+    // Track change -> reset the end-detection state and surface best-effort
+    // metadata. Skipped entirely when a foreign device is active: its uri is NOT
+    // our track, so adopting it / emitting metadata would surface another bot's
+    // now-playing as ours and later misread that bot's stop as our track's end.
+    if (!foreignActive && state.trackUri && state.trackUri !== this.currentUri) {
       this.currentUri = state.trackUri;
       this.hasPlayed = false;
       this.endedForCurrent = false;
@@ -351,7 +381,11 @@ export class RustLibrespotBackend extends EventEmitter implements SpotifyAudioBa
       this.emit("metadata", np);
     }
 
-    if (state.isPlaying) {
+    // R4-4: only OUR device actually playing counts as our track playing. When a
+    // foreign device is active, `state.isPlaying` reflects THAT bot's playback,
+    // not ours — so it must not mark hasPlayed or clear the stop confirmation.
+    const ourTrackPlaying = state.isPlaying && !foreignActive;
+    if (ourTrackPlaying) {
       this.hasPlayed = true;
       // Real playback observed -> the I4 degrade-to-skip watchdog is moot.
       this.clearPlaybackWatchdog();
@@ -362,7 +396,7 @@ export class RustLibrespotBackend extends EventEmitter implements SpotifyAudioBa
     // A null item under is_playing:true is NOT "clearly playing" and must NOT
     // reset the confirmation, or a genuine null-item end could never accumulate
     // its second poll.
-    if (state.isPlaying && state.trackUri !== null) {
+    if (ourTrackPlaying && state.trackUri !== null) {
       this.stopSeen = false;
     }
     if (!this.currentUri || this.endedForCurrent) return;
@@ -381,9 +415,13 @@ export class RustLibrespotBackend extends EventEmitter implements SpotifyAudioBa
     // without `!this.paused` this near-end heuristic would fire and skip the
     // paused track. resume() clears `paused`, so a genuine natural end is still
     // detected afterwards.
+    // R4-4: progress/duration under a foreign-active state belong to another
+    // bot's track, so the near-end heuristic must not fire off them. A stolen
+    // session ends OUR track through the stop/null two-poll path below instead.
     const finishedByProgress =
       this.hasPlayed &&
       !this.paused &&
+      !foreignActive &&
       state.durationMs > END_OF_TRACK_WINDOW_MS &&
       state.progressMs >= state.durationMs - END_OF_TRACK_WINDOW_MS;
     // C1(pause-skip) + R3-1(null-item): a self-initiated pause (this.paused)
@@ -397,11 +435,16 @@ export class RustLibrespotBackend extends EventEmitter implements SpotifyAudioBa
     // stop OR null is absorbed; a confirmed end still emits within ~one extra
     // poll interval, and a genuine end (item stays null / stopped across two
     // polls) still fires exactly once.
+    // R4-4: a foreign device becoming the active one means OUR device is no
+    // longer playing our track — the same signal as an external stop / null
+    // item, so it shares the two-poll confirmation: one foreign poll is
+    // unconfirmed (could be a transient handoff), two consecutive foreign polls
+    // cleanly end our track and advance our queue.
     let finishedByStopOrNull = false;
     if (
       this.hasPlayed &&
       !this.paused &&
-      (!state.isPlaying || state.trackUri === null)
+      (foreignActive || !state.isPlaying || state.trackUri === null)
     ) {
       if (this.stopSeen) {
         finishedByStopOrNull = true;
@@ -431,6 +474,10 @@ export class RustLibrespotBackend extends EventEmitter implements SpotifyAudioBa
   async playTrack(uri: string): Promise<void> {
     const deviceId = await this.connect.findDeviceByName(this.opts.deviceName);
     if (!deviceId) throw new Error(`Connect device "${this.opts.deviceName}" not found`);
+    // R4-4: persist OUR device id so control (pause/resume/seek) is device-scoped
+    // and pollState can distinguish our device from a foreign one that stole the
+    // shared account's single active Connect session.
+    this.deviceId = deviceId;
     // Reset the track-end state machine for the new track: clear the once-only
     // latch and drop hasPlayed so no end can fire until a poll re-confirms this
     // uri playing. currentUri is cleared so the next poll re-detects the track
@@ -509,20 +556,25 @@ export class RustLibrespotBackend extends EventEmitter implements SpotifyAudioBa
   }
 
   async pause(): Promise<void> {
-    await this.connect.pause();
+    // R4-4: device-scope to OUR device so bot A's pause / auto-pause-when-alone
+    // can't pause whatever device is currently active for the shared account
+    // (= bot B's playback). Falls back to account-wide only before first play.
+    await this.connect.pause(this.deviceId ?? undefined);
     // C1(pause-skip): mark our own pause so the next poll's is_playing:false
     // (same uri) is not misread as a track end and skipped.
     this.paused = true;
   }
 
   async resume(): Promise<void> {
-    await this.connect.resume();
+    // R4-4: device-scope to OUR device (see pause()).
+    await this.connect.resume(this.deviceId ?? undefined);
     // Resumed -> normal end-detection applies again.
     this.paused = false;
   }
 
   async seek(ms: number): Promise<void> {
-    await this.connect.seek(ms);
+    // R4-4: device-scope to OUR device (see pause()).
+    await this.connect.seek(ms, this.deviceId ?? undefined);
     this.positionMs = ms;
     // R4-6: arm the one-poll grace so a seek landing inside the final
     // END_OF_TRACK_WINDOW_MS is not immediately treated as a natural end.
