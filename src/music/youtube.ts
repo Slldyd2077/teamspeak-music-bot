@@ -115,20 +115,26 @@ export class YouTubeProvider implements MusicProvider {
   readonly platform = "youtube" as const;
   private quality = "bestaudio";
 
-  async search(query: string, limit = 5): Promise<SearchResult> {
+  async search(query: string, limit = 5, offset = 0): Promise<SearchResult> {
     try {
+      // yt-dlp's `ytsearchN` has no offset cursor — it always returns the first
+      // N results. Best-effort paginate by fetching offset+limit and slicing
+      // locally. (offset 0 → identical to before.)
+      const total = offset + limit;
       const raw = await runYtDlp([
-        `ytsearch${limit}:${query}`,
+        `ytsearch${total}:${query}`,
         "--dump-json",
         "--flat-playlist",
         "--no-warnings",
         "--quiet",
       ]);
       const lines = raw.trim().split("\n").filter(Boolean);
-      const songs: Song[] = lines.map((line) => {
-        const entry = JSON.parse(line) as YtDlpEntry;
-        return entryToSong(entry);
-      });
+      const songs: Song[] = lines
+        .slice(offset, offset + limit)
+        .map((line) => {
+          const entry = JSON.parse(line) as YtDlpEntry;
+          return entryToSong(entry);
+        });
       return { songs, playlists: [], albums: [] };
     } catch {
       return { songs: [], playlists: [], albums: [] };

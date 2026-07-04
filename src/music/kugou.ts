@@ -616,12 +616,15 @@ export class KugouProvider implements MusicProvider {
   }
 
   // --- Search (verified live via the unsigned mobile endpoint) ---------------
-  async search(query: string, limit = 20): Promise<SearchResult> {
+  async search(query: string, limit = 20, offset = 0): Promise<SearchResult> {
     const q = query.trim();
     if (!q) return { songs: [], playlists: [], albums: [] };
     try {
+      // Songs only. `page` is the 1-based cursor; the web pages in limit-aligned
+      // steps so offset is a multiple of pagesize.
+      const page = Math.floor(offset / limit) + 1;
       const res = await this.mobileHttp.get("http://mobilecdn.kugou.com/api/v3/search/song", {
-        params: { format: "json", keyword: q, page: 1, pagesize: limit, showtype: 1 },
+        params: { format: "json", keyword: q, page, pagesize: limit, showtype: 1 },
       });
       const info = res.data?.data?.info as KugouRawSong[] | undefined;
       return { songs: mapKugouSongs(info), playlists: [], albums: [] };

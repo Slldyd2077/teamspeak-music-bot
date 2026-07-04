@@ -74,7 +74,7 @@ export interface AuthStatus {
 export interface MusicProvider {
   readonly platform: "netease" | "qq" | "bilibili" | "youtube" | "local" | "kugou";
 
-  search(query: string, limit?: number): Promise<SearchResult>;
+  search(query: string, limit?: number, offset?: number): Promise<SearchResult>;
   getSongUrl(songId: string, quality?: string): Promise<SongUrlResult | null>;
   setQuality(quality: string): void;
   getQuality(): string;

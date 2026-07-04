@@ -131,21 +131,25 @@ export class NeteaseProvider implements MusicProvider {
     return this.cookie ? { cookie: this.cookie } : {};
   }
 
-  async search(query: string, limit = 20): Promise<SearchResult> {
+  async search(query: string, limit = 20, offset = 0): Promise<SearchResult> {
+    // /cloudsearch supports offset for every type. Songs, playlists (type 1000)
+    // and albums (type 10) are all limit/offset-driven so the web can page past
+    // the first page (playlists/albums were previously hardcoded to limit: 10).
     const [songRes, playlistRes, albumRes] = await Promise.all([
       this.api.get("/cloudsearch", {
-        params: { keywords: query, type: 1, limit, ...this.cookieParams },
+        params: { keywords: query, type: 1, limit, offset, ...this.cookieParams },
       }),
       this.api.get("/cloudsearch", {
         params: {
           keywords: query,
           type: 1000,
-          limit: 10,
+          limit,
+          offset,
           ...this.cookieParams,
         },
       }),
       this.api.get("/cloudsearch", {
-        params: { keywords: query, type: 10, limit: 10, ...this.cookieParams },
+        params: { keywords: query, type: 10, limit, offset, ...this.cookieParams },
       }),
     ]);
 
