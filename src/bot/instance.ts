@@ -85,6 +85,7 @@ export class BotInstance extends EventEmitter {
   private profileManager: BotProfileManager;
   private isFmMode = false;
   private fmProvider: MusicProvider | null = null;
+  private fmRequesterName: string | undefined;
   /** Results of the most recent !search, for "#N" selection (issue #90). */
   private lastSearchResults: Song[] = [];
   /** 当前曲实际播放时长（试听片段秒数或完整 duration）；resolveAndPlay 赋值。 */
@@ -446,7 +447,8 @@ export class BotInstance extends EventEmitter {
 
   async executeCommand(
     cmd: ParsedCommand,
-    msg?: TS3TextMessage
+    msg?: TS3TextMessage,
+    requesterName = this.requesterNameFromMessage(msg),
   ): Promise<string | null> {
     // Reject commands that would push audio when the bot isn't connected:
     // otherwise ffmpeg spawns and voice goes to a half-initialized or
@@ -474,12 +476,12 @@ export class BotInstance extends EventEmitter {
       case "find":
         return this.cmdSearch(cmd);
       case "play":
-        return this.cmdPlay(cmd);
+        return this.cmdPlay(cmd, requesterName);
       case "add":
-        return this.cmdAdd(cmd);
+        return this.cmdAdd(cmd, requesterName);
       case "playnext":
       case "pn":
-        return this.cmdPlayNext(cmd);
+        return this.cmdPlayNext(cmd, requesterName);
       case "pause":
         return this.cmdPause();
       case "resume":
@@ -505,13 +507,13 @@ export class BotInstance extends EventEmitter {
       case "mode":
         return this.cmdMode(cmd);
       case "playlist":
-        return this.cmdPlaylist(cmd);
+        return this.cmdPlaylist(cmd, requesterName);
       case "album":
-        return this.cmdAlbum(cmd);
+        return this.cmdAlbum(cmd, requesterName);
       case "fm":
-        return this.cmdFm(cmd);
+        return this.cmdFm(cmd, requesterName);
       case "artist":
-        return this.cmdArtist(cmd);
+        return this.cmdArtist(cmd, requesterName);
       case "vote":
         return this.cmdVote(msg);
       case "lyrics":
@@ -538,6 +540,7 @@ export class BotInstance extends EventEmitter {
   private disableFmMode(): void {
     this.isFmMode = false;
     this.fmProvider = null;
+    this.fmRequesterName = undefined;
   }
 
   private getProvider(flags: Set<string>): MusicProvider {
@@ -546,6 +549,19 @@ export class BotInstance extends EventEmitter {
     if (flags.has("y")) return this.youtubeProvider;
     if (flags.has("k")) return this.kugouProvider;
     return this.neteaseProvider;
+  }
+
+  private requesterNameFromMessage(msg?: TS3TextMessage): string | undefined {
+    const name = msg?.invokerName?.trim();
+    return name || undefined;
+  }
+
+  private withRequester<T extends Song | QueuedSong>(
+    song: T,
+    requesterName?: string,
+  ): T & { requestedBy?: string } {
+    const requestedBy = requesterName?.trim();
+    return requestedBy ? { ...song, requestedBy } : { ...song };
   }
 
   /** Resolve URL for a song and start playing it. Skips to next if URL fails. */
@@ -596,6 +612,7 @@ export class BotInstance extends EventEmitter {
         album: song.album,
         platform: song.platform,
         coverUrl: song.coverUrl,
+        requestedBy: song.requestedBy,
       });
       // Keep TeamSpeak-side profile updates on the same path for play/next/FM.
       await this.syncProfileToSong(song);
@@ -668,7 +685,7 @@ export class BotInstance extends EventEmitter {
     ].join("\n");
   }
 
-  private async cmdPlay(cmd: ParsedCommand): Promise<string> {
+  private async cmdPlay(cmd: ParsedCommand, requesterName?: string): Promise<string> {
     if (!cmd.args) return `Usage: ${this.config.commandPrefix}play <song name | #N | id:<id> | URL>`;
     const { song, error } = await this.resolvePlayQuery(cmd);
     if (error) return error;
@@ -679,7 +696,7 @@ export class BotInstance extends EventEmitter {
     }
     this.queue.clear();
     this.disableFmMode();
-    this.queue.add({ ...song0 });
+    this.queue.add(this.withRequester(song0, requesterName));
     this.queue.play();
 
     // Reset failure counter on user-initiated play
@@ -693,14 +710,14 @@ export class BotInstance extends EventEmitter {
     return `Now playing: ${song0.name} - ${song0.artist}`;
   }
 
-  private async cmdAdd(cmd: ParsedCommand): Promise<string> {
+  private async cmdAdd(cmd: ParsedCommand, requesterName?: string): Promise<string> {
     if (!cmd.args) return `Usage: ${this.config.commandPrefix}add <song name | #N | id:<id> | URL>`;
     const { song, error } = await this.resolvePlayQuery(cmd);
     if (error) return error;
     const s = song!;
 
     const wasIdle = this.player.getState() === "idle";
-    this.queue.add({ ...s });
+    this.queue.add(this.withRequester(s, requesterName));
 
     // If nothing was playing, start this newly-added song immediately.
     // Matches /api/player/:id/add-by-id behavior so both add paths feel
@@ -717,7 +734,7 @@ export class BotInstance extends EventEmitter {
     return `Added to queue: ${s.name} - ${s.artist} (position ${this.queue.size()})`;
   }
 
-  private async cmdPlayNext(cmd: ParsedCommand): Promise<string> {
+  private async cmdPlayNext(cmd: ParsedCommand, requesterName?: string): Promise<string> {
     if (!cmd.args) return `Usage: ${this.config.commandPrefix}playnext <song name | #N | id:<id> | URL>`;
     const { song, error } = await this.resolvePlayQuery(cmd);
     if (error) return error;
@@ -733,7 +750,7 @@ export class BotInstance extends EventEmitter {
       this.queue.getCurrentIndex() < 0
         ? this.queue.size()
         : this.queue.getCurrentIndex() + 1;
-    this.queue.addNext({ ...s });
+    this.queue.addNext(this.withRequester(s, requesterName));
 
     if (wasIdle) {
       this.queue.playAt(insertedAt);
@@ -862,7 +879,7 @@ export class BotInstance extends EventEmitter {
     return `Play mode set to: ${cmd.args}`;
   }
 
-  private async cmdPlaylist(cmd: ParsedCommand): Promise<string> {
+  private async cmdPlaylist(cmd: ParsedCommand, requesterName?: string): Promise<string> {
     if (!cmd.args) return "Usage: !playlist <playlist name or ID>";
     const provider = this.getProvider(cmd.flags);
 
@@ -907,7 +924,7 @@ export class BotInstance extends EventEmitter {
     this.queue.clear();
     this.disableFmMode();
     for (const song of songs) {
-      this.queue.add({ ...song, platform: provider.platform });
+      this.queue.add(this.withRequester({ ...song, platform: provider.platform }, requesterName));
     }
     const first = this.queue.play();
     if (first) await this.resolveAndPlay(first);
@@ -916,7 +933,7 @@ export class BotInstance extends EventEmitter {
     return `Loaded ${songs.length} songs. Now playing: ${first?.name ?? "unknown"}`;
   }
 
-  private async cmdAlbum(cmd: ParsedCommand): Promise<string> {
+  private async cmdAlbum(cmd: ParsedCommand, requesterName?: string): Promise<string> {
     if (!cmd.args) return "Usage: !album <album name or ID>";
     const provider = this.getProvider(cmd.flags);
 
@@ -944,7 +961,7 @@ export class BotInstance extends EventEmitter {
     this.queue.clear();
     this.disableFmMode();
     for (const song of songs) {
-      this.queue.add({ ...song, platform: provider.platform });
+      this.queue.add(this.withRequester({ ...song, platform: provider.platform }, requesterName));
     }
     const first = this.queue.play();
     if (first) await this.resolveAndPlay(first);
@@ -953,11 +970,11 @@ export class BotInstance extends EventEmitter {
     return `Loaded ${songs.length} songs. Now playing: ${first?.name ?? "unknown"}`;
   }
 
-  private async cmdFm(cmd: ParsedCommand): Promise<string> {
-    return this.startFm(this.getProvider(cmd.flags));
+  private async cmdFm(cmd: ParsedCommand, requesterName?: string): Promise<string> {
+    return this.startFm(this.getProvider(cmd.flags), requesterName);
   }
 
-  async startFm(provider: MusicProvider = this.neteaseProvider): Promise<string> {
+  async startFm(provider: MusicProvider = this.neteaseProvider, requesterName?: string): Promise<string> {
     // Match the !fm chat-command guard: refuse before mutating the queue when
     // offline, so the web /fm route can't wipe the queue + flip into FM mode
     // while nothing can actually play.
@@ -974,11 +991,12 @@ export class BotInstance extends EventEmitter {
     this.player.stop();
     this.queue.clear();
     for (const song of songs) {
-      this.queue.add({ ...song, platform: provider.platform });
+      this.queue.add(this.withRequester({ ...song, platform: provider.platform }, requesterName));
     }
     this.queue.setMode(PlayMode.Random);
     this.isFmMode = true;
     this.fmProvider = provider;
+    this.fmRequesterName = requesterName?.trim() || undefined;
     this.player.resetFailures();
 
     const first = this.queue.play();
@@ -989,7 +1007,7 @@ export class BotInstance extends EventEmitter {
     return `${label} started: ${first?.name ?? "unknown"} - ${first?.artist ?? ""}`;
   }
 
-  private async cmdArtist(cmd: ParsedCommand): Promise<string> {
+  private async cmdArtist(cmd: ParsedCommand, requesterName?: string): Promise<string> {
     if (!cmd.args) return "Usage: !artist <artist name>";
     const provider = this.getProvider(cmd.flags);
     const result = await provider.search(cmd.args, 50);
@@ -1010,7 +1028,7 @@ export class BotInstance extends EventEmitter {
     this.queue.clear();
     this.disableFmMode();
     for (const song of filtered) {
-      this.queue.add({ ...song, platform: provider.platform });
+      this.queue.add(this.withRequester({ ...song, platform: provider.platform }, requesterName));
     }
     this.queue.setMode(PlayMode.Loop);
     this.player.resetFailures();
@@ -1029,7 +1047,7 @@ export class BotInstance extends EventEmitter {
       const songs = await provider.getPersonalFm();
       if (songs.length === 0) return;
       for (const song of songs) {
-        this.queue.add({ ...song, platform: provider.platform });
+        this.queue.add(this.withRequester({ ...song, platform: provider.platform }, this.fmRequesterName));
       }
       this.logger.debug({ count: songs.length, platform: provider.platform }, "FM queue refilled");
     } catch (err) {

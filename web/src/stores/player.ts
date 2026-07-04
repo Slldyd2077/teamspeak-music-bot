@@ -11,6 +11,8 @@ export interface Song {
   duration: number;
   coverUrl: string;
   platform: 'netease' | 'qq' | 'bilibili' | 'youtube' | 'local' | 'kugou';
+  requestedBy?: string;
+  playedAt?: string;
 }
 
 export type Source = 'netease' | 'qq' | 'kugou';
