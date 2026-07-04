@@ -18,6 +18,7 @@
   <img src="https://img.shields.io/badge/酷狗音乐-支持-2ca2f9" />
   <img src="https://img.shields.io/badge/BiliBili-支持-00a1d6?logo=bilibili&logoColor=white" />
   <img src="https://img.shields.io/badge/YouTube-可选-FF0000?logo=youtube&logoColor=white" />
+  <img src="https://img.shields.io/badge/Spotify-可选-1DB954?logo=spotify&logoColor=white" />
   <img src="https://img.shields.io/badge/TS3-支持-2580C3?logo=teamspeak&logoColor=white" />
   <img src="https://img.shields.io/badge/TS6-支持-2580C3?logo=teamspeak&logoColor=white" />
 </p>
