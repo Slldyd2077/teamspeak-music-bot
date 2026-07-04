@@ -249,6 +249,14 @@ const handleOccupancy = (BotInstance.prototype as any).handleOccupancy as (
   userCount: number,
 ) => void;
 const seek = (BotInstance.prototype as any).seek as (this: unknown, seconds: number) => void;
+const playNext = (BotInstance.prototype as any).playNext as (
+  this: unknown,
+  maxRetries?: number,
+) => Promise<boolean>;
+const cmdRemove = (BotInstance.prototype as any).cmdRemove as (
+  this: unknown,
+  cmd: any,
+) => Promise<string> | string;
 
 function makeController() {
   return {
@@ -266,15 +274,22 @@ function makePlayer() {
   // `externalActive` mirrors the real AudioPlayer: playPcmStream attaches the
   // external stream (true), and both stop() and play() detach it (false). The
   // re-attach guard reads isExternalActive(), so this must track that state.
+  // `state` mirrors the real player's PlayerState transitions so tests can
+  // observe paused→playing (R3-3): playPcmStream/play → "playing", stop →
+  // "idle", pause → "paused" (only from playing), resume → "playing" (only
+  // from paused). Existing tests never read state, so tracking it is inert
+  // for them.
   let externalActive = false;
+  let state: "idle" | "playing" | "paused" = "idle";
   return {
-    play: vi.fn((..._args: any[]) => { externalActive = false; }),
-    stop: vi.fn(() => { externalActive = false; }),
-    playPcmStream: vi.fn((..._args: any[]) => { externalActive = true; }),
-    pause: vi.fn(),
-    resume: vi.fn(),
+    play: vi.fn((..._args: any[]) => { externalActive = false; state = "playing"; }),
+    stop: vi.fn(() => { externalActive = false; state = "idle"; }),
+    playPcmStream: vi.fn((..._args: any[]) => { externalActive = true; state = "playing"; }),
+    pause: vi.fn(() => { if (state === "playing") state = "paused"; }),
+    resume: vi.fn(() => { if (state === "paused") state = "playing"; }),
     seek: vi.fn(),
     isExternalActive: vi.fn(() => externalActive),
+    getState: vi.fn(() => state),
   };
 }
 function makeResolveCtx(opts: {
@@ -465,6 +480,54 @@ describe("BotInstance.resolveAndPlay — Spotify routing (C4)", () => {
     expect(player.play).toHaveBeenCalledWith("http://cdn/x.mp3", 0, 200);
     expect(player.playPcmStream).not.toHaveBeenCalled();
   });
+
+  // R3-3: spotify A playing → pause → skip to spotify B. The persistent PCM
+  // stream stays attached through the pause, so the re-attach gate skips
+  // playPcmStream (which is what sets state='playing'). Without an explicit
+  // resume the player would sit 'paused' and emit silence while the sidecar
+  // decodes B. The reuse path must force the player back to PLAYING.
+  it("resumes the player when skipping from a PAUSED spotify track to another spotify track (R3-3)", async () => {
+    const controller = makeController();
+    const player = makePlayer();
+    const ctx = makeResolveCtx({
+      controller, player, url: "spotify:track:abc", currentSourceIsSpotify: false,
+    });
+
+    // Spotify A starts → PCM stream attached, player playing.
+    await resolveAndPlay.call(ctx, spotifySong());
+    expect(player.getState()).toBe("playing");
+    expect(player.isExternalActive()).toBe(true);
+
+    // User pauses: player paused; the external stream stays attached.
+    player.pause();
+    expect(player.getState()).toBe("paused");
+    expect(player.isExternalActive()).toBe(true);
+
+    // Skip to spotify B via the external-stream-reuse path (playPcmStream skipped).
+    await resolveAndPlay.call(ctx, spotifySong());
+
+    // Player must be PLAYING again (frames would emit), not stuck paused.
+    expect(player.getState()).toBe("playing");
+    // Reuse path — the persistent stream was NOT re-attached.
+    expect(player.playPcmStream).toHaveBeenCalledTimes(1);
+    expect(player.resume).toHaveBeenCalled();
+  });
+
+  // The normal (non-paused) spotify→spotify handoff must be unaffected: resume
+  // on an already-playing player is a no-op, so state stays 'playing'.
+  it("keeps a non-paused spotify→spotify handoff playing (R3-3 no-regression)", async () => {
+    const controller = makeController();
+    const player = makePlayer();
+    const ctx = makeResolveCtx({
+      controller, player, url: "spotify:track:abc", currentSourceIsSpotify: false,
+    });
+
+    await resolveAndPlay.call(ctx, spotifySong());
+    await resolveAndPlay.call(ctx, spotifySong());
+
+    expect(player.getState()).toBe("playing");
+    expect(player.playPcmStream).toHaveBeenCalledTimes(1);
+  });
 });
 
 describe("BotInstance.setupPlayerEvents — controller trackEnded wiring", () => {
@@ -549,6 +612,138 @@ describe("BotInstance transport delegation — spotify current song", () => {
     cmdResume.call(ctx);
     expect(ctx.spotifyController.pause).not.toHaveBeenCalled();
     expect(ctx.spotifyController.resume).not.toHaveBeenCalled();
+  });
+});
+
+// --- R3-2: removing the currently-playing Spotify track ---------------------
+// queue.remove() of the current index only decrements currentIndex; it never
+// stops the player or sidecar. A spotify track has NO player self-EOF advance
+// path, so leaving the sidecar running while queue.current() is no longer that
+// track wedges the bot in silence. cmdRemove must reconcile: stop the sidecar
+// and advance (or stop cleanly) — but ONLY for a current spotify track.
+describe("BotInstance.cmdRemove — spotify current-track reconciliation (R3-2)", () => {
+  function makeRemoveCtx(opts: {
+    currentIndex: number;
+    currentSourceIsSpotify: boolean;
+    removed: any;
+  }) {
+    return {
+      currentSourceIsSpotify: opts.currentSourceIsSpotify,
+      queue: {
+        getCurrentIndex: vi.fn(() => opts.currentIndex),
+        remove: vi.fn(() => opts.removed),
+      },
+      spotifyController: makeController(),
+      player: makePlayer(),
+      playNext: vi.fn(async () => true),
+      sweepLocalAudio: vi.fn(),
+      emit: vi.fn(),
+      logger: { warn: vi.fn(), info: vi.fn(), error: vi.fn(), debug: vi.fn() },
+    } as any;
+  }
+
+  it("stops the sidecar and advances when removing the CURRENT spotify track", async () => {
+    const ctx = makeRemoveCtx({
+      currentIndex: 0,
+      currentSourceIsSpotify: true,
+      removed: { name: "A", platform: "spotify" },
+    });
+
+    const reply = await cmdRemove.call(ctx, { args: "1" }); // index 0 == current
+
+    expect(reply).toContain("Removed: A");
+    expect(ctx.spotifyController.stop).toHaveBeenCalledTimes(1);
+    expect(ctx.currentSourceIsSpotify).toBe(false);
+    expect(ctx.player.stop).toHaveBeenCalledTimes(1);
+    // Advance to whatever is now current (or stop cleanly if empty).
+    expect(ctx.playNext).toHaveBeenCalledTimes(1);
+  });
+
+  it("does NOT stop the sidecar when removing a NON-current track", async () => {
+    const ctx = makeRemoveCtx({
+      currentIndex: 0,
+      currentSourceIsSpotify: true,
+      removed: { name: "B", platform: "spotify" },
+    });
+
+    await cmdRemove.call(ctx, { args: "2" }); // index 1 != current (0)
+
+    expect(ctx.spotifyController.stop).not.toHaveBeenCalled();
+    expect(ctx.player.stop).not.toHaveBeenCalled();
+    expect(ctx.playNext).not.toHaveBeenCalled();
+    expect(ctx.currentSourceIsSpotify).toBe(true);
+  });
+
+  it("does NOT stop the sidecar when the current track is NOT spotify (URL self-heals)", async () => {
+    const ctx = makeRemoveCtx({
+      currentIndex: 0,
+      currentSourceIsSpotify: false, // current is a URL track
+      removed: { name: "A", platform: "netease" },
+    });
+
+    await cmdRemove.call(ctx, { args: "1" }); // index 0 == current
+
+    expect(ctx.spotifyController.stop).not.toHaveBeenCalled();
+    expect(ctx.player.stop).not.toHaveBeenCalled();
+    expect(ctx.playNext).not.toHaveBeenCalled();
+  });
+
+  it("returns 'Invalid position' without touching the sidecar on a bad index", async () => {
+    const ctx = makeRemoveCtx({
+      currentIndex: 0,
+      currentSourceIsSpotify: true,
+      removed: null, // queue.remove() rejects the index
+    });
+
+    const reply = await cmdRemove.call(ctx, { args: "9" });
+
+    expect(reply).toBe("Invalid position");
+    expect(ctx.spotifyController.stop).not.toHaveBeenCalled();
+    expect(ctx.playNext).not.toHaveBeenCalled();
+  });
+});
+
+// --- R3-6: queue exhausts on a spotify track --------------------------------
+// playNext's exhausted (non-FM) branch only called player.stop(); it left the
+// sidecar decoding and currentSourceIsSpotify stale — diverging from cmdStop.
+describe("BotInstance.playNext — spotify teardown on queue exhaust (R3-6)", () => {
+  function makeExhaustCtx(opts: { currentSourceIsSpotify: boolean }) {
+    return {
+      connected: true,
+      isAdvancing: false,
+      isFmMode: false,
+      currentSourceIsSpotify: opts.currentSourceIsSpotify,
+      voteSkipUsers: new Set<string>(),
+      queue: { next: vi.fn(() => null), unplayedCount: vi.fn(() => 0) },
+      player: makePlayer(),
+      spotifyController: makeController(),
+      profileManager: { onSongChange: vi.fn(async () => {}) },
+      resolveAndPlay: vi.fn(async () => true),
+      sweepLocalAudio: vi.fn(),
+      emit: vi.fn(),
+      logger: { warn: vi.fn(), info: vi.fn(), error: vi.fn(), debug: vi.fn() },
+    } as any;
+  }
+
+  it("stops the sidecar and clears the flag when a spotify queue exhausts", async () => {
+    const ctx = makeExhaustCtx({ currentSourceIsSpotify: true });
+
+    const started = await playNext.call(ctx);
+
+    expect(started).toBe(false);
+    expect(ctx.spotifyController.stop).toHaveBeenCalledTimes(1);
+    expect(ctx.currentSourceIsSpotify).toBe(false);
+    expect(ctx.player.stop).toHaveBeenCalledTimes(1);
+  });
+
+  it("does NOT stop the sidecar when a NON-spotify queue exhausts", async () => {
+    const ctx = makeExhaustCtx({ currentSourceIsSpotify: false });
+
+    const started = await playNext.call(ctx);
+
+    expect(started).toBe(false);
+    expect(ctx.spotifyController.stop).not.toHaveBeenCalled();
+    expect(ctx.player.stop).toHaveBeenCalledTimes(1);
   });
 });
 

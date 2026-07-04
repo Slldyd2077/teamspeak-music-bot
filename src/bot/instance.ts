@@ -760,6 +760,16 @@ export class BotInstance extends EventEmitter {
               this.currentSourceIsSpotify = false;
             },
           });
+        } else {
+          // External-stream-reuse path: the persistent PCM stream is still
+          // attached (e.g. we arrived here via pause → skip-within-spotify,
+          // where the stream stays attached through the pause). playPcmStream —
+          // which is what puts the player into the 'playing' state — is skipped,
+          // so without this the player would stay 'paused' and emit silence
+          // while the sidecar decodes the new track (corner-case R3-3). resume()
+          // is a no-op on an already-playing player, so the normal (non-paused)
+          // spotify→spotify handoff is unaffected.
+          this.player.resume();
         }
         this.currentSourceIsSpotify = true;
         song.url = result.url;
@@ -1058,11 +1068,31 @@ export class BotInstance extends EventEmitter {
     return "Queue cleared";
   }
 
-  private cmdRemove(cmd: ParsedCommand): string {
+  private async cmdRemove(cmd: ParsedCommand): Promise<string> {
     const index = parseInt(cmd.args, 10) - 1;
     if (isNaN(index) || index < 0) return "Usage: !remove <number>";
+    // Capture BEFORE the splice whether we're removing the currently-playing
+    // Spotify track: queue.remove() decrements currentIndex, so getCurrentIndex()
+    // is only meaningful pre-remove.
+    const removingCurrentSpotify =
+      index === this.queue.getCurrentIndex() && this.currentSourceIsSpotify;
     const removed = this.queue.remove(index);
     if (!removed) return "Invalid position";
+    // Corner-case R3-2: removing the track the Spotify sidecar is decoding
+    // right now leaves it running while queue.current() is no longer that
+    // track. Since a spotify track has NO player self-EOF advance path, the
+    // controller "trackEnded" handler would return early (current is no longer
+    // spotify) and the bot would wedge in silence. Reconcile like cmdStop/skip:
+    // tear the sidecar down, then advance to whatever is now current — or stop
+    // cleanly if the queue is now empty (playNext's exhausted branch stops the
+    // player). Non-current or non-spotify removals are untouched (a URL current
+    // track self-heals via its own EOF).
+    if (removingCurrentSpotify) {
+      this.spotifyController.stop();
+      this.currentSourceIsSpotify = false;
+      this.player.stop();
+      await this.playNext();
+    }
     // Sweep after the entry is gone — the file is deleted only if no other
     // queue position (or bot) still references this upload.
     this.sweepLocalAudio("removed_from_queue");
@@ -1381,6 +1411,16 @@ export class BotInstance extends EventEmitter {
             this.profileManager.onSongChange(null).catch(() => {});
           }
         } else {
+          // Queue exhausted on a non-FM source (skip-past-end or natural
+          // last-track end via trackEnded→playNext). If the ending track was
+          // served by the Spotify sidecar, tear it down like cmdStop —
+          // otherwise the go-librespot Connect device stays active with the
+          // track loaded (decoding into a detached/backpressured stream) and
+          // currentSourceIsSpotify stays stale (corner-case R3-6).
+          if (this.currentSourceIsSpotify) {
+            this.spotifyController.stop();
+            this.currentSourceIsSpotify = false;
+          }
           this.player.stop();
           this.profileManager.onSongChange(null).catch(() => {});
         }
