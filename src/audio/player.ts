@@ -616,7 +616,14 @@ export class AudioPlayer extends EventEmitter {
       // External mode: the sidecar PCM stream is continuous and never EOFs per
       // song; a transient underrun must NOT end the track (advance is driven by
       // the controller). Skip BOTH drain/stall branches while externalMode.
-      if (!this.externalMode && this.ffmpeg !== null && this.pcmBuffer.length < PCM_FRAME_BYTES) {
+      //
+      // R3-4: gate BOTH end-detection branches on state==="playing". While paused
+      // the loop still ticks (so a resumed stream can refill), but it must NOT
+      // accumulate stall attempts or emit trackEnd — otherwise pausing a stalled/
+      // unknown-duration stream would auto-advance ~5s later. Because the if is
+      // now false while paused, the else resets emptyFrameAttempts to 0, so a
+      // resumed healthy stream starts fresh and never ends instantly.
+      if (this.state === "playing" && !this.externalMode && this.ffmpeg !== null && this.pcmBuffer.length < PCM_FRAME_BYTES) {
         this.emptyFrameAttempts++;
         
         // End the track when FFmpeg has gone silent: quickly if we're near the
@@ -641,20 +648,20 @@ export class AudioPlayer extends EventEmitter {
             nearEnd: isNearEnd,
           }, "FFmpeg stopped outputting data, ending track");
           this.frameLoopRunning = false;
-          if (this.state !== "idle") {
-            this.state = "idle";
-            // 清理FFmpeg进程
-            if (this.ffmpeg) {
-              const procToKill = this.ffmpeg;
-              const pidToKill = procToKill.pid;
-              this.ffmpeg = null;
-              if (pidToKill) {
-                this.forceCleanup(procToKill, pidToKill);
-              }
+          // The outer gate guarantees state==="playing" here, so no !=="idle"
+          // guard is needed: end the track directly.
+          this.state = "idle";
+          // 清理FFmpeg进程
+          if (this.ffmpeg) {
+            const procToKill = this.ffmpeg;
+            const pidToKill = procToKill.pid;
+            this.ffmpeg = null;
+            if (pidToKill) {
+              this.forceCleanup(procToKill, pidToKill);
             }
-            this.consecutiveFailures = 0;
-            this.emit("trackEnd");
           }
+          this.consecutiveFailures = 0;
+          this.emit("trackEnd");
           return;
         }
       } else {
@@ -662,14 +669,15 @@ export class AudioPlayer extends EventEmitter {
         this.emptyFrameAttempts = 0;
       }
 
-      if (!this.externalMode && !this.ffmpeg && this.pcmBuffer.length < PCM_FRAME_BYTES) {
+      // R3-4: likewise gated on state==="playing" — a drained/EOF'd stream must
+      // not emit trackEnd while paused; end-detection resumes on resume().
+      if (this.state === "playing" && !this.externalMode && !this.ffmpeg && this.pcmBuffer.length < PCM_FRAME_BYTES) {
         this.frameLoopRunning = false;
-        if (this.state !== "idle") {
-          this.state = "idle";
-          if (!this.spawnFailed) {
-            this.consecutiveFailures = 0;
-            this.emit("trackEnd");
-          }
+        // Outer gate guarantees state==="playing"; end directly (no !=="idle" guard).
+        this.state = "idle";
+        if (!this.spawnFailed) {
+          this.consecutiveFailures = 0;
+          this.emit("trackEnd");
         }
         return;
       }

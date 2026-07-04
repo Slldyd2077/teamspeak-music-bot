@@ -1,4 +1,4 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi } from "vitest";
 import { mkdtempSync, writeFileSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -459,5 +459,130 @@ describe("AudioPlayer external-PCM mode (playPcmStream)", () => {
     expect(spyBytes).toBeGreaterThan(0);
     expect(player.getState()).toBe("playing");
     player.stop();
+  });
+});
+
+// R3-4: the 20ms frame loop keeps running while paused (so a live-but-silent
+// stream can refill on resume). But the stall/EOF end-detection branches MUST
+// only run while state==="playing" — otherwise pausing a stalled or
+// unknown-duration stream still accumulates emptyFrameAttempts and auto-emits
+// trackEnd (~5s later), making the controller skip the paused track.
+//
+// These tests drive the real url-path frame loop (this.ffmpeg !== null, NOT
+// external mode), which cannot be exercised via playPcmStream (that sets
+// externalMode and suppresses both branches). We inject a fake live ffmpeg +
+// an empty pcmBuffer (a stream that stays alive but never yields a full PCM
+// frame) and run the actual startFrameLoop() under fake timers. `performance`
+// is faked in lockstep with the timer clock so each tick advances a real 20ms,
+// letting us cheaply cross MAX_EMPTY_ATTEMPTS (250 ticks ≈ 5s) deterministically.
+describe("AudioPlayer stall/EOF end-detection is gated on playing state (R3-4)", () => {
+  // Fake `performance` in lockstep with the timer clock so each advanced 20ms is
+  // a real frame tick (the loop computes its delay from performance.now()).
+  const FAKE_TIMER_OPTS: Parameters<typeof vi.useFakeTimers>[0] = {
+    toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval", "Date", "performance"],
+  };
+
+  // A player primed as "playing" with a LIVE ffmpeg that never produces a full
+  // PCM frame (unknown duration -> isNearEnd forced true). startFrameLoop() runs
+  // the genuine loop; no real process is spawned (fake ffmpeg has no pid, so the
+  // end path never touches forceCleanup/process.kill).
+  function makeStalledPlaying(): AudioPlayer {
+    const player = new AudioPlayer(silentLogger);
+    const p = player as unknown as {
+      ffmpeg: unknown;
+      currentSongDuration: number;
+      pcmBuffer: Buffer;
+      emptyFrameAttempts: number;
+      framesPlayed: number;
+      state: string;
+      startFrameLoop(): void;
+    };
+    p.ffmpeg = { pid: undefined }; // live ffmpeg, but delivers no PCM
+    p.currentSongDuration = 0; // unknown duration -> isNearEnd === true
+    p.pcmBuffer = Buffer.alloc(0); // always < one PCM frame
+    p.emptyFrameAttempts = 0;
+    p.framesPlayed = 0;
+    p.state = "playing";
+    p.startFrameLoop();
+    return player;
+  }
+
+  it("does NOT emit trackEnd (and stays paused) when a stalled unknown-duration stream is paused past the stall threshold", () => {
+    vi.useFakeTimers(FAKE_TIMER_OPTS);
+    try {
+      const player = makeStalledPlaying();
+      let ended = 0;
+      player.on("trackEnd", () => ended++);
+
+      player.pause();
+      expect(player.getState()).toBe("paused");
+
+      // Advance well past MAX_EMPTY_ATTEMPTS (250 ticks ≈ 5s): ~300 ticks.
+      vi.advanceTimersByTime(20 * 300);
+
+      expect(ended).toBe(0);
+      expect(player.getState()).toBe("paused");
+      player.stop();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("STILL emits trackEnd when the SAME stalled unknown-duration stream is left playing (dead-stream recovery #89 preserved)", () => {
+    vi.useFakeTimers(FAKE_TIMER_OPTS);
+    try {
+      const player = makeStalledPlaying(); // stays "playing"
+      let ended = 0;
+      player.on("trackEnd", () => ended++);
+
+      vi.advanceTimersByTime(20 * 300); // cross the 250-tick stall threshold
+
+      expect(ended).toBe(1);
+      expect(player.getState()).toBe("idle");
+      player.stop();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("does not spuriously end after a brief pause+resume on a healthy stream", () => {
+    vi.useFakeTimers(FAKE_TIMER_OPTS);
+    try {
+      const player = new AudioPlayer(silentLogger);
+      const p = player as unknown as {
+        ffmpeg: unknown;
+        currentSongDuration: number;
+        pcmBuffer: Buffer;
+        emptyFrameAttempts: number;
+        framesPlayed: number;
+        state: string;
+        startFrameLoop(): void;
+      };
+      // Healthy: a live ffmpeg with a large buffered runway that never drains
+      // empty across the ticks below, so no underrun is ever seen.
+      p.ffmpeg = { pid: undefined };
+      p.currentSongDuration = 0;
+      p.pcmBuffer = Buffer.alloc(FRAME_BYTES * 400);
+      p.emptyFrameAttempts = 0;
+      p.framesPlayed = 0;
+      p.state = "playing";
+      p.startFrameLoop();
+
+      let ended = 0;
+      player.on("trackEnd", () => ended++);
+
+      vi.advanceTimersByTime(20 * 5); // play a few frames
+      player.pause();
+      vi.advanceTimersByTime(20 * 100); // brief pause (buffer NOT drained while paused)
+      player.resume();
+      expect(player.getState()).toBe("playing");
+      vi.advanceTimersByTime(20 * 100); // resume; still plenty of runway
+
+      expect(ended).toBe(0);
+      expect(player.getState()).toBe("playing");
+      player.stop();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
