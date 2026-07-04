@@ -149,16 +149,16 @@ export class QQMusicProvider implements MusicProvider {
     };
   }
 
-  async search(query: string, limit = 20): Promise<SearchResult> {
+  async search(query: string, limit = 20, offset = 0): Promise<SearchResult> {
     // Primary: u.y.qq.com/cgi-bin/musicu.fcg — supports songs + albums +
     // playlists. Fixed per https://github.com/ZHANGTIANYAO1/teamspeak-music-bot/issues/61
     // (removed searchid, num_per_page >= 10, corrected search_type values).
-    const primary = await this.searchViaMusicuFcg(query, limit);
+    const primary = await this.searchViaMusicuFcg(query, limit, offset);
     if (primary) return primary;
 
     // Fallback: c.y.qq.com/soso/fcgi-bin/client_search_cp (song + album,
     // no playlist support). Kept as redundancy.
-    return this.searchViaClientSearchCp(query, limit);
+    return this.searchViaClientSearchCp(query, limit, offset);
   }
 
   /** Primary search via u.y.qq.com/cgi-bin/musicu.fcg.
@@ -169,25 +169,31 @@ export class QQMusicProvider implements MusicProvider {
    *   3. `search_type: 2` for albums, `3` for playlists (8 was "user"). */
   private async searchViaMusicuFcg(
     query: string,
-    limit: number
+    limit: number,
+    offset = 0
   ): Promise<SearchResult | null> {
     try {
+      // num_per_page must stay >= 10 (lower values return empty). It is now
+      // limit-driven for ALL three lists (albums/playlists were hardcoded to
+      // 10). page_num is the offset cursor; the web always requests in
+      // limit-aligned pages so offset is a multiple of limit.
       const numPerPage = Math.max(10, Math.min(limit, 50));
+      const pageNum = Math.floor(offset / limit) + 1;
       const reqData = JSON.stringify({
         req_0: {
           module: "music.search.SearchCgiService",
           method: "DoSearchForQQMusicDesktop",
-          param: { query, num_per_page: numPerPage, search_type: 0 },
+          param: { query, num_per_page: numPerPage, page_num: pageNum, search_type: 0 },
         },
         req_album: {
           module: "music.search.SearchCgiService",
           method: "DoSearchForQQMusicDesktop",
-          param: { query, num_per_page: 10, search_type: 2 },
+          param: { query, num_per_page: numPerPage, page_num: pageNum, search_type: 2 },
         },
         req_playlist: {
           module: "music.search.SearchCgiService",
           method: "DoSearchForQQMusicDesktop",
-          param: { query, num_per_page: 10, search_type: 3 },
+          param: { query, num_per_page: numPerPage, page_num: pageNum, search_type: 3 },
         },
       });
       const res = await qqMusicuApi.get("/cgi-bin/musicu.fcg", {
@@ -221,12 +227,16 @@ export class QQMusicProvider implements MusicProvider {
   /** Fallback search via c.y.qq.com/soso/fcgi-bin/client_search_cp */
   private async searchViaClientSearchCp(
     query: string,
-    limit: number
+    limit: number,
+    offset = 0
   ): Promise<SearchResult> {
+    // `p` is the 1-based page cursor. The web pages in limit-aligned steps so
+    // offset is a multiple of limit.
+    const page = Math.floor(offset / limit) + 1;
     const songParams = {
       w: query,
       format: "json",
-      p: 1,
+      p: page,
       n: Math.min(limit, 50),
       type: 0,
       cr: 1,
@@ -234,7 +244,7 @@ export class QQMusicProvider implements MusicProvider {
     const albumParams = {
       w: query,
       format: "json",
-      p: 1,
+      p: page,
       n: 5,
       t: 8,
       cr: 1,

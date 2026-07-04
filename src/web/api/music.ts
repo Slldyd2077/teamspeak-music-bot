@@ -86,7 +86,7 @@ export function createMusicRouter(
 
   router.get("/search", async (req, res) => {
     try {
-      const { q, platform, limit } = req.query;
+      const { q, platform, limit, offset } = req.query;
       if (!q) {
         res.status(400).json({ error: "q (query) is required" });
         return;
@@ -96,9 +96,13 @@ export function createMusicRouter(
         return;
       }
       const provider = getProvider(platform as string);
+      // Server-side pagination: offset lets the web load past the first page.
+      // Clamp to >= 0 so a bad/negative value falls back to the first page.
+      const parsedOffset = Math.max(0, parseInt(offset as string) || 0);
       const result = await provider.search(
         q as string,
-        parseInt(limit as string) || 20
+        parseInt(limit as string) || 20,
+        parsedOffset
       );
       res.json(result);
     } catch (err) {

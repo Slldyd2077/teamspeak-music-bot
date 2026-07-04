@@ -1,5 +1,14 @@
-import { describe, it, expect } from "vitest";
-import { mapQqAlbums, mapQqSongs, parseQqTrial } from "./qq.js";
+import { describe, it, expect, vi, beforeEach } from "vitest";
+
+// All axios.create(...) instances in qq.ts (qqMusicuApi / qqSearchApi / qqFavApi
+// and the per-instance api) share this single mock so the search test can
+// inspect the outgoing params/body regardless of which client issued them.
+const { mockGet, mockPost } = vi.hoisted(() => ({ mockGet: vi.fn(), mockPost: vi.fn() }));
+vi.mock("axios", () => ({
+  default: { create: () => ({ get: mockGet, post: mockPost }) },
+}));
+
+import { mapQqAlbums, mapQqSongs, parseQqTrial, QQMusicProvider } from "./qq.js";
 
 describe("QQ adapter", () => {
   it("mapQqSongs maps QQMusicApi-style song entries", () => {
@@ -90,5 +99,76 @@ describe("QQ adapter", () => {
     const out = mapQqAlbums(raw);
     expect(out[0].coverUrl).toBe("https://x/p.jpg");
     expect(out[0].id).toBe("");
+  });
+});
+
+describe("QQMusicProvider.search pagination", () => {
+  beforeEach(() => {
+    mockGet.mockReset();
+    mockPost.mockReset();
+  });
+
+  /** musicu.fcg returns one song → primary path succeeds. */
+  function musicuOk() {
+    mockGet.mockImplementation(async (url: string) => {
+      if (url === "/cgi-bin/musicu.fcg") {
+        return {
+          data: {
+            req_0: { data: { body: { song: { list: [{ mid: "m1", name: "S", singer: [], album: {}, interval: 100 }] } } } },
+            req_album: { data: { body: { album: { list: [] } } } },
+            req_playlist: { data: { body: { songlist: { list: [] } } } },
+          },
+        };
+      }
+      return { data: {} };
+    });
+  }
+
+  function musicuReqData() {
+    const call = mockGet.mock.calls.find((c: any[]) => c[0] === "/cgi-bin/musicu.fcg");
+    expect(call, "expected a musicu.fcg call").toBeTruthy();
+    return JSON.parse(call![1].params.data);
+  }
+
+  it("adds page_num (offset/limit+1) and limit-driven num_per_page for songs/albums/playlists", async () => {
+    musicuOk();
+    const p = new QQMusicProvider("http://x");
+    await p.search("hello", 20, 20); // page 2
+
+    const d = musicuReqData();
+    expect(d.req_0.param.page_num).toBe(2);
+    expect(d.req_0.param.num_per_page).toBe(20);
+    // Albums/playlists: num_per_page must be limit-driven (NOT hardcoded 10).
+    expect(d.req_album.param.page_num).toBe(2);
+    expect(d.req_album.param.num_per_page).toBe(20);
+    expect(d.req_playlist.param.page_num).toBe(2);
+    expect(d.req_playlist.param.num_per_page).toBe(20);
+  });
+
+  it("defaults offset to 0 → page_num 1 (backward compatible)", async () => {
+    musicuOk();
+    const p = new QQMusicProvider("http://x");
+    await p.search("hello", 20);
+    const d = musicuReqData();
+    expect(d.req_0.param.page_num).toBe(1);
+  });
+
+  it("fallback client_search_cp sets p to the page cursor", async () => {
+    // musicu returns no songs → primary returns null → fallback runs.
+    mockGet.mockImplementation(async (url: string) => {
+      if (url === "/cgi-bin/musicu.fcg") {
+        return { data: { req_0: { data: { body: { song: { list: [] } } } } } };
+      }
+      // client_search_cp
+      return { data: { data: { song: { list: [] }, album: { list: [] } } } };
+    });
+    const p = new QQMusicProvider("http://x");
+    await p.search("hello", 20, 20); // page 2
+
+    const songCall = mockGet.mock.calls.find(
+      (c: any[]) => c[0] === "/soso/fcgi-bin/client_search_cp" && c[1]?.params?.type === 0
+    );
+    expect(songCall, "expected a client_search_cp song call").toBeTruthy();
+    expect(songCall![1].params.p).toBe(2);
   });
 });

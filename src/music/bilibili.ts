@@ -147,12 +147,16 @@ export class BiliBiliProvider implements MusicProvider {
     return fixed;
   }
 
-  async search(query: string, limit = 20): Promise<SearchResult> {
+  async search(query: string, limit = 20, offset = 0): Promise<SearchResult> {
     await this.ensureBuvidCookie();
     await this.ensureWbiKeys();
+    // /search/type is page-based; the web pages in limit-aligned steps so
+    // offset is a multiple of page_size.
+    const page = Math.floor(offset / limit) + 1;
     const signed = this.signWbi({
       search_type: "video",
       keyword: query,
+      page,
       page_size: limit,
     });
     const res = await this.api.get("/x/web-interface/wbi/search/type", {
