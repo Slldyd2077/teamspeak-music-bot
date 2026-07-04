@@ -4,6 +4,7 @@ import {
   existsSync,
   mkdirSync,
   readFileSync,
+  renameSync,
   rmSync,
   writeFileSync,
 } from "node:fs";
@@ -81,7 +82,30 @@ export function createFileOAuthTokenStore(filePath: string): OAuthTokenStore {
     },
     save(t: OAuthTokens) {
       mkdirSync(dirname(filePath), { recursive: true });
-      writeFileSync(filePath, JSON.stringify(t, null, 2), { mode: 0o600 });
+      // Atomic write: serialize to a sibling temp file in the SAME directory,
+      // then rename it onto the final path. rename is an atomic replace on POSIX
+      // and modern Windows, so a crash / power loss / ENOSPC mid-write can never
+      // leave the token file truncated — a reader always sees either the previous
+      // file or the fully-written new one, never a partial. This matters because
+      // refresh() persists a ROTATED refresh token here: Spotify invalidates the
+      // OLD one the instant it responds, so a torn write would silently
+      // de-authenticate the operator (next load() JSON.parse-fails -> null ->
+      // full PKCE re-login). Mirrors config.ts saveConfig. The temp lives in the
+      // same dir so the rename stays on one filesystem; pid + timestamp keep
+      // concurrent writers from colliding on the temp name. 0600 is preserved.
+      const tmp = `${filePath}.${process.pid}.${Date.now()}.tmp`;
+      try {
+        writeFileSync(tmp, JSON.stringify(t, null, 2), { mode: 0o600 });
+        renameSync(tmp, filePath);
+      } catch (err) {
+        // Never leave a partial temp file behind on failure.
+        try {
+          rmSync(tmp, { force: true });
+        } catch {
+          /* best-effort cleanup */
+        }
+        throw err;
+      }
     },
     clear() {
       try {

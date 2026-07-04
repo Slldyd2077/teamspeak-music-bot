@@ -1,5 +1,12 @@
-import { describe, it, expect, vi } from "vitest";
-import { mkdtempSync, rmSync } from "node:fs";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
+import {
+  mkdtempSync,
+  rmSync,
+  readdirSync,
+  readFileSync,
+  renameSync,
+  statSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -11,6 +18,20 @@ import {
   type OAuthTokens,
   type OAuthTokenStore,
 } from "./spotify-oauth.js";
+
+// Wrap the fs functions the token store uses in call-through spies so the
+// atomic-write path (temp file + rename) can be observed/forced. Everything else
+// (mkdtemp, rmSync, readdir, …) is the real implementation via `...actual`, so
+// all other tests keep real filesystem behavior. `vi.spyOn` can't be used here
+// because the node:fs ESM namespace is non-configurable in this setup.
+vi.mock("node:fs", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:fs")>();
+  return {
+    ...actual,
+    writeFileSync: vi.fn(actual.writeFileSync),
+    renameSync: vi.fn(actual.renameSync),
+  };
+});
 
 // Correction C3.2: the control OAuth REQUIRES a user-provided client_id (their
 // own Spotify Developer app) + caller-supplied loopback redirect. There is NO
@@ -476,5 +497,91 @@ describe("createFileOAuthTokenStore", () => {
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
+  });
+});
+
+// R3-5: the token store save() must be atomic (same-dir temp file + rename), so
+// a crash / power loss / ENOSPC while persisting a ROTATED refresh token (Spotify
+// invalidates the OLD one the instant it responds — the new one lives only in
+// memory until this write lands) can never truncate the file and silently
+// de-authenticate the operator. Mirrors the hardened config.ts saveConfig.
+describe("createFileOAuthTokenStore atomic write (R3-5)", () => {
+  const dirs: string[] = [];
+  function makeTmpDir(): string {
+    const dir = mkdtempSync(join(tmpdir(), "sp-oauth-atomic-"));
+    dirs.push(dir);
+    return dir;
+  }
+  beforeEach(() => {
+    vi.clearAllMocks(); // reset call history, keep the call-through implementations
+  });
+  afterEach(() => {
+    for (const d of dirs) rmSync(d, { recursive: true, force: true });
+    dirs.length = 0;
+  });
+
+  const TOK: OAuthTokens = {
+    accessToken: "a",
+    refreshToken: "r",
+    expiresAt: 123,
+    scope: "s",
+  };
+
+  it("round-trips save/load and leaves NO .tmp file behind", () => {
+    const dir = makeTmpDir();
+    const file = join(dir, "tokens.json");
+    const store = createFileOAuthTokenStore(file);
+
+    store.save(TOK);
+
+    expect(store.load()).toEqual(TOK);
+    // No temp remnants in the target directory.
+    expect(readdirSync(dir).filter((f) => f.includes(".tmp"))).toEqual([]);
+  });
+
+  it("writes via a same-dir temp file then renameSync onto the final path", () => {
+    const dir = makeTmpDir();
+    const file = join(dir, "tokens.json");
+
+    createFileOAuthTokenStore(file).save(TOK);
+
+    expect(vi.mocked(renameSync)).toHaveBeenCalled();
+    const [from, to] = vi.mocked(renameSync).mock.calls[0] as [string, string];
+    expect(to).toBe(file); // renamed ONTO the real path
+    expect(String(from)).not.toBe(file); // ...from a distinct temp file
+    expect(join(String(from), "..")).toBe(join(file, "..")); // ...in the SAME dir
+  });
+
+  it("persists the token file with 0600 permissions (POSIX)", () => {
+    if (process.platform === "win32") return; // mode bits aren't meaningful on Windows
+    const dir = makeTmpDir();
+    const file = join(dir, "tokens.json");
+    createFileOAuthTokenStore(file).save(TOK);
+    expect(statSync(file).mode & 0o777).toBe(0o600);
+  });
+
+  it("does NOT truncate/corrupt a pre-existing valid token file when the write fails mid-way", () => {
+    const dir = makeTmpDir();
+    const file = join(dir, "tokens.json");
+    const store = createFileOAuthTokenStore(file);
+
+    // A valid, previously-persisted token file (the live refresh token on disk).
+    store.save(TOK);
+    const before = readFileSync(file, "utf-8");
+
+    // Simulate a crash / ENOSPC at the atomic-replace step while persisting a
+    // ROTATED refresh token.
+    const rotated: OAuthTokens = { ...TOK, accessToken: "a2", refreshToken: "r2" };
+    vi.mocked(renameSync).mockImplementationOnce(() => {
+      throw new Error("rename boom");
+    });
+
+    expect(() => store.save(rotated)).toThrow(/rename boom/);
+
+    // The original file is untouched: present, byte-identical, still parseable.
+    expect(readFileSync(file, "utf-8")).toBe(before);
+    expect(store.load()).toEqual(TOK);
+    // ...and the failed write left no temp file lying around.
+    expect(readdirSync(dir).filter((f) => f.includes(".tmp"))).toEqual([]);
   });
 });
