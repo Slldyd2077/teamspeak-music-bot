@@ -1,5 +1,6 @@
 import crypto from "node:crypto";
 import { EventEmitter } from "node:events";
+import path from "node:path";
 import {
   BotInstance,
   type BotInstanceOptions,
@@ -13,6 +14,7 @@ import type { Logger } from "../logger.js";
 import type { ServerProtocol } from "../ts-protocol/client.js";
 import type { AvatarStore } from "../data/avatars.js";
 import type { PermissionStore } from "../data/permissions.js";
+import type { SpotifyOAuth } from "../music/spotify/spotify-oauth.js";
 
 /**
  * Run bot.connect() with a hard deadline. If the handshake hangs (e.g. the
@@ -76,6 +78,9 @@ export class BotManager extends EventEmitter {
   private youtubeProvider: MusicProvider;
   private localProvider: MusicProvider;
   private kugouProvider: MusicProvider;
+  private spotifyProvider: MusicProvider;
+  private spotifyDataDir: string;
+  private readonly spotifyOAuth?: SpotifyOAuth;
   private database: BotDatabase;
   private config: BotConfig;
   private logger: Logger;
@@ -94,7 +99,10 @@ export class BotManager extends EventEmitter {
     permissions: PermissionStore,
     configPath: string,
     localProvider?: MusicProvider,
-    kugouProvider?: MusicProvider
+    kugouProvider?: MusicProvider,
+    spotifyProvider?: MusicProvider,
+    spotifyDataDir?: string,
+    spotifyOAuth?: SpotifyOAuth
   ) {
     super();
     this.neteaseProvider = neteaseProvider;
@@ -103,6 +111,9 @@ export class BotManager extends EventEmitter {
     this.youtubeProvider = new YouTubeProvider();
     this.localProvider = localProvider ?? neteaseProvider;
     this.kugouProvider = kugouProvider ?? neteaseProvider;
+    this.spotifyProvider = spotifyProvider ?? neteaseProvider;
+    this.spotifyDataDir = spotifyDataDir ?? path.join(process.cwd(), "data", "spotify");
+    this.spotifyOAuth = spotifyOAuth;
     // Let the local provider see which uploads are still referenced by any
     // bot's queue, so it never deletes a file another queue/bot still needs.
     const referenceable = this.localProvider as Partial<{
@@ -141,10 +152,13 @@ export class BotManager extends EventEmitter {
       youtubeProvider: this.youtubeProvider,
       localProvider: this.localProvider,
       kugouProvider: this.kugouProvider,
+      spotifyProvider: this.spotifyProvider,
       database: this.database,
       config: this.config,
       logger: this.logger,
       avatarStore: this.avatarStore,
+      spotifyDataDir: this.spotifyDataDir,
+      spotifyOAuth: this.spotifyOAuth,
     });
 
     this.bots.set(id, bot);
@@ -281,10 +295,13 @@ export class BotManager extends EventEmitter {
         youtubeProvider: this.youtubeProvider,
         localProvider: this.localProvider,
         kugouProvider: this.kugouProvider,
+        spotifyProvider: this.spotifyProvider,
         database: this.database,
         config: this.config,
         logger: this.logger,
         avatarStore: this.avatarStore,
+        spotifyDataDir: this.spotifyDataDir,
+        spotifyOAuth: this.spotifyOAuth,
       });
       this.bots.set(id, bot);
       this.emit("botInstance", bot);
@@ -335,10 +352,13 @@ export class BotManager extends EventEmitter {
         youtubeProvider: this.youtubeProvider,
         localProvider: this.localProvider,
         kugouProvider: this.kugouProvider,
+        spotifyProvider: this.spotifyProvider,
         database: this.database,
         config: this.config,
         logger: this.logger,
         avatarStore: this.avatarStore,
+        spotifyDataDir: this.spotifyDataDir,
+        spotifyOAuth: this.spotifyOAuth,
       });
 
       this.bots.set(saved.id, bot);

@@ -19,6 +19,14 @@ import { createUsersRouter } from "./api/users.js";
 import { createAuditStore } from "../data/audit.js";
 import { createAuditRouter } from "./api/audit.js";
 import { createFavoritesRouter } from "./api/favorites.js";
+import { createSpotifyRouter } from "./api/spotify.js";
+import type { SpotifyOAuth } from "../music/spotify/spotify-oauth.js";
+import type { SpotifyProvider } from "../music/spotify/provider.js";
+import { resolveSpotifyBackendKind } from "../music/spotify/backend-select.js";
+import {
+  isGoLibrespotPresent,
+  isLibrespotPresent,
+} from "../music/spotify/binary.js";
 import { setupWebSocket } from "./websocket.js";
 import { createUserStore } from "../data/users.js";
 import { createSessionStore } from "../data/sessions.js";
@@ -40,6 +48,7 @@ export interface WebServerOptions {
   bilibiliProvider: MusicProvider;
   localProvider: MusicProvider;
   kugouProvider: MusicProvider;
+  spotifyProvider: MusicProvider;
   database: BotDatabase;
   config: BotConfig;
   configPath: string;
@@ -47,6 +56,9 @@ export interface WebServerOptions {
   cookieStore?: CookieStore;
   avatarStore: AvatarStore;
   staticDir?: string;
+  /** Process-wide shared Spotify OAuth (single account, Stage 3). When set, the
+   *  /api/spotify {login,callback,status} router is mounted. */
+  spotifyOAuth?: SpotifyOAuth;
 }
 
 export interface WebServer {
@@ -121,11 +133,19 @@ export function createWebServer(options: WebServerOptions): WebServer {
       options.database,
       options.avatarStore,
       (cfg) => onGuestPolicyChanged(cfg),
+      // I2: so saving a Client ID in Settings re-configures the live OAuth
+      // (no restart needed for the UI-entered-creds -> Connect flow).
+      options.spotifyOAuth,
+      // R2-4: so saving Spotify creds in Settings also refreshes the live Web API
+      // search provider (search + getAuthStatus) without a process restart. The
+      // runtime object is a SpotifyProvider (see index.ts); WebServerOptions types
+      // it as the wider MusicProvider, so narrow it here for the setCreds contract.
+      options.spotifyProvider as SpotifyProvider,
     )
   );
   app.use(
     "/api/music",
-    createMusicRouter(options.neteaseProvider, options.qqProvider, options.bilibiliProvider, logger, options.localProvider, options.config, options.kugouProvider)
+    createMusicRouter(options.neteaseProvider, options.qqProvider, options.bilibiliProvider, logger, options.localProvider, options.config, options.kugouProvider, options.spotifyProvider)
   );
   app.use("/api/player", createPlayerRouter(
     options.botManager, logger, options.database,
@@ -133,8 +153,34 @@ export function createWebServer(options: WebServerOptions): WebServer {
   ));
   app.use(
     "/api/auth",
-    createAuthRouter(options.neteaseProvider, options.qqProvider, options.bilibiliProvider, logger, options.cookieStore, options.kugouProvider)
+    createAuthRouter(options.neteaseProvider, options.qqProvider, options.bilibiliProvider, logger, options.cookieStore, options.kugouProvider, options.spotifyProvider)
   );
+  if (options.spotifyOAuth) {
+    app.use(
+      "/api/spotify",
+      createSpotifyRouter({
+        oauth: options.spotifyOAuth,
+        logger,
+        getBackendInfo: () => {
+          // PATH-aware presence (Bug m1): a PATH-installed binary (bare name)
+          // is resolved against $PATH, not existsSync()'d against cwd.
+          const goPresent = isGoLibrespotPresent();
+          const rustPresent = isLibrespotPresent();
+          const resolved = resolveSpotifyBackendKind(
+            options.config.spotify.backend,
+            goPresent,
+            rustPresent,
+          );
+          return {
+            backend: resolved ?? "none",
+            deviceName: options.config.spotify.deviceName,
+            binaryAvailable: resolved !== null,
+          };
+        },
+        webUiRedirect: "/",
+      }),
+    );
+  }
   app.use("/api/favorites", requireNotGuest, createFavoritesRouter(options.database, logger));
 
   // admin-only routes

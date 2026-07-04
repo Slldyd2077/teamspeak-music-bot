@@ -15,7 +15,7 @@ import {
 import { parseSongRef, parseSelectionIndex } from "./song-ref.js";
 import type { Logger } from "../logger.js";
 import type { BotDatabase, ProfileConfig } from "../data/database.js";
-import type { BotConfig } from "../data/config.js";
+import type { BotConfig, SpotifyConfig } from "../data/config.js";
 import { BotProfileManager } from "./profile.js";
 import type { AvatarStore } from "../data/avatars.js";
 import {
@@ -23,9 +23,50 @@ import {
   occupancyFromClientList,
   shouldResumeOnReturn,
 } from "./auto-pause.js";
+import { isSpotifyUri } from "../music/spotify/webapi.js";
+import path from "node:path";
+import { SpotifyController } from "../music/spotify/controller.js";
+import type { SpotifyTrackEndedEvent } from "../music/spotify/backend.js";
+import type { SpotifyOAuth } from "../music/spotify/spotify-oauth.js";
 
 /** Reply sent when a non-admin invokes an admin-only chat command. */
 export const COMMAND_DENIED_MESSAGE = "⛔ 需要管理员权限（该命令仅限管理员服务器组）";
+
+/** Fallback message when Spotify audio can't be served (backend unavailable
+ *  OR a per-track playTrack failure against a dead/failed sidecar). */
+const SPOTIFY_UNAVAILABLE_MESSAGE =
+  "⚠️ Spotify 播放尚未启用（需要 librespot 音频后端，将在后续版本支持）。";
+
+/** FNV-1a deterministic string hash (unsigned 32-bit). Stable across restarts
+ *  and processes, unlike a random/insertion-order value — used to derive
+ *  per-bot go-librespot ports. */
+function stableHash(s: string): number {
+  let h = 2166136261;
+  for (let i = 0; i < s.length; i++) {
+    h ^= s.charCodeAt(i);
+    h = Math.imul(h, 16777619);
+  }
+  return h >>> 0;
+}
+
+/**
+ * STABLE per-bot go-librespot ports derived from the bot id, kept fixed across
+ * restarts. The two ranges (37xx / 87xx) are disjoint so a single bot's API and
+ * callback ports never clash with each other.
+ *
+ * NOTE: the hash (`% 1000`) only REDUCES collisions between bots — it does NOT
+ * guarantee uniqueness. Two Spotify-enabled bots whose ids collide mod 1000
+ * (birthday-bound: likely well below 1000 bots) get IDENTICAL ports; the second
+ * bot's go-librespot sidecar then fails to bind 127.0.0.1:<apiPort>, start()
+ * throws, and that bot's Spotify stays permanently unavailable. Proper fix (out
+ * of scope here): assign each Spotify-enabled bot a unique free port —
+ * manager-coordinated allocation or bind-retry on EADDRINUSE — instead of a
+ * pure hash.
+ */
+export function spotifyPortsForBotId(id: string): { apiPort: number; callbackPort: number } {
+  const off = stableHash(id) % 1000;
+  return { apiPort: 3700 + off, callbackPort: 8700 + off };
+}
 
 export interface BotInstanceOptions {
   id: string;
@@ -37,10 +78,27 @@ export interface BotInstanceOptions {
   youtubeProvider: MusicProvider;
   localProvider?: MusicProvider;
   kugouProvider?: MusicProvider;
+  spotifyProvider?: MusicProvider;
   database: BotDatabase;
   config: BotConfig;
   logger: Logger;
   avatarStore: AvatarStore;
+  /** Base dir (under DATA_DIR) for per-bot go-librespot work/config trees. */
+  spotifyDataDir?: string;
+  /** Process-wide shared Spotify OAuth (single account); injected into the
+   *  SpotifyController so web-login authorization is visible to playback (C3.1). */
+  spotifyOAuth?: SpotifyOAuth;
+  /** Test seam: build a fake controller instead of a real go-librespot one. */
+  spotifyControllerFactory?: (o: {
+    config: SpotifyConfig;
+    workDir: string;
+    configDir: string;
+    logger: Logger;
+    instanceId: string;
+    apiPort: number;
+    callbackPort: number;
+    oauth?: SpotifyOAuth;
+  }) => SpotifyController;
 }
 
 export interface BotStatus {
@@ -64,6 +122,7 @@ export class BotInstance extends EventEmitter {
 
   private tsClient: TS3Client;
   private player: AudioPlayer;
+  private spotifyController: SpotifyController;
   private queue: PlayQueue;
   private neteaseProvider: MusicProvider;
   private qqProvider: MusicProvider;
@@ -71,6 +130,7 @@ export class BotInstance extends EventEmitter {
   private youtubeProvider: MusicProvider;
   private localProvider: MusicProvider;
   private kugouProvider: MusicProvider;
+  private spotifyProvider: MusicProvider;
   private database: BotDatabase;
   private config: BotConfig;
   private logger: Logger;
@@ -82,6 +142,9 @@ export class BotInstance extends EventEmitter {
   private idleTimer: ReturnType<typeof setTimeout> | null = null;
   private channelUserCount = 0;
   private autoPaused = false;
+  /** True while the audible track is served by the Spotify sidecar (external
+   *  PCM mode) — drives fence/handoff decisions in resolveAndPlay + cmdStop. */
+  private currentSourceIsSpotify = false;
   private profileManager: BotProfileManager;
   private isFmMode = false;
   private fmProvider: MusicProvider | null = null;
@@ -101,6 +164,7 @@ export class BotInstance extends EventEmitter {
     this.youtubeProvider = options.youtubeProvider;
     this.localProvider = options.localProvider ?? options.neteaseProvider;
     this.kugouProvider = options.kugouProvider ?? options.neteaseProvider;
+    this.spotifyProvider = options.spotifyProvider ?? options.neteaseProvider;
     this.database = options.database;
     this.config = options.config;
     this.logger = options.logger.child({ botId: this.id });
@@ -109,6 +173,35 @@ export class BotInstance extends EventEmitter {
     this.tsClient = new TS3Client(options.tsOptions, this.logger);
     this.player = new AudioPlayer(this.logger);
     this.queue = new PlayQueue();
+
+    // One long-lived Spotify sidecar controller per bot. Construction is
+    // cheap and side-effect-free — nothing spawns until ensureStarted().
+    const spotifyBase =
+      options.spotifyDataDir ?? path.join(process.cwd(), "data", "spotify");
+    const spotifyWorkDir = path.join(spotifyBase, this.id, "work");
+    const spotifyConfigDir = path.join(spotifyBase, this.id, "config");
+    // Stable per-bot ports for the go-librespot control API / OAuth callback.
+    // These only reduce (not eliminate) cross-bot collisions: two bot ids that
+    // hash to the same % 1000 bucket share ports and the second sidecar fails to
+    // bind — see spotifyPortsForBotId() for the recommended per-bot free-port fix.
+    const { apiPort: spotifyApiPort, callbackPort: spotifyCallbackPort } =
+      spotifyPortsForBotId(this.id);
+    const buildController =
+      options.spotifyControllerFactory ??
+      ((o) => new SpotifyController({ ...o }));
+    this.spotifyController = buildController({
+      config: this.config.spotify,
+      workDir: spotifyWorkDir,
+      configDir: spotifyConfigDir,
+      logger: this.logger,
+      // Per-bot id → unique Spotify Connect device name ("<base>-<id>"), so two
+      // bots under the one shared account never register the same name and
+      // misroute Connect commands (corner-case R2-5).
+      instanceId: this.id,
+      apiPort: spotifyApiPort,
+      callbackPort: spotifyCallbackPort,
+      oauth: options.spotifyOAuth,
+    });
 
     const profileConfig = this.database.getProfileConfig(this.id);
     this.profileManager = new BotProfileManager(
@@ -149,6 +242,19 @@ export class BotInstance extends EventEmitter {
       this.logger.error({ err }, "Player error");
       this.playNext().catch((err2) => {
         this.logger.error({ err: err2 }, "playNext failed after player error");
+      });
+    });
+
+    // Spotify advances exclusively via the sidecar's WebSocket "trackEnded"
+    // (the continuous go-librespot→ffmpeg pipe never EOFs per track, so the
+    // player's own underrun "trackEnd" is suppressed in external mode). Guard
+    // on the current song being spotify so a stray event can't double-advance
+    // a URL track; playNext()'s isAdvancing guard covers any residual race.
+    this.spotifyController.on("trackEnded", (_e: SpotifyTrackEndedEvent) => {
+      if (this.queue.current()?.platform !== "spotify") return;
+      this.logger.debug("Spotify track ended, advancing queue");
+      this.playNext().catch((err) => {
+        this.logger.error({ err }, "playNext failed after spotify trackEnded");
       });
     });
   }
@@ -201,6 +307,8 @@ export class BotInstance extends EventEmitter {
       // this.connected was never flipped to true. Previously this handler
       // short-circuited on !this.connected, leaving player stuck as "playing".
       this.connected = false;
+      this.spotifyController.stop();
+      this.currentSourceIsSpotify = false;
       this.player.stop();
       this.queue.clear();
       this.sweepLocalAudio("disconnected");
@@ -284,6 +392,8 @@ export class BotInstance extends EventEmitter {
 
   disconnect(): void {
     this._cancelIdleTimer();
+    this.spotifyController.stop();
+    this.currentSourceIsSpotify = false;
     this.player.stop();
     this.queue.clear();
     this.sweepLocalAudio("disconnected");
@@ -306,6 +416,10 @@ export class BotInstance extends EventEmitter {
     this.config.autoPauseOnEmpty = enabled;
     if (!enabled && this.autoPaused && this.player.getState() === "paused") {
       this.player.resume();
+      if (this.queue.current()?.platform === "spotify") {
+        this.spotifyController.resume().catch((err) =>
+          this.logger.warn({ err }, "Spotify resume failed (auto-pause disabled)"));
+      }
       this.autoPaused = false;
       this.emit("stateChange");
     }
@@ -339,10 +453,21 @@ export class BotInstance extends EventEmitter {
     );
     if (action === "pause") {
       this.player.pause();
+      // Occupancy paths drive player.pause()/resume() DIRECTLY (bypassing the
+      // cmd handlers), so they must ALSO stop/resume the sidecar — else it
+      // keeps decoding into an empty channel.
+      if (this.queue.current()?.platform === "spotify") {
+        this.spotifyController.pause().catch((err) =>
+          this.logger.warn({ err }, "Spotify pause failed (occupancy)"));
+      }
       this.autoPaused = true;
       this.emit("stateChange");
     } else if (action === "resume") {
       this.player.resume();
+      if (this.queue.current()?.platform === "spotify") {
+        this.spotifyController.resume().catch((err) =>
+          this.logger.warn({ err }, "Spotify resume failed (occupancy)"));
+      }
       this.autoPaused = false;
       this.emit("stateChange");
     }
@@ -527,11 +652,12 @@ export class BotInstance extends EventEmitter {
     }
   }
 
-  getProviderFor(platform: "netease" | "qq" | "bilibili" | "youtube" | "local" | "kugou"): MusicProvider {
+  getProviderFor(platform: "netease" | "qq" | "bilibili" | "youtube" | "local" | "kugou" | "spotify"): MusicProvider {
     if (platform === "bilibili") return this.bilibiliProvider;
     if (platform === "youtube") return this.youtubeProvider;
     if (platform === "local") return this.localProvider;
     if (platform === "kugou") return this.kugouProvider;
+    if (platform === "spotify") return this.spotifyProvider;
     return platform === "qq" ? this.qqProvider : this.neteaseProvider;
   }
 
@@ -545,6 +671,7 @@ export class BotInstance extends EventEmitter {
     if (flags.has("q")) return this.qqProvider;
     if (flags.has("y")) return this.youtubeProvider;
     if (flags.has("k")) return this.kugouProvider;
+    if (flags.has("s")) return this.spotifyProvider;
     return this.neteaseProvider;
   }
 
@@ -580,6 +707,95 @@ export class BotInstance extends EventEmitter {
           "bot disconnected during URL resolve — aborting playback",
         );
         return false;
+      }
+      // Stage 2: a `spotify:` sentinel URI means the go-librespot sidecar
+      // serves the audio, NOT ffmpeg. Start the per-bot sidecar on demand; if
+      // it can't run (disabled / non-Linux / binary missing) keep the Stage-1
+      // fallback message + skip so the queue keeps moving.
+      if (isSpotifyUri(result.url)) {
+        const ready = await this.spotifyController.ensureStarted();
+        if (!ready) {
+          this.logger.info({ songId: song.id, name: song.name }, "Spotify backend unavailable — skipping");
+          await this.tsClient.sendTextMessage(SPOTIFY_UNAVAILABLE_MESSAGE);
+          return false;
+        }
+        // `spotify:track:<id>` is the URI. go-librespot decodes into a SINGLE
+        // continuous FIFO/PCM stream, so per-track playback is just a REST
+        // playTrack — the stream keeps flowing. A false result means the
+        // sidecar failed the play (dead/errored backend): never attach the
+        // player to a dead stream — send the same fallback and skip.
+        const played = await this.spotifyController.playTrack(result.url);
+        if (!played) {
+          this.logger.info({ songId: song.id, name: song.name }, "Spotify playTrack failed — skipping");
+          await this.tsClient.sendTextMessage(SPOTIFY_UNAVAILABLE_MESSAGE);
+          return false;
+        }
+        // Only ATTACH the persistent PCM stream when the player is NOT already
+        // attached to it. Gate on the player's ACTUAL external state, not the
+        // currentSourceIsSpotify flag: command paths (cmdPlay/cmdPlaylist/…)
+        // call player.stop() (which detaches the external stream) WITHOUT
+        // clearing the flag, so a stale-true flag would skip the re-attach and
+        // silence playback. playPcmStream internally fences the prior url-ffmpeg
+        // (so NO player.stop() here). On the gapless auto-advance path the
+        // player is still attached (isExternalActive() === true) so we do NOT
+        // re-attach — the sidecar rolls the SAME FIFO into the next track.
+        // KNOWN LIMITATION: on a gapless spotify->spotify advance the player's
+        // frame counter is not reset, so player.getElapsed() over-reads for the
+        // 2nd+ consecutive Spotify track. Cosmetic only — the authoritative
+        // elapsed shown to users is status.track.position from the backend poll.
+        if (!this.player.isExternalActive()) {
+          this.player.playPcmStream(this.spotifyController.getPcmStream(), {
+            // The sidecar PCM pipe is long-lived; per-track end arrives via the
+            // controller "trackEnded" WS event, not stream EOF. A real EOF here
+            // means the sidecar died mid-session — RECOVER instead of emitting
+            // silence forever (which would also leave the player stuck in
+            // externalMode, so the re-attach gate skips every future track).
+            // Tear the controller down (next ensureStarted() rebuilds a fresh
+            // backend), stop the player (drop external mode so it re-attaches),
+            // and clear the flag so a non-spotify track isn't mis-handled.
+            onExternalEnd: () => {
+              this.logger.warn("Spotify PCM stream ended unexpectedly — recovering");
+              this.spotifyController.stop();
+              this.player.stop();
+              this.currentSourceIsSpotify = false;
+            },
+          });
+        } else {
+          // External-stream-reuse path: the persistent PCM stream is still
+          // attached (e.g. we arrived here via pause → skip-within-spotify,
+          // where the stream stays attached through the pause). playPcmStream —
+          // which is what puts the player into the 'playing' state — is skipped,
+          // so without this the player would stay 'paused' and emit silence
+          // while the sidecar decodes the new track (corner-case R3-3). resume()
+          // is a no-op on an already-playing player, so the normal (non-paused)
+          // spotify→spotify handoff is unaffected.
+          this.player.resume();
+        }
+        this.currentSourceIsSpotify = true;
+        song.url = result.url;
+        // No trial clip for Spotify — full-track duration only (the near-end
+        // stall watchdog is disabled for the external stream anyway).
+        this.effectiveDuration = song.duration;
+        this.autoPaused = false;
+        this.database.addPlayHistory({
+          botId: this.id,
+          songId: song.id,
+          songName: song.name,
+          artist: song.artist,
+          album: song.album,
+          platform: song.platform,
+          coverUrl: song.coverUrl,
+        });
+        await this.syncProfileToSong(song);
+        this.emit("stateChange");
+        return true;
+      }
+      // Non-Spotify track: if we were on Spotify, pause the sidecar so it stops
+      // decoding ahead before the URL ffmpeg reclaims the PCM buffer.
+      if (this.currentSourceIsSpotify) {
+        this.spotifyController.pause().catch((err) =>
+          this.logger.warn({ err }, "Failed to pause Spotify sidecar on source switch"));
+        this.currentSourceIsSpotify = false;
       }
       song.url = result.url;
       // 试听片段用试听时长（让 player nearEnd 正确触发自动切歌）；完整曲回退 song.duration
@@ -750,6 +966,10 @@ export class BotInstance extends EventEmitter {
 
   private cmdPause(): string {
     this.player.pause();
+    if (this.queue.current()?.platform === "spotify") {
+      this.spotifyController.pause().catch((err) =>
+        this.logger.warn({ err }, "Spotify pause failed"));
+    }
     // User-initiated pause — clear auto-pause so occupancy won't auto-resume it.
     this.autoPaused = false;
     this.emit("stateChange");
@@ -758,6 +978,10 @@ export class BotInstance extends EventEmitter {
 
   private cmdResume(): string {
     this.player.resume();
+    if (this.queue.current()?.platform === "spotify") {
+      this.spotifyController.resume().catch((err) =>
+        this.logger.warn({ err }, "Spotify resume failed"));
+    }
     // User-initiated resume — drop any auto-pause flag.
     this.autoPaused = false;
     this.emit("stateChange");
@@ -765,6 +989,12 @@ export class BotInstance extends EventEmitter {
   }
 
   private cmdStop(): string {
+    // Read the current song BEFORE queue.clear() so we can tell whether the
+    // sidecar needs stopping.
+    if (this.queue.current()?.platform === "spotify") {
+      this.spotifyController.stop();
+    }
+    this.currentSourceIsSpotify = false;
     this.player.stop();
     this.autoPaused = false;
     this.queue.clear();
@@ -825,6 +1055,8 @@ export class BotInstance extends EventEmitter {
   }
 
   private cmdClear(): string {
+    this.spotifyController.stop();
+    this.currentSourceIsSpotify = false;
     this.player.stop();
     this.queue.clear();
     this.sweepLocalAudio("queue_cleared");
@@ -836,11 +1068,31 @@ export class BotInstance extends EventEmitter {
     return "Queue cleared";
   }
 
-  private cmdRemove(cmd: ParsedCommand): string {
+  private async cmdRemove(cmd: ParsedCommand): Promise<string> {
     const index = parseInt(cmd.args, 10) - 1;
     if (isNaN(index) || index < 0) return "Usage: !remove <number>";
+    // Capture BEFORE the splice whether we're removing the currently-playing
+    // Spotify track: queue.remove() decrements currentIndex, so getCurrentIndex()
+    // is only meaningful pre-remove.
+    const removingCurrentSpotify =
+      index === this.queue.getCurrentIndex() && this.currentSourceIsSpotify;
     const removed = this.queue.remove(index);
     if (!removed) return "Invalid position";
+    // Corner-case R3-2: removing the track the Spotify sidecar is decoding
+    // right now leaves it running while queue.current() is no longer that
+    // track. Since a spotify track has NO player self-EOF advance path, the
+    // controller "trackEnded" handler would return early (current is no longer
+    // spotify) and the bot would wedge in silence. Reconcile like cmdStop/skip:
+    // tear the sidecar down, then advance to whatever is now current — or stop
+    // cleanly if the queue is now empty (playNext's exhausted branch stops the
+    // player). Non-current or non-spotify removals are untouched (a URL current
+    // track self-heals via its own EOF).
+    if (removingCurrentSpotify) {
+      this.spotifyController.stop();
+      this.currentSourceIsSpotify = false;
+      this.player.stop();
+      await this.playNext();
+    }
     // Sweep after the entry is gone — the file is deleted only if no other
     // queue position (or bot) still references this upload.
     this.sweepLocalAudio("removed_from_queue");
@@ -1159,6 +1411,16 @@ export class BotInstance extends EventEmitter {
             this.profileManager.onSongChange(null).catch(() => {});
           }
         } else {
+          // Queue exhausted on a non-FM source (skip-past-end or natural
+          // last-track end via trackEnded→playNext). If the ending track was
+          // served by the Spotify sidecar, tear it down like cmdStop —
+          // otherwise the go-librespot Connect device stays active with the
+          // track loaded (decoding into a detached/backpressured stream) and
+          // currentSourceIsSpotify stays stale (corner-case R3-6).
+          if (this.currentSourceIsSpotify) {
+            this.spotifyController.stop();
+            this.currentSourceIsSpotify = false;
+          }
           this.player.stop();
           this.profileManager.onSongChange(null).catch(() => {});
         }
@@ -1212,6 +1474,29 @@ export class BotInstance extends EventEmitter {
 
   getPlayer(): AudioPlayer {
     return this.player;
+  }
+
+  /** The per-bot Spotify sidecar controller. Exposed like getPlayer()/
+   *  getQueueManager() so the shared, process-wide OAuth threaded in at
+   *  construction (C3.1) is observable to callers/tests via getOAuth(). */
+  getSpotifyController(): SpotifyController {
+    return this.spotifyController;
+  }
+
+  /**
+   * Route a seek to the Spotify sidecar for a spotify track (its PCM stream is
+   * external — AudioPlayer.seek would respawn ffmpeg on the `spotify:` sentinel
+   * and collide with the running stream), otherwise to the URL player.
+   */
+  seek(seconds: number): void {
+    if (this.queue.current()?.platform === "spotify") {
+      // The web route + AudioPlayer.seek are seconds-based, but
+      // SpotifyController.seek expects milliseconds — convert here.
+      this.spotifyController.seek(seconds * 1000).catch((err) =>
+        this.logger.warn({ err }, "Spotify seek failed"));
+      return;
+    }
+    this.player.seek(seconds);
   }
 
   getQueueManager(): PlayQueue {

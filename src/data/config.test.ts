@@ -1,8 +1,31 @@
-import { describe, it, expect, afterEach } from "vitest";
+import { describe, it, expect, afterEach, beforeEach, vi } from "vitest";
 import { join } from "node:path";
-import { mkdtempSync, rmSync, writeFileSync, existsSync, readFileSync } from "node:fs";
+import {
+  mkdtempSync,
+  rmSync,
+  writeFileSync,
+  existsSync,
+  readFileSync,
+  readdirSync,
+  renameSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { getDefaultConfig, loadConfig, saveConfig, migrateLegacyConfig } from "./config.js";
+
+// Wrap the fs functions config.ts uses in call-through spies so the atomic-write
+// and transient-read-error paths can be observed/forced. Everything else (mkdtemp,
+// rmSync, existsSync, …) is the real implementation via `...actual`, so all other
+// tests keep their real filesystem behavior. `vi.spyOn` can't be used here because
+// the node:fs ESM namespace is non-configurable in this setup.
+vi.mock("node:fs", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:fs")>();
+  return {
+    ...actual,
+    readFileSync: vi.fn(actual.readFileSync),
+    writeFileSync: vi.fn(actual.writeFileSync),
+    renameSync: vi.fn(actual.renameSync),
+  };
+});
 
 describe("config", () => {
   const dirs: string[] = [];
@@ -203,5 +226,228 @@ describe("adminGroups normalization", () => {
   });
   it("a non-array value falls back to the default [] (no crash)", () => {
     expect(loadAdminGroups({ adminGroups: "6" })).toEqual([]);
+  });
+});
+
+describe("spotify config", () => {
+  it("defaults are present and disabled", () => {
+    const c = getDefaultConfig();
+    expect(c.spotify).toEqual({
+      enabled: false,
+      backend: "auto",
+      clientId: "",
+      clientSecret: "",
+      deviceName: "TSMusicBot",
+      bitrate: 320,
+    });
+  });
+
+  it("loadConfig coerces bad spotify values back to safe defaults", () => {
+    const dir = mkdtempSync(join(tmpdir(), "cfg-"));
+    const p = join(dir, "config.json");
+    writeFileSync(
+      p,
+      JSON.stringify({
+        spotify: { enabled: "yes", backend: "bogus", bitrate: 7, clientId: 5 },
+      })
+    );
+    const c = loadConfig(p);
+    expect(c.spotify.enabled).toBe(false); // non-boolean → false
+    expect(c.spotify.backend).toBe("auto"); // invalid enum → auto
+    expect(c.spotify.bitrate).toBe(320); // invalid → 320
+    expect(c.spotify.clientId).toBe(""); // non-string → ""
+    expect(c.spotify.deviceName).toBe("TSMusicBot"); // missing → default
+  });
+
+  it("loadConfig preserves valid spotify values", () => {
+    const dir = mkdtempSync(join(tmpdir(), "cfg-"));
+    const p = join(dir, "config.json");
+    writeFileSync(
+      p,
+      JSON.stringify({
+        spotify: {
+          enabled: true,
+          backend: "librespot",
+          clientId: "abc",
+          clientSecret: "def",
+          deviceName: "MyBot",
+          bitrate: 160,
+        },
+      })
+    );
+    const c = loadConfig(p);
+    expect(c.spotify).toEqual({
+      enabled: true,
+      backend: "librespot",
+      clientId: "abc",
+      clientSecret: "def",
+      deviceName: "MyBot",
+      bitrate: 160,
+    });
+  });
+});
+
+// --- R2-1: saveConfig must write atomically (temp file + rename), never truncate ---
+
+describe("saveConfig atomic write", () => {
+  const dirs: string[] = [];
+  function makeTmpDir(): string {
+    const dir = mkdtempSync(join(tmpdir(), "tsmb-atomic-"));
+    dirs.push(dir);
+    return dir;
+  }
+  beforeEach(() => {
+    vi.clearAllMocks(); // reset call history, keep the call-through implementations
+  });
+  afterEach(() => {
+    for (const d of dirs) rmSync(d, { recursive: true, force: true });
+    dirs.length = 0;
+  });
+
+  it("round-trips (save then load equals) and leaves NO .tmp file behind", () => {
+    const dir = makeTmpDir();
+    const path = join(dir, "config.json");
+    const config = { ...getDefaultConfig(), webPort: 4567, adminPassword: "pw" };
+
+    saveConfig(path, config);
+
+    expect(loadConfig(path)).toEqual(config);
+    // No temp remnants in the target directory.
+    expect(readdirSync(dir).filter((f) => f.includes(".tmp"))).toEqual([]);
+  });
+
+  it("writes via a same-dir temp file then renameSync onto the final path", () => {
+    const dir = makeTmpDir();
+    const path = join(dir, "config.json");
+
+    saveConfig(path, getDefaultConfig());
+
+    expect(vi.mocked(renameSync)).toHaveBeenCalled();
+    const [from, to] = vi.mocked(renameSync).mock.calls[0] as [string, string];
+    expect(to).toBe(path); // renamed ONTO the real path
+    expect(String(from)).not.toBe(path); // ...from a distinct temp file
+    expect(join(String(from), "..")).toBe(join(path, "..")); // ...in the SAME directory
+  });
+
+  it("does not corrupt a pre-existing valid config when saving over it", () => {
+    const dir = makeTmpDir();
+    const path = join(dir, "config.json");
+    saveConfig(path, { ...getDefaultConfig(), adminPassword: "first", webPort: 1234 });
+
+    // Overwrite with a different, fully-formed config.
+    saveConfig(path, { ...getDefaultConfig(), adminPassword: "second", webPort: 9999 });
+
+    const loaded = loadConfig(path);
+    expect(loaded.adminPassword).toBe("second");
+    expect(loaded.webPort).toBe(9999);
+    // The on-disk file is a single complete JSON document (no partial/truncated write).
+    expect(() => JSON.parse(readFileSync(path, "utf-8"))).not.toThrow();
+    expect(readdirSync(dir).filter((f) => f.includes(".tmp"))).toEqual([]);
+  });
+
+  it("cleans up the temp file (no .tmp remnant) when the rename fails", () => {
+    const dir = makeTmpDir();
+    const path = join(dir, "config.json");
+    vi.mocked(renameSync).mockImplementationOnce(() => {
+      throw new Error("rename boom");
+    });
+
+    expect(() => saveConfig(path, getDefaultConfig())).toThrow(/rename boom/);
+    // The failed write left no temp file lying around.
+    expect(readdirSync(dir).filter((f) => f.includes(".tmp"))).toEqual([]);
+  });
+});
+
+// --- R2-2: loadConfig must not treat a transient/corrupt read as "missing" ---
+
+describe("loadConfig error handling", () => {
+  const dirs: string[] = [];
+  function makeTmpDir(): string {
+    const dir = mkdtempSync(join(tmpdir(), "tsmb-load-"));
+    dirs.push(dir);
+    return dir;
+  }
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+  afterEach(() => {
+    for (const d of dirs) rmSync(d, { recursive: true, force: true });
+    dirs.length = 0;
+  });
+
+  it("(a) ENOENT (missing file) returns defaults — unchanged first-run behavior", () => {
+    const dir = makeTmpDir();
+    expect(loadConfig(join(dir, "config.json"))).toEqual(getDefaultConfig());
+  });
+
+  it("(b) a non-ENOENT read error (EBUSY) rethrows instead of returning defaults", () => {
+    const dir = makeTmpDir();
+    const path = join(dir, "config.json");
+    // A REAL config exists on disk; a transient lock must NOT collapse to defaults
+    // (the caller would otherwise overwrite this real config with defaults).
+    saveConfig(path, { ...getDefaultConfig(), adminPassword: "keep-me" });
+    vi.mocked(readFileSync).mockImplementationOnce(() => {
+      const err = new Error("EBUSY: resource busy or locked") as NodeJS.ErrnoException;
+      err.code = "EBUSY";
+      throw err;
+    });
+
+    expect(() => loadConfig(path)).toThrow(/EBUSY/);
+    // The on-disk config is untouched and still readable once the lock clears.
+    expect(loadConfig(path).adminPassword).toBe("keep-me");
+  });
+
+  it("(c) corrupt JSON returns defaults AND backs up the original to *.corrupt-*", () => {
+    const dir = makeTmpDir();
+    const path = join(dir, "config.json");
+    const garbage = "{ not: valid json, ";
+    writeFileSync(path, garbage, "utf-8");
+
+    const loaded = loadConfig(path);
+
+    expect(loaded).toEqual(getDefaultConfig());
+    const backups = readdirSync(dir).filter((f) => f.includes(".corrupt-"));
+    expect(backups.length).toBeGreaterThan(0);
+    // The corrupt original is preserved verbatim (recoverable, never deleted).
+    expect(readFileSync(join(dir, backups[0]), "utf-8")).toBe(garbage);
+  });
+
+  // (d)/(e) Valid JSON that is NOT a non-null object (null / [] / 42 / "str") passes
+  // JSON.parse but would throw a raw TypeError in the per-field sanitize block
+  // (property access on a non-object), bypassing the corrupt-backup path. It must be
+  // treated EXACTLY like corrupt JSON: back up to *.corrupt-* (original preserved),
+  // return defaults — NOT a thrown TypeError, and NOT a silent defaults-with-no-backup.
+  it("(d) a `null` config is treated as corrupt: defaults + *.corrupt-* backup (original preserved)", () => {
+    const dir = makeTmpDir();
+    const path = join(dir, "config.json");
+    writeFileSync(path, "null", "utf-8");
+
+    let loaded: ReturnType<typeof getDefaultConfig>;
+    expect(() => {
+      loaded = loadConfig(path);
+    }).not.toThrow();
+
+    expect(loaded!).toEqual(getDefaultConfig());
+    const backups = readdirSync(dir).filter((f) => f.includes(".corrupt-"));
+    expect(backups.length).toBeGreaterThan(0);
+    expect(readFileSync(join(dir, backups[0]), "utf-8")).toBe("null");
+  });
+
+  it("(e) a non-object config (`[]` / `42`) is backed up + defaults, not a thrown TypeError", () => {
+    for (const content of ["[]", "42"]) {
+      const dir = makeTmpDir();
+      const path = join(dir, "config.json");
+      writeFileSync(path, content, "utf-8");
+
+      let loaded: ReturnType<typeof getDefaultConfig>;
+      expect(() => {
+        loaded = loadConfig(path);
+      }).not.toThrow();
+
+      expect(loaded!).toEqual(getDefaultConfig());
+      const backups = readdirSync(dir).filter((f) => f.includes(".corrupt-"));
+      expect(backups.length).toBeGreaterThan(0);
+      expect(readFileSync(join(dir, backups[0]), "utf-8")).toBe(content);
+    }
   });
 });

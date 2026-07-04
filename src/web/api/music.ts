@@ -14,7 +14,8 @@ export function createMusicRouter(
   logger: Logger,
   localProvider?: MusicProvider,
   config?: BotConfig,
-  kugouProvider?: MusicProvider
+  kugouProvider?: MusicProvider,
+  spotifyProvider?: MusicProvider
 ): Router {
   const router = Router();
   const youtubeProvider: MusicProvider = new YouTubeProvider();
@@ -28,6 +29,7 @@ export function createMusicRouter(
     if (platform === "youtube") return youtubeProvider;
     if (platform === "local" && localProvider) return localProvider;
     if (platform === "kugou" && kugouProvider) return kugouProvider;
+    if (platform === "spotify" && spotifyProvider) return spotifyProvider;
     return platform === "qq" ? qqProvider : neteaseProvider;
   }
 
@@ -113,6 +115,11 @@ export function createMusicRouter(
         return;
       }
       const parsedLimit = parseInt(limit as string) || 20;
+      // Spotify is intentionally EXCLUDED from unified /search/all in Stage 1:
+      // its tracks are metadata-only (not yet playable) until the librespot audio
+      // backend lands (Stage 2/3), so surfacing them in the default all-sources
+      // view would only yield results that get skipped. Spotify search remains
+      // available from its own tab via /search?platform=spotify.
       const [neteaseResult, qqResult, bilibiliResult, localResult, kugouResult] = await Promise.allSettled([
         neteaseProvider.search(q as string, parsedLimit),
         qqProvider.search(q as string, parsedLimit),
@@ -291,6 +298,7 @@ export function createMusicRouter(
       bilibili: bilibiliProvider.getQuality(),
       local: localProvider?.getQuality() ?? "original",
       kugou: kugouProvider?.getQuality() ?? "128",
+      spotify: spotifyProvider?.getQuality() ?? "320",
     });
   });
 
@@ -312,6 +320,9 @@ export function createMusicRouter(
     }
     if ((!platform || platform === "kugou") && kugouProvider) {
       kugouProvider.setQuality(quality);
+    }
+    if ((!platform || platform === "spotify") && spotifyProvider) {
+      spotifyProvider.setQuality(quality);
     }
     logger.info({ quality, platform }, "Audio quality changed");
     res.json({ success: true, quality });

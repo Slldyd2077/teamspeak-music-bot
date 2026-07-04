@@ -1,0 +1,620 @@
+import { EventEmitter } from "node:events";
+import type { Readable } from "node:stream";
+import type { ChildProcess } from "node:child_process";
+import { spawn as realSpawn } from "node:child_process";
+import { mkdirSync as realMkdirSync } from "node:fs";
+import type { Logger } from "pino";
+import type {
+  SpotifyAudioBackend,
+  SpotifyTrackEndedEvent,
+  SpotifyNowPlaying,
+} from "./backend.js";
+import { findLibrespot } from "./binary.js";
+import { SpotifyConnectApi } from "./connect-api.js";
+import type { PlaybackState, SpotifyDevice } from "./connect-api.js";
+import type { SpotifyOAuth } from "./spotify-oauth.js";
+import { getFfmpegCommand } from "../../audio/player.js";
+
+export interface RustLibrespotBackendOptions {
+  deviceName: string;
+  bitrate: number;
+  cacheDir: string;
+  oauth: SpotifyOAuth;
+  connect?: SpotifyConnectApi;
+  logger: Logger;
+  deps?: RustLibrespotBackendDeps;
+}
+
+/** Injectable seams so the whole lifecycle is testable without a real binary/network. */
+export interface RustLibrespotBackendDeps {
+  spawn?: typeof realSpawn;
+  mkdirSync?: typeof realMkdirSync;
+  findBinary?: () => string;
+  /**
+   * C1: override the ffmpeg command. Production resolves it via
+   * getFfmpegCommand() (bundled ffmpeg-static fallback when `ffmpeg` isn't on
+   * PATH); tests pin it to "ffmpeg" for stable arg assertions.
+   */
+  ffmpegCommand?: string;
+  sleep?: (ms: number) => Promise<void>;
+  readyPollIntervalMs?: number;
+  readyTimeoutMs?: number;
+  statePollIntervalMs?: number;
+  /**
+   * I4 (§13): bounded window after playTrack() within which our own track must
+   * be observed playing, else we degrade-to-skipped (emit trackEnded
+   * reason:"error"). Injectable timer seams (default real setTimeout, unref'd)
+   * let tests advance it deterministically.
+   */
+  playbackStartTimeoutMs?: number;
+  setTimeout?: (cb: () => void, ms: number) => unknown;
+  clearTimeout?: (handle: unknown) => void;
+}
+
+const DEFAULT_READY_POLL_MS = 500;
+const DEFAULT_READY_TIMEOUT_MS = 20_000;
+const DEFAULT_STATE_POLL_MS = 2_000;
+/** How close to the end (ms) counts as "track finished" when polling player state. */
+const END_OF_TRACK_WINDOW_MS = 1_500;
+/**
+ * I4 (§13): if our own track has not been observed playing within this window
+ * after playTrack(), degrade-to-skipped so the queue advances instead of
+ * stalling on a persistently-failing play (403 non-Premium, 404 outliving
+ * retries). Bounded and injectable for tests.
+ */
+const DEFAULT_PLAYBACK_START_TIMEOUT_MS = 8_000;
+
+const defaultSleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+
+export class RustLibrespotBackend extends EventEmitter implements SpotifyAudioBackend {
+  private readonly opts: RustLibrespotBackendOptions;
+  private readonly log: Logger;
+  private readonly deps: RustLibrespotBackendDeps;
+  private readonly oauth: SpotifyOAuth;
+  private readonly connect: SpotifyConnectApi;
+
+  private proc: ChildProcess | null = null;
+  private ffmpeg: ChildProcess | null = null;
+  private pollTimer: ReturnType<typeof setInterval> | null = null;
+  // I4 (§13): "did our track actually start playing?" watchdog handle (opaque —
+  // produced by the injectable setTimeout seam). null when disarmed.
+  private watchdogTimer: unknown = null;
+  private ready = false;
+  private positionMs = 0;
+
+  // R4-4 (multi-bot): OUR resolved Connect device id, captured from
+  // findDeviceByName() in playTrack(). config.spotify (hence this Connect
+  // session) is shared process-wide across every BotInstance under one Premium
+  // account, and both the control API (pause/resume/seek) and the state read
+  // (GET /v1/me/player) are ACCOUNT-wide by default. Persisting our device id
+  // lets us (a) device-scope our control commands so we only ever act on our own
+  // device, and (b) in pollState, ignore state reported for a foreign device
+  // another bot stole the single active session with. null until first playTrack.
+  private deviceId: string | null = null;
+
+  // track-end poll state machine
+  private currentUri: string | null = null;
+  private hasPlayed = false;
+  private endedForCurrent = false;
+  // C3.4: end-detection is DISARMED until our own playTrack() runs. A poll that
+  // fires before the bot ever asks to play (e.g. at startup) must produce no
+  // side effects at all, so a foreign track already near its end can't emit a
+  // spurious trackEnded/metadata and wrongly advance the queue.
+  private armed = false;
+  // C1(pause-skip): our own pause state. A self-initiated pause makes the
+  // Connect device report is_playing:false with the SAME uri; without tracking
+  // it we'd misread that as a track end and SKIP the paused track (breaking the
+  // pause command and occupancy auto-pause-when-alone on the Rust backend). Set
+  // by pause(), cleared by resume() and playTrack().
+  private paused = false;
+  // Robustness (finishedByStop + finishedByNull / R3-1): a "not clearly playing
+  // our track" signal — either a non-paused is_playing:false (external stop) OR
+  // a null item (trackUri===null) observed while our track was playing — must be
+  // confirmed across TWO consecutive non-paused polls before we emit trackEnded.
+  // Both signals can be momentary: is_playing:false from a buffering hiccup; a
+  // null item from a Connect/track handoff boundary or a region-relinked /
+  // restricted item that momentarily maps to uri:null (getPlaybackState omits
+  // the `market` param). Set on the first such poll; reset only when a poll
+  // clearly shows our track playing again (is_playing AND a real item), on track
+  // change, or on playTrack(). Sharing ONE flag keeps both sibling paths from
+  // false-skipping on a single transient poll.
+  private stopSeen = false;
+  // R4-6: one-poll "just-seeked" grace. finishedByProgress is a SINGLE-poll
+  // near-end heuristic; if a user deliberately seeks to within the final
+  // END_OF_TRACK_WINDOW_MS, the very next poll would see progressMs >=
+  // durationMs-window and emit trackEnded, SKIPPING the ~1s the user seeked
+  // into. Set by seek(); consumed on the next poll so it suppresses that single
+  // finishedByProgress misfire only — the track then plays its remaining <=1.5s
+  // and ends naturally on the following poll via the stop/null detection. It
+  // deliberately does NOT touch the paused/stop/null two-poll logic, and a track
+  // reaching the window by PLAYING (no preceding seek) still ends normally.
+  private seekGrace = false;
+  // I(pipe): one teardown per broken librespot->ffmpeg pipe. Both stream ends
+  // (ffmpeg.stdin write side, proc.stdout read side) can report the same EPIPE;
+  // this guard prevents a double teardown / double error-emit.
+  private pipeBroke = false;
+
+  constructor(o: RustLibrespotBackendOptions) {
+    super();
+    this.opts = o;
+    this.log = o.logger;
+    this.deps = o.deps ?? {};
+    this.oauth = o.oauth;
+    // The Connect API shares the backend's OAuth token source. Reuse the
+    // injected instance in tests; otherwise build one over oauth.getAccessToken().
+    this.connect = o.connect ?? new SpotifyConnectApi(() => this.oauth.getAccessToken());
+  }
+
+  async start(): Promise<void> {
+    const spawn = this.deps.spawn ?? realSpawn;
+    const mkdirSync = this.deps.mkdirSync ?? realMkdirSync;
+    const findBinary = this.deps.findBinary ?? findLibrespot;
+    // C1: resolve ffmpeg via getFfmpegCommand() unless injected for tests.
+    const ffmpegCommand = this.deps.ffmpegCommand ?? getFfmpegCommand();
+
+    // A valid USER control token is required before we spawn anything.
+    const token = await this.oauth.getAccessToken();
+    if (!token) {
+      throw new Error("Spotify not authorized (no access token) — sign in first");
+    }
+
+    mkdirSync(this.opts.cacheDir, { recursive: true });
+
+    // Everything past here spawns children / opens the state poll. On any
+    // failure (e.g. the device never appears), tear it all down via stop().
+    try {
+      this.pipeBroke = false; // fresh pipe for this start()
+      // 1. Spawn ffmpeg FIRST (the reader) so its stdin pipe is ready before
+      //    librespot starts pushing raw 44.1k s16le PCM into it.
+      this.ffmpeg = spawn(
+        ffmpegCommand,
+        [
+          "-f", "s16le", "-ar", "44100", "-ac", "2", "-i", "pipe:0",
+          "-f", "s16le", "-ar", "48000", "-ac", "2", "-acodec", "pcm_s16le", "pipe:1",
+        ],
+        { stdio: ["pipe", "pipe", "pipe"] },
+      );
+      this.ffmpeg.stderr?.on("data", (b: Buffer) =>
+        this.log.debug({ ffmpeg: b.toString().trim() }, "ffmpeg"),
+      );
+      this.ffmpeg.on("error", (err) => this.emitError(err));
+      // I(pipe): if ffmpeg dies mid-track while librespot keeps producing PCM,
+      // the next write into its stdin hits the now-closed pipe -> EPIPE 'error'
+      // on stdin. With no listener Node escalates that to process
+      // 'uncaughtException' (the global handler logs but leaves undefined
+      // state). Handle it in-band: tear down cleanly and surface via emitError.
+      this.ffmpeg.stdin?.on("error", (err) => this.onPipeError(err));
+
+      // 2. Spawn librespot: --backend pipe with NO --device => raw s16le/44100/2
+      //    on stdout, NO --passthrough (that would emit raw Ogg). --access-token
+      //    authenticates it as a Connect device controllable via the Web API.
+      const bin = findBinary();
+      this.proc = spawn(
+        bin,
+        [
+          "--name", this.opts.deviceName,
+          "--backend", "pipe",
+          "--bitrate", String(this.opts.bitrate),
+          "--format", "S16",
+          "--cache", this.opts.cacheDir,
+          "--device-type", "speaker",
+          // KNOWN LIMITATION (CWE-214): the live Spotify access token is passed in
+          // the child argv, so on a shared/multi-tenant host a co-located local
+          // process could read it via `ps` / /proc/<pid>/cmdline. Bounded (~1h token,
+          // needs local access) and `--access-token` is librespot's supported bootstrap.
+          "--access-token", token,
+        ],
+        { stdio: ["ignore", "pipe", "pipe"] },
+      );
+      // stdout carries PCM — pipe it, never attach a data listener that consumes it.
+      if (this.proc.stdout && this.ffmpeg.stdin) {
+        this.proc.stdout.pipe(this.ffmpeg.stdin);
+        // Guard the read side too: a broken pipe can surface as an 'error' on
+        // proc.stdout when ffmpeg's stdin closes underneath it. Same handler,
+        // guarded against a double teardown.
+        this.proc.stdout.on("error", (err) => this.onPipeError(err));
+      }
+      this.proc.stderr?.on("data", (b: Buffer) =>
+        this.log.info({ librespot: b.toString().trim() }, "librespot"),
+      );
+      this.proc.on("error", (err) => this.emitError(err));
+      this.proc.on("exit", (code, signal) => {
+        this.ready = false;
+        this.log.warn({ code, signal }, "librespot exited");
+      });
+
+      // 3. Poll the Connect device list until our device registers.
+      await this.waitForDevice();
+
+      // 4. Begin the player-state poll loop (track-end / position / metadata).
+      this.startPollLoop();
+
+      this.ready = true;
+      this.emit("ready");
+    } catch (e) {
+      this.stop();
+      throw e;
+    }
+  }
+
+  /**
+   * Re-emit a child "error" only when a consumer is listening; Node throws on an
+   * unhandled "error" event, so with no listener we log via the injected logger.
+   */
+  private emitError(err: unknown): void {
+    if (this.listenerCount("error") > 0) {
+      this.emit("error", err);
+    } else {
+      this.log.error({ err }, "rust-librespot backend error (no listener)");
+    }
+  }
+
+  /**
+   * I(pipe): the librespot->ffmpeg PCM pipe broke — typically ffmpeg died
+   * mid-track and librespot's next write hit the closed pipe (EPIPE), or the
+   * stream was destroyed (ERR_STREAM_DESTROYED). Both are expected teardown
+   * signals, not programming errors. Log, tear down cleanly (stop() is
+   * idempotent), then surface via emitError so a listening controller reacts.
+   * Guarded so both stream ends reporting the same break don't double-teardown.
+   */
+  private onPipeError(err: unknown): void {
+    if (this.pipeBroke) return;
+    this.pipeBroke = true;
+    this.log.warn(
+      { err },
+      "rust-librespot: librespot->ffmpeg pipe broke (ffmpeg died?) — tearing down",
+    );
+    this.stop();
+    this.emitError(err);
+  }
+
+  private async waitForDevice(): Promise<void> {
+    const sleep = this.deps.sleep ?? defaultSleep;
+    const interval = this.deps.readyPollIntervalMs ?? DEFAULT_READY_POLL_MS;
+    const timeout = this.deps.readyTimeoutMs ?? DEFAULT_READY_TIMEOUT_MS;
+    const deadline = Date.now() + timeout;
+    while (Date.now() < deadline) {
+      let devices: SpotifyDevice[] = [];
+      try {
+        devices = await this.connect.getDevices();
+      } catch (err) {
+        this.log.debug({ err }, "getDevices failed during readiness poll");
+      }
+      if (devices.some((d) => d.name === this.opts.deviceName)) return;
+      await sleep(interval);
+    }
+    throw new Error(`librespot device "${this.opts.deviceName}" did not appear within timeout`);
+  }
+
+  private startPollLoop(): void {
+    const interval = this.deps.statePollIntervalMs ?? DEFAULT_STATE_POLL_MS;
+    this.pollTimer = setInterval(() => {
+      void this.pollState();
+    }, interval);
+    // Don't keep the event loop / test process alive on account of the poll timer.
+    this.pollTimer.unref?.();
+  }
+
+  /** One player-state poll iteration: updates position/metadata and detects track end. */
+  private async pollState(): Promise<void> {
+    let state: PlaybackState | null;
+    try {
+      state = await this.connect.getPlaybackState();
+    } catch (err) {
+      this.log.debug({ err }, "getPlaybackState failed");
+      return;
+    }
+
+    // C3.4: detection is armed ONLY by our own playTrack(). Until then a poll
+    // must have NO side effects — no metadata/trackEnded emit and no mutation of
+    // currentUri/hasPlayed/positionMs. This single gate covers the null-state
+    // (C3.5 post-play-204) branch, the metadata-emit block, and every end
+    // heuristic below, so a foreign track sitting near its end at startup can
+    // never spuriously advance the queue. (Device-readiness polling via
+    // getDevices is separate and stays active regardless of this flag.)
+    if (!this.armed) return;
+
+    // R4-6: consume the one-poll "just-seeked" grace up front so it spans exactly
+    // ONE poll regardless of which branch this poll takes. `justSeeked` then
+    // suppresses a single finishedByProgress misfire below (a deliberate seek
+    // into the final END_OF_TRACK_WINDOW_MS must not be read as a natural end).
+    const justSeeked = this.seekGrace;
+    this.seekGrace = false;
+
+    if (!state) {
+      // C3.5: a 204 / no-active-device response. AFTER our own track has been
+      // seen playing, librespot going idle means the track ended — emit once so
+      // the queue advances instead of stalling. BEFORE any play (hasPlayed
+      // false), a null state is just "nothing active yet" and is ignored.
+      // C1(pause-skip) residual: while WE hold a self-initiated pause, a long
+      // pause can let the Connect device idle out to 204/null. That is still
+      // "paused", NOT a track end — do nothing this poll, or we'd skip the
+      // paused track. Once resume() clears `paused`, a genuinely-dead device
+      // (persistent null) is detected and skipped on the next poll as before.
+      if (this.hasPlayed && this.currentUri && !this.endedForCurrent && !this.paused) {
+        this.endedForCurrent = true;
+        const endedUri = this.currentUri;
+        this.currentUri = null;
+        this.positionMs = 0;
+        const e: SpotifyTrackEndedEvent = { uri: endedUri, reason: "ended" };
+        this.emit("trackEnded", e);
+      }
+      return;
+    }
+
+    // R4-4 (multi-bot): is the account's single ACTIVE Connect device ours? The
+    // Premium account allows one active playback stream, so if another bot stole
+    // the session, GET /v1/me/player now reports THAT device + its track. Only
+    // when the active device is foreign (we know our id AND the state names a
+    // DIFFERENT active id) do we refuse to treat this poll as our own track:
+    // skip metadata/track-change (so B's now-playing isn't surfaced as ours),
+    // don't advance our position/hasPlayed off foreign playback, and feed the
+    // stop/null two-poll detection so the stolen session cleanly ends OUR track
+    // and advances OUR queue instead of thrashing/misattributing. LENIENT: if
+    // our id is unknown or activeDeviceId is absent we can't tell, so we fall
+    // back to today's behavior byte-for-byte (single-bot: activeDeviceId === ours).
+    const foreignActive =
+      this.deviceId != null &&
+      state.activeDeviceId != null &&
+      state.activeDeviceId !== this.deviceId;
+
+    // Don't misattribute a foreign device's playback position as ours.
+    if (!foreignActive) this.positionMs = state.progressMs;
+
+    // Track change -> reset the end-detection state and surface best-effort
+    // metadata. Skipped entirely when a foreign device is active: its uri is NOT
+    // our track, so adopting it / emitting metadata would surface another bot's
+    // now-playing as ours and later misread that bot's stop as our track's end.
+    if (!foreignActive && state.trackUri && state.trackUri !== this.currentUri) {
+      this.currentUri = state.trackUri;
+      this.hasPlayed = false;
+      this.endedForCurrent = false;
+      this.stopSeen = false; // new track -> drop any pending stop confirmation
+      const np: SpotifyNowPlaying = {
+        uri: state.trackUri,
+        name: "",
+        artist: "",
+        album: "",
+        coverUrl: "",
+        durationMs: state.durationMs,
+      };
+      this.emit("metadata", np);
+    }
+
+    // R4-4: only OUR device actually playing counts as our track playing. When a
+    // foreign device is active, `state.isPlaying` reflects THAT bot's playback,
+    // not ours — so it must not mark hasPlayed or clear the stop confirmation.
+    const ourTrackPlaying = state.isPlaying && !foreignActive;
+    if (ourTrackPlaying) {
+      this.hasPlayed = true;
+      // Real playback observed -> the I4 degrade-to-skip watchdog is moot.
+      this.clearPlaybackWatchdog();
+    }
+    // Clearly playing our track again (is_playing AND a real item) -> any earlier
+    // transient is_playing:false (buffering) or null item (Connect handoff /
+    // market relink) was a hiccup; drop the pending two-poll end confirmation.
+    // A null item under is_playing:true is NOT "clearly playing" and must NOT
+    // reset the confirmation, or a genuine null-item end could never accumulate
+    // its second poll.
+    if (ourTrackPlaying && state.trackUri !== null) {
+      this.stopSeen = false;
+    }
+    if (!this.currentUri || this.endedForCurrent) return;
+
+    // C3.4: EVERY end condition is gated on hasPlayed so no end can fire until
+    // the bot's own track has actually been observed playing. Without this, the
+    // first poll (before playTrack) could observe the account's stale/paused
+    // track sitting near its end and spuriously emit "trackEnded".
+    // m(sub-window): only apply the near-end window when the track is LONGER
+    // than the window. For durationMs in [1, END_OF_TRACK_WINDOW_MS],
+    // `durationMs - window` is negative, so the old `> 0` guard made this
+    // unconditionally true and finished the track on its first poll. A
+    // sub-window track instead relies on normal stop/next-track detection.
+    // C1(pause-skip) residual: a self-initiated pause within the final window
+    // freezes progress at >= dur-window with is_playing:false and the SAME uri;
+    // without `!this.paused` this near-end heuristic would fire and skip the
+    // paused track. resume() clears `paused`, so a genuine natural end is still
+    // detected afterwards.
+    // R4-4: progress/duration under a foreign-active state belong to another
+    // bot's track, so the near-end heuristic must not fire off them. A stolen
+    // session ends OUR track through the stop/null two-poll path below instead.
+    const finishedByProgress =
+      this.hasPlayed &&
+      !this.paused &&
+      !foreignActive &&
+      state.durationMs > END_OF_TRACK_WINDOW_MS &&
+      state.progressMs >= state.durationMs - END_OF_TRACK_WINDOW_MS;
+    // C1(pause-skip) + R3-1(null-item): a self-initiated pause (this.paused)
+    // reports is_playing:false (and can idle to a null item) with the SAME uri —
+    // that is NOT a track end, so never finish while paused. Beyond pause, the
+    // two "not clearly playing our track" signals — an external stop
+    // (is_playing:false) and a null item (trackUri===null) — are BOTH momentary
+    // at the boundaries (buffering; Connect handoff / market relink), so they
+    // share ONE two-poll confirmation (stopSeen): require the signal to persist
+    // across two consecutive non-paused polls before ending. A single transient
+    // stop OR null is absorbed; a confirmed end still emits within ~one extra
+    // poll interval, and a genuine end (item stays null / stopped across two
+    // polls) still fires exactly once.
+    // R4-4: a foreign device becoming the active one means OUR device is no
+    // longer playing our track — the same signal as an external stop / null
+    // item, so it shares the two-poll confirmation: one foreign poll is
+    // unconfirmed (could be a transient handoff), two consecutive foreign polls
+    // cleanly end our track and advance our queue.
+    let finishedByStopOrNull = false;
+    if (
+      this.hasPlayed &&
+      !this.paused &&
+      (foreignActive || !state.isPlaying || state.trackUri === null)
+    ) {
+      if (this.stopSeen) {
+        finishedByStopOrNull = true;
+      } else {
+        this.stopSeen = true; // first such poll — await confirmation
+      }
+    }
+
+    // R4-6: a deliberate seek into the near-end window suppresses this single
+    // finishedByProgress. `justSeeked` was already consumed above, so the NEXT
+    // in-window poll finishes normally — the grace never permanently disables
+    // near-end detection, and it never touches the stop/null two-poll path.
+    if ((finishedByProgress && !justSeeked) || finishedByStopOrNull) {
+      this.endedForCurrent = true; // latch: emit at most once per track
+      const endedUri = this.currentUri;
+      this.currentUri = null;
+      this.positionMs = 0;
+      const e: SpotifyTrackEndedEvent = { uri: endedUri, reason: "ended" };
+      this.emit("trackEnded", e);
+    }
+  }
+
+  isReady(): boolean {
+    return this.ready;
+  }
+
+  async playTrack(uri: string): Promise<void> {
+    const deviceId = await this.connect.findDeviceByName(this.opts.deviceName);
+    if (!deviceId) throw new Error(`Connect device "${this.opts.deviceName}" not found`);
+    // R4-4: persist OUR device id so control (pause/resume/seek) is device-scoped
+    // and pollState can distinguish our device from a foreign one that stole the
+    // shared account's single active Connect session.
+    this.deviceId = deviceId;
+    // Reset the track-end state machine for the new track: clear the once-only
+    // latch and drop hasPlayed so no end can fire until a poll re-confirms this
+    // uri playing. currentUri is cleared so the next poll re-detects the track
+    // (fresh metadata) rather than treating it as unchanged. Arming here is the
+    // primary guarantee that no end/metadata can fire before the bot plays.
+    // Cancel the previous track's degrade-to-skip watchdog first (at-most-one
+    // trackEnded per track, I4).
+    this.clearPlaybackWatchdog();
+    this.currentUri = null;
+    this.hasPlayed = false;
+    this.endedForCurrent = false;
+    this.armed = true;
+    // A newly-started track is not paused, and carries no pending stop
+    // confirmation from the previous track. (C1 pause-skip.)
+    this.paused = false;
+    this.stopSeen = false;
+    // R4-6: a fresh track carries no pending seek grace from the previous one.
+    this.seekGrace = false;
+    // transfer(false) activates our device WITHOUT starting audio; play() then
+    // actually starts the uri. The two-step is required — transfer alone won't
+    // begin playback.
+    await this.connect.transfer(deviceId, false);
+    await this.connect.play(deviceId, uri);
+    // I4 (§13): arm the "did it actually start playing?" watchdog. If our own
+    // track is never seen playing within the window, degrade-to-skipped so the
+    // queue advances instead of hanging on a silent, persistently-failing play.
+    this.armPlaybackWatchdog(uri);
+  }
+
+  /**
+   * I4 (§13) degrade-to-skip watchdog. Arms a bounded timer; if our own track
+   * has not been observed playing by the time it fires, emit a single
+   * trackEnded{reason:"error"} so the controller re-emits it and BotInstance
+   * advances the queue. Cleared when real playback is observed, on stop(), and
+   * at the start of a new playTrack().
+   */
+  private armPlaybackWatchdog(uri: string): void {
+    this.clearPlaybackWatchdog();
+    const timeoutMs = this.deps.playbackStartTimeoutMs ?? DEFAULT_PLAYBACK_START_TIMEOUT_MS;
+    const setTimer =
+      this.deps.setTimeout ??
+      ((cb: () => void, ms: number) => {
+        const t = setTimeout(cb, ms);
+        (t as { unref?: () => void }).unref?.();
+        return t;
+      });
+    this.watchdogTimer = setTimer(() => {
+      this.watchdogTimer = null;
+      this.onPlaybackStartTimeout(uri);
+    }, timeoutMs);
+  }
+
+  private clearPlaybackWatchdog(): void {
+    if (this.watchdogTimer == null) return;
+    const clearTimer =
+      this.deps.clearTimeout ??
+      ((h: unknown) => clearTimeout(h as ReturnType<typeof setTimeout>));
+    clearTimer(this.watchdogTimer);
+    this.watchdogTimer = null;
+  }
+
+  /**
+   * Fired when the playback-start window elapses with no observed playback.
+   * C3.6: never throws up the queue path. Guarded by the same endedForCurrent
+   * latch as normal end-detection so at most one trackEnded per track (no
+   * double-emit with the poll-loop end detection).
+   */
+  private onPlaybackStartTimeout(uri: string): void {
+    // Real playback was seen (hasPlayed) or the track already ended -> moot.
+    if (this.hasPlayed || this.endedForCurrent) return;
+    this.endedForCurrent = true; // latch
+    this.currentUri = null;
+    this.positionMs = 0;
+    const e: SpotifyTrackEndedEvent = { uri, reason: "error" };
+    this.emit("trackEnded", e);
+  }
+
+  async pause(): Promise<void> {
+    // R4-4: device-scope to OUR device so bot A's pause / auto-pause-when-alone
+    // can't pause whatever device is currently active for the shared account
+    // (= bot B's playback). Falls back to account-wide only before first play.
+    await this.connect.pause(this.deviceId ?? undefined);
+    // C1(pause-skip): mark our own pause so the next poll's is_playing:false
+    // (same uri) is not misread as a track end and skipped.
+    this.paused = true;
+  }
+
+  async resume(): Promise<void> {
+    // R4-4: device-scope to OUR device (see pause()).
+    await this.connect.resume(this.deviceId ?? undefined);
+    // Resumed -> normal end-detection applies again.
+    this.paused = false;
+  }
+
+  async seek(ms: number): Promise<void> {
+    // R4-4: device-scope to OUR device (see pause()).
+    await this.connect.seek(ms, this.deviceId ?? undefined);
+    this.positionMs = ms;
+    // R4-6: arm the one-poll grace so a seek landing inside the final
+    // END_OF_TRACK_WINDOW_MS is not immediately treated as a natural end.
+    this.seekGrace = true;
+  }
+
+  getPcmStream(): Readable {
+    const out = this.ffmpeg?.stdout;
+    if (!out) throw new Error("PCM stream unavailable (rust-librespot backend not started)");
+    return out;
+  }
+
+  getPositionMs(): number {
+    return this.positionMs;
+  }
+
+  stop(): void {
+    this.ready = false;
+    // Disarm the I4 degrade-to-skip watchdog so a stopped backend never emits.
+    this.clearPlaybackWatchdog();
+    // Clear the state poll interval FIRST so no poll fires mid-teardown.
+    if (this.pollTimer) {
+      clearInterval(this.pollTimer);
+      this.pollTimer = null;
+    }
+    if (this.proc) {
+      try {
+        this.proc.kill();
+      } catch {
+        /* ignore */
+      }
+      this.proc = null;
+    }
+    if (this.ffmpeg) {
+      try {
+        this.ffmpeg.kill();
+      } catch {
+        /* ignore */
+      }
+      this.ffmpeg = null;
+    }
+  }
+}

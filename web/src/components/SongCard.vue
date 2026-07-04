@@ -7,8 +7,8 @@
         <span class="song-name">{{ song.name }}</span>
         <span
           class="platform-badge"
-          :class="song.platform === 'bilibili' ? 'badge-bilibili' : song.platform === 'qq' ? 'badge-qq' : song.platform === 'youtube' ? 'badge-youtube' : song.platform === 'local' ? 'badge-local' : song.platform === 'kugou' ? 'badge-kugou' : 'badge-netease'"
-        >{{ song.platform === 'bilibili' ? 'B站' : song.platform === 'qq' ? 'QQ' : song.platform === 'youtube' ? 'YouTube' : song.platform === 'local' ? '本地' : song.platform === 'kugou' ? '酷狗' : '网易云' }}</span>
+          :class="song.platform === 'bilibili' ? 'badge-bilibili' : song.platform === 'qq' ? 'badge-qq' : song.platform === 'youtube' ? 'badge-youtube' : song.platform === 'local' ? 'badge-local' : song.platform === 'kugou' ? 'badge-kugou' : song.platform === 'spotify' ? 'badge-spotify' : 'badge-netease'"
+        >{{ song.platform === 'bilibili' ? 'B站' : song.platform === 'qq' ? 'QQ' : song.platform === 'youtube' ? 'YouTube' : song.platform === 'local' ? '本地' : song.platform === 'kugou' ? '酷狗' : song.platform === 'spotify' ? 'Spotify' : '网易云' }}</span>
       </div>
       <div class="song-artist">{{ song.artist }}</div>
     </div>
@@ -143,6 +143,11 @@ function formatDuration(seconds: number): string {
 .badge-kugou {
   background: var(--brand-kugou-12);
   color: var(--brand-kugou);
+}
+
+.badge-spotify {
+  background: var(--brand-spotify-12);
+  color: var(--brand-spotify);
 }
 
 .song-artist {

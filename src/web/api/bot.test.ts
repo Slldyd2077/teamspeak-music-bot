@@ -3,7 +3,7 @@ import express from "express";
 import cookieParser from "cookie-parser";
 import request from "supertest";
 import pino from "pino";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, readFileSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createDatabase, type BotDatabase } from "../../data/database.js";
@@ -196,6 +196,304 @@ describe("bot router /settings", () => {
     expect(res.status).toBe(200);
     expect(config.adminGroups).toEqual([6]);
   });
+
+  it("GET /settings includes a masked spotify block (hasClientSecret, never a raw secret)", async () => {
+    config.spotify.enabled = true;
+    config.spotify.backend = "librespot";
+    config.spotify.clientId = "cid-1";
+    config.spotify.deviceName = "MyDevice";
+    config.spotify.bitrate = 160;
+    config.spotify.clientSecret = "supersecret";
+
+    const withSecret = await request(app).get("/api/bot/settings").set("Cookie", cookie);
+    expect(withSecret.status).toBe(200);
+    expect(withSecret.body.spotify).toEqual({
+      enabled: true,
+      backend: "librespot",
+      clientId: "cid-1",
+      deviceName: "MyDevice",
+      bitrate: 160,
+      hasClientSecret: true,
+    });
+    // The raw secret is never serialized to the client.
+    expect(withSecret.body.spotify).not.toHaveProperty("clientSecret");
+
+    config.spotify.clientSecret = "";
+    const noSecret = await request(app).get("/api/bot/settings").set("Cookie", cookie);
+    expect(noSecret.body.spotify.hasClientSecret).toBe(false);
+    expect(noSecret.body.spotify).not.toHaveProperty("clientSecret");
+  });
+
+  it("POST /settings updates the spotify block, echoes the masked view, and persists", async () => {
+    const res = await request(app)
+      .post("/api/bot/settings")
+      .set("Cookie", cookie)
+      .send({ spotify: { enabled: true, backend: "librespot", clientId: "cid", deviceName: "Dev", bitrate: 160 } });
+    expect(res.status).toBe(200);
+    expect(config.spotify.enabled).toBe(true);
+    expect(config.spotify.backend).toBe("librespot");
+    expect(config.spotify.clientId).toBe("cid");
+    expect(config.spotify.deviceName).toBe("Dev");
+    expect(config.spotify.bitrate).toBe(160);
+
+    expect(res.body.spotify).toEqual({
+      enabled: true,
+      backend: "librespot",
+      clientId: "cid",
+      deviceName: "Dev",
+      bitrate: 160,
+      hasClientSecret: false,
+    });
+    expect(res.body.spotify).not.toHaveProperty("clientSecret");
+
+    // saveConfig persisted the block to disk.
+    expect(existsSync(configPath)).toBe(true);
+    const persisted = JSON.parse(readFileSync(configPath, "utf-8"));
+    expect(persisted.spotify.clientId).toBe("cid");
+    expect(persisted.spotify.backend).toBe("librespot");
+  });
+
+  it("POST /settings ignores an invalid spotify backend/bitrate (partial-merge, no 400)", async () => {
+    config.spotify.backend = "auto";
+    config.spotify.bitrate = 320;
+    const res = await request(app)
+      .post("/api/bot/settings")
+      .set("Cookie", cookie)
+      .send({ spotify: { backend: "bogus", bitrate: 999 } });
+    expect(res.status).toBe(200);
+    expect(config.spotify.backend).toBe("auto");
+    expect(config.spotify.bitrate).toBe(320);
+  });
+
+  it("POST /settings sets a non-empty clientSecret but a blank one never wipes it", async () => {
+    const set = await request(app)
+      .post("/api/bot/settings")
+      .set("Cookie", cookie)
+      .send({ spotify: { clientSecret: "newsecret" } });
+    expect(set.status).toBe(200);
+    expect(config.spotify.clientSecret).toBe("newsecret");
+    expect(set.body.spotify.hasClientSecret).toBe(true);
+    expect(set.body.spotify).not.toHaveProperty("clientSecret");
+
+    const blank = await request(app)
+      .post("/api/bot/settings")
+      .set("Cookie", cookie)
+      .send({ spotify: { clientSecret: "" } });
+    expect(blank.status).toBe(200);
+    expect(config.spotify.clientSecret).toBe("newsecret");
+    expect(blank.body.spotify.hasClientSecret).toBe(true);
+  });
+
+  it("POST /settings ignores a blank/whitespace deviceName but stores a trimmed non-empty one", async () => {
+    config.spotify.deviceName = "OldDevice";
+
+    // Empty string leaves the prior deviceName untouched.
+    const empty = await request(app)
+      .post("/api/bot/settings")
+      .set("Cookie", cookie)
+      .send({ spotify: { deviceName: "" } });
+    expect(empty.status).toBe(200);
+    expect(config.spotify.deviceName).toBe("OldDevice");
+    expect(empty.body.spotify.deviceName).toBe("OldDevice");
+
+    // Whitespace-only is likewise ignored (trim().length === 0).
+    const ws = await request(app)
+      .post("/api/bot/settings")
+      .set("Cookie", cookie)
+      .send({ spotify: { deviceName: "   " } });
+    expect(ws.status).toBe(200);
+    expect(config.spotify.deviceName).toBe("OldDevice");
+
+    // A non-empty value is stored TRIMMED.
+    const set = await request(app)
+      .post("/api/bot/settings")
+      .set("Cookie", cookie)
+      .send({ spotify: { deviceName: "  Dev  " } });
+    expect(set.status).toBe(200);
+    expect(config.spotify.deviceName).toBe("Dev");
+    expect(set.body.spotify.deviceName).toBe("Dev");
+  });
+
+  it("POST /settings that omits spotify leaves config.spotify untouched (no regression)", async () => {
+    config.spotify.clientId = "keep-me";
+    config.spotify.clientSecret = "keep-secret";
+    const before = { ...config.spotify };
+    const res = await request(app)
+      .post("/api/bot/settings")
+      .set("Cookie", cookie)
+      .send({ autoPauseOnEmpty: false });
+    expect(res.status).toBe(200);
+    expect(config.spotify).toEqual(before);
+  });
+});
+
+// Whole-branch I2: saving a Client ID in Settings must re-configure the single
+// live SpotifyOAuth so the operator can Connect without a process restart.
+describe("bot router /settings applies spotify creds to the live OAuth (I2)", () => {
+  let botDb: BotDatabase;
+  let app: express.Express;
+  let cookie: string;
+  let config: BotConfig;
+  let configPath: string;
+  let tmpDir: string;
+  let configureCalls: Array<[string | undefined, string | undefined]>;
+
+  beforeEach(async () => {
+    botDb = createDatabase(":memory:");
+    const users = createUserStore(botDb.db);
+    const sessions = createSessionStore(botDb.db);
+    const alice = await users.createUser("alice", "pw-alice", "admin");
+    cookie = `${SESSION_COOKIE_NAME}=${sessions.createSession(alice.id).token}`;
+
+    tmpDir = mkdtempSync(join(tmpdir(), "botsettings-oauth-"));
+    configPath = join(tmpDir, "config.json");
+    config = getDefaultConfig(); // webPort defaults to 3000
+
+    const fakeManager = { getAllBots: () => [] } as unknown as BotManager;
+    const avatarStore = createAvatarStore(tmpDir);
+
+    // Fake OAuth recording every configure(clientId, redirectUri) call.
+    configureCalls = [];
+    const fakeOAuth = {
+      configure(clientId?: string, redirectUri?: string) {
+        configureCalls.push([clientId, redirectUri]);
+      },
+    };
+
+    app = express();
+    app.use(express.json());
+    app.use(cookieParser());
+    app.use("/api", createRequireAuth(sessions, createPermissionStore(botDb.db), () => getDefaultConfig().guestMode));
+    app.use(
+      "/api/bot",
+      createBotRouter(fakeManager, config, configPath, pino({ level: "silent" }), botDb, avatarStore, undefined, fakeOAuth),
+    );
+  });
+
+  afterEach(() => {
+    botDb.close();
+    rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  it("configures the live OAuth once with the derived callback redirectUri when a Client ID is saved", async () => {
+    const res = await request(app)
+      .post("/api/bot/settings")
+      .set("Cookie", cookie)
+      .send({ spotify: { clientId: "cid", enabled: true } });
+    expect(res.status).toBe(200);
+    expect(configureCalls).toEqual([
+      ["cid", `http://127.0.0.1:${config.webPort}/api/spotify/callback`],
+    ]);
+  });
+
+  it("does NOT touch the OAuth when the request has no spotify block", async () => {
+    const res = await request(app)
+      .post("/api/bot/settings")
+      .set("Cookie", cookie)
+      .send({ autoPauseOnEmpty: false });
+    expect(res.status).toBe(200);
+    expect(configureCalls).toEqual([]);
+  });
+
+  it("configures with ('', undefined) when a spotify block clears the Client ID (disables OAuth)", async () => {
+    const res = await request(app)
+      .post("/api/bot/settings")
+      .set("Cookie", cookie)
+      .send({ spotify: { clientId: "" } });
+    expect(res.status).toBe(200);
+    expect(configureCalls).toEqual([["", undefined]]);
+  });
+});
+
+// R2-4: saving Spotify creds in Settings must also refresh the Web API SEARCH
+// provider (spotifyProvider.setCreds), not only the OAuth playback path. Without
+// this, a fresh install (enabled defaults false) keeps empty search creds until a
+// full process restart even after an admin enters Client ID + Secret.
+describe("bot router /settings refreshes the Web API search provider creds (R2-4)", () => {
+  let botDb: BotDatabase;
+  let app: express.Express;
+  let cookie: string;
+  let config: BotConfig;
+  let configPath: string;
+  let tmpDir: string;
+  let setCredsCalls: Array<[string, string]>;
+  let configureCalls: Array<[string | undefined, string | undefined]>;
+
+  beforeEach(async () => {
+    botDb = createDatabase(":memory:");
+    const users = createUserStore(botDb.db);
+    const sessions = createSessionStore(botDb.db);
+    const alice = await users.createUser("alice", "pw-alice", "admin");
+    cookie = `${SESSION_COOKIE_NAME}=${sessions.createSession(alice.id).token}`;
+
+    tmpDir = mkdtempSync(join(tmpdir(), "botsettings-provider-"));
+    configPath = join(tmpDir, "config.json");
+    config = getDefaultConfig();
+
+    const fakeManager = { getAllBots: () => [] } as unknown as BotManager;
+    const avatarStore = createAvatarStore(tmpDir);
+
+    // Fake search provider recording every setCreds(clientId, clientSecret) call.
+    setCredsCalls = [];
+    const fakeProvider = {
+      setCreds(clientId: string, clientSecret: string) {
+        setCredsCalls.push([clientId, clientSecret]);
+      },
+    };
+    // Fake OAuth so we can assert the playback path is still wired alongside.
+    configureCalls = [];
+    const fakeOAuth = {
+      configure(clientId?: string, redirectUri?: string) {
+        configureCalls.push([clientId, redirectUri]);
+      },
+    };
+
+    app = express();
+    app.use(express.json());
+    app.use(cookieParser());
+    app.use("/api", createRequireAuth(sessions, createPermissionStore(botDb.db), () => getDefaultConfig().guestMode));
+    app.use(
+      "/api/bot",
+      createBotRouter(fakeManager, config, configPath, pino({ level: "silent" }), botDb, avatarStore, undefined, fakeOAuth, fakeProvider),
+    );
+  });
+
+  afterEach(() => {
+    botDb.close();
+    rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  it("calls setCreds once with (clientId, clientSecret) when a spotify block is saved (and OAuth is still configured)", async () => {
+    const res = await request(app)
+      .post("/api/bot/settings")
+      .set("Cookie", cookie)
+      .send({ spotify: { clientId: "cid", clientSecret: "sec", enabled: true } });
+    expect(res.status).toBe(200);
+    expect(setCredsCalls).toEqual([["cid", "sec"]]);
+    // The OAuth playback path is still wired on the same save.
+    expect(configureCalls.length).toBe(1);
+  });
+
+  it("does NOT call setCreds when the request has no spotify block", async () => {
+    const res = await request(app)
+      .post("/api/bot/settings")
+      .set("Cookie", cookie)
+      .send({ autoPauseOnEmpty: false });
+    expect(res.status).toBe(200);
+    expect(setCredsCalls).toEqual([]);
+  });
+
+  it("calls setCreds with the PRESERVED stored secret when the spotify block omits/blanks clientSecret", async () => {
+    config.spotify.clientId = "cid0";
+    config.spotify.clientSecret = "stored-secret";
+    const res = await request(app)
+      .post("/api/bot/settings")
+      .set("Cookie", cookie)
+      .send({ spotify: { clientId: "cid0", clientSecret: "", enabled: true } });
+    expect(res.status).toBe(200);
+    // Post-merge values: masked/blank secret must keep the stored one, never "".
+    expect(setCredsCalls).toEqual([["cid0", "stored-secret"]]);
+  });
 });
 
 describe("bot router /settings guest-mode gating + persistence", () => {
@@ -250,5 +548,16 @@ describe("bot router /settings guest-mode gating + persistence", () => {
     expect(res.body.guestMode.bots).toEqual(["bot1"]);
     expect(res.body.guestMode.permissions.playNext).toBe(true);
     expect(res.body.guestMode.permissions.addToQueue).toBe(true); // untouched default
+  });
+
+  it("POST /settings spotify write is 403 for a member lacking bot.manage", async () => {
+    const memberApp = mountBot(() => ({ role: "member", capabilities: new Set([]) }));
+    const res = await request(memberApp)
+      .post("/api/bot/settings")
+      .send({ spotify: { enabled: true, clientId: "cid" } });
+    expect(res.status).toBe(403);
+    // Gate rejected before any mutation.
+    expect(config.spotify.enabled).toBe(false);
+    expect(config.spotify.clientId).toBe("");
   });
 });

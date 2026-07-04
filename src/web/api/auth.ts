@@ -12,7 +12,8 @@ export function createAuthRouter(
   bilibiliProvider: MusicProvider,
   logger: Logger,
   cookieStore?: CookieStore,
-  kugouProvider?: MusicProvider
+  kugouProvider?: MusicProvider,
+  spotifyProvider?: MusicProvider
 ): Router {
   const router = Router();
   // YouTube is auth-less; we only use this instance so /auth/status can
@@ -23,6 +24,7 @@ export function createAuthRouter(
     if (platform === "bilibili") return bilibiliProvider;
     if (platform === "youtube") return youtubeProvider;
     if (platform === "kugou" && kugouProvider) return kugouProvider;
+    if (platform === "spotify" && spotifyProvider) return spotifyProvider;
     return platform === "qq" ? qqProvider : neteaseProvider;
   }
 
