@@ -365,7 +365,15 @@ export class SpotifyController extends EventEmitter {
   }
 
   async seek(ms: number): Promise<void> {
-    if (this.backend) await this.backend.seek(ms);
+    // R4-1: round to an integer ms ONCE here so BOTH backends receive a valid
+    // integer position. The web progress bar computes seekTime = ratio *
+    // duration (fractional seconds), so seek(seconds * 1000) is a NON-integer ms
+    // (e.g. 71610.00000000001). go-librespot decodes `position` into an int64
+    // and Go's encoding/json rejects a JSON number with a decimal point → HTTP
+    // 400 → the error is swallowed → the track never seeks. The Spotify Web API
+    // (Rust path) likewise expects an integer position_ms. Clamp negatives to 0.
+    const position = Math.max(0, Math.round(ms));
+    if (this.backend) await this.backend.seek(position);
   }
 
   getPcmStream(): Readable {

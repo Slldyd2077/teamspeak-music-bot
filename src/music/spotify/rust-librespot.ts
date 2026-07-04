@@ -109,6 +109,16 @@ export class RustLibrespotBackend extends EventEmitter implements SpotifyAudioBa
   // change, or on playTrack(). Sharing ONE flag keeps both sibling paths from
   // false-skipping on a single transient poll.
   private stopSeen = false;
+  // R4-6: one-poll "just-seeked" grace. finishedByProgress is a SINGLE-poll
+  // near-end heuristic; if a user deliberately seeks to within the final
+  // END_OF_TRACK_WINDOW_MS, the very next poll would see progressMs >=
+  // durationMs-window and emit trackEnded, SKIPPING the ~1s the user seeked
+  // into. Set by seek(); consumed on the next poll so it suppresses that single
+  // finishedByProgress misfire only — the track then plays its remaining <=1.5s
+  // and ends naturally on the following poll via the stop/null detection. It
+  // deliberately does NOT touch the paused/stop/null two-poll logic, and a track
+  // reaching the window by PLAYING (no preceding seek) still ends normally.
+  private seekGrace = false;
   // I(pipe): one teardown per broken librespot->ffmpeg pipe. Both stream ends
   // (ffmpeg.stdin write side, proc.stdout read side) can report the same EPIPE;
   // this guard prevents a double teardown / double error-emit.
@@ -294,6 +304,13 @@ export class RustLibrespotBackend extends EventEmitter implements SpotifyAudioBa
     // getDevices is separate and stays active regardless of this flag.)
     if (!this.armed) return;
 
+    // R4-6: consume the one-poll "just-seeked" grace up front so it spans exactly
+    // ONE poll regardless of which branch this poll takes. `justSeeked` then
+    // suppresses a single finishedByProgress misfire below (a deliberate seek
+    // into the final END_OF_TRACK_WINDOW_MS must not be read as a natural end).
+    const justSeeked = this.seekGrace;
+    this.seekGrace = false;
+
     if (!state) {
       // C3.5: a 204 / no-active-device response. AFTER our own track has been
       // seen playing, librespot going idle means the track ended — emit once so
@@ -393,7 +410,11 @@ export class RustLibrespotBackend extends EventEmitter implements SpotifyAudioBa
       }
     }
 
-    if (finishedByProgress || finishedByStopOrNull) {
+    // R4-6: a deliberate seek into the near-end window suppresses this single
+    // finishedByProgress. `justSeeked` was already consumed above, so the NEXT
+    // in-window poll finishes normally — the grace never permanently disables
+    // near-end detection, and it never touches the stop/null two-poll path.
+    if ((finishedByProgress && !justSeeked) || finishedByStopOrNull) {
       this.endedForCurrent = true; // latch: emit at most once per track
       const endedUri = this.currentUri;
       this.currentUri = null;
@@ -426,6 +447,8 @@ export class RustLibrespotBackend extends EventEmitter implements SpotifyAudioBa
     // confirmation from the previous track. (C1 pause-skip.)
     this.paused = false;
     this.stopSeen = false;
+    // R4-6: a fresh track carries no pending seek grace from the previous one.
+    this.seekGrace = false;
     // transfer(false) activates our device WITHOUT starting audio; play() then
     // actually starts the uri. The two-step is required — transfer alone won't
     // begin playback.
@@ -501,6 +524,9 @@ export class RustLibrespotBackend extends EventEmitter implements SpotifyAudioBa
   async seek(ms: number): Promise<void> {
     await this.connect.seek(ms);
     this.positionMs = ms;
+    // R4-6: arm the one-poll grace so a seek landing inside the final
+    // END_OF_TRACK_WINDOW_MS is not immediately treated as a natural end.
+    this.seekGrace = true;
   }
 
   getPcmStream(): Readable {

@@ -481,6 +481,83 @@ describe("RustLibrespotBackend track-end poll loop", () => {
   });
 });
 
+// R4-6: finishedByProgress is a SINGLE-poll near-end heuristic. If a user
+// deliberately SEEKS to within the final END_OF_TRACK_WINDOW_MS, the next poll
+// would see progressMs >= durationMs-1500 and emit trackEnded — skipping the ~1s
+// the user seeked into. A one-poll "just-seeked" grace suppresses that single
+// misfire; the track then plays its remaining <=1.5s and ends naturally on the
+// following poll via the stop/null detection. Natural near-end (reached by
+// PLAYING, no seek) must be UNCHANGED.
+describe("RustLibrespotBackend seek-into-end grace (R4-6)", () => {
+  it("does NOT skip when a seek lands within the final end-of-track window; ends naturally on the following poll", async () => {
+    const h = makeHarness();
+    const ended = vi.fn();
+    h.backend.on("trackEnded", ended);
+    await h.backend.playTrack("spotify:track:A");
+    // Observe our track actually playing first (mid-track).
+    h.connect.getPlaybackState.mockResolvedValueOnce({
+      isPlaying: true, progressMs: 5000, trackUri: "spotify:track:A", durationMs: 200000,
+    });
+    await (h.backend as any).pollState();
+    // User deliberately seeks to ~1s before the end (inside the 1.5s window).
+    await h.backend.seek(199000);
+    // First poll after the seek: progress is already inside the near-end window
+    // and still playing. The grace must suppress this single finishedByProgress.
+    h.connect.getPlaybackState.mockResolvedValueOnce({
+      isPlaying: true, progressMs: 199000, trackUri: "spotify:track:A", durationMs: 200000,
+    });
+    await (h.backend as any).pollState();
+    expect(ended).not.toHaveBeenCalled();
+    // The remaining <=1.5s plays out and librespot goes idle (null/204) — the
+    // genuine end. It emits exactly one trackEnded.
+    h.connect.getPlaybackState.mockResolvedValue(null as any);
+    await (h.backend as any).pollState();
+    expect(ended).toHaveBeenCalledTimes(1);
+    expect(ended).toHaveBeenCalledWith({ uri: "spotify:track:A", reason: "ended" });
+  });
+
+  it("the seek grace only spans ONE poll: a second in-window playing poll still finishes by progress", async () => {
+    const h = makeHarness();
+    const ended = vi.fn();
+    h.backend.on("trackEnded", ended);
+    await h.backend.playTrack("spotify:track:A");
+    h.connect.getPlaybackState.mockResolvedValueOnce({
+      isPlaying: true, progressMs: 5000, trackUri: "spotify:track:A", durationMs: 200000,
+    });
+    await (h.backend as any).pollState(); // observed playing
+    await h.backend.seek(199000); // seek into the final window
+    // Grace poll: suppressed.
+    h.connect.getPlaybackState.mockResolvedValueOnce({
+      isPlaying: true, progressMs: 199000, trackUri: "spotify:track:A", durationMs: 200000,
+    });
+    await (h.backend as any).pollState();
+    expect(ended).not.toHaveBeenCalled();
+    // Second in-window playing poll: grace already consumed -> natural near-end
+    // detection fires exactly once (grace must not permanently disable it).
+    h.connect.getPlaybackState.mockResolvedValueOnce({
+      isPlaying: true, progressMs: 199500, trackUri: "spotify:track:A", durationMs: 200000,
+    });
+    await (h.backend as any).pollState();
+    expect(ended).toHaveBeenCalledTimes(1);
+    expect(ended).toHaveBeenCalledWith({ uri: "spotify:track:A", reason: "ended" });
+  });
+
+  it("regression: a track that reaches the final window by PLAYING (no seek) still emits trackEnded on the first in-window poll", async () => {
+    const h = makeHarness();
+    const ended = vi.fn();
+    h.backend.on("trackEnded", ended);
+    await h.backend.playTrack("spotify:track:A");
+    h.connect.getPlaybackState
+      .mockResolvedValueOnce({ isPlaying: true, progressMs: 1000, trackUri: "spotify:track:A", durationMs: 200000 })
+      .mockResolvedValueOnce({ isPlaying: true, progressMs: 199000, trackUri: "spotify:track:A", durationMs: 200000 });
+    await (h.backend as any).pollState(); // observed playing (no seek)
+    expect(ended).not.toHaveBeenCalled();
+    await (h.backend as any).pollState(); // reaches window by PLAYING -> natural end
+    expect(ended).toHaveBeenCalledTimes(1);
+    expect(ended).toHaveBeenCalledWith({ uri: "spotify:track:A", reason: "ended" });
+  });
+});
+
 describe("RustLibrespotBackend playback-start watchdog (I4 degrade-to-skip)", () => {
   /** A controllable timer seam matching the file's injected-deps style. */
   function makeFakeTimer() {

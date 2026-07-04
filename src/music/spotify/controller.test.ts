@@ -338,6 +338,37 @@ describe("SpotifyController transport delegation", () => {
   });
 });
 
+// R4-1: the web progress bar computes seekTime = ratio * duration (fractional
+// seconds); BotInstance routes Spotify seeks through seek(seconds * 1000),
+// yielding a NON-integer ms (e.g. 71610.00000000001). go-librespot decodes
+// `position` into an int64 and Go's encoding/json REJECTS a JSON number with a
+// decimal point -> HTTP 400 -> the error is swallowed -> the track never seeks.
+// The controller must round ONCE so BOTH backends get a valid integer ms.
+describe("SpotifyController.seek integer rounding (R4-1)", () => {
+  it("rounds a fractional seek to an integer ms before forwarding to the backend", async () => {
+    const { ctrl, be } = makeCtrl();
+    await ctrl.ensureStarted();
+    await ctrl.seek(71610.00000000001);
+    expect(be.seekCalls).toHaveLength(1);
+    expect(Number.isInteger(be.seekCalls[0])).toBe(true);
+    expect(be.seekCalls[0]).toBe(71610);
+  });
+
+  it("clamps a negative seek to 0", async () => {
+    const { ctrl, be } = makeCtrl();
+    await ctrl.ensureStarted();
+    await ctrl.seek(-5);
+    expect(be.seekCalls).toEqual([0]);
+  });
+
+  it("passes an already-integer seek through unchanged", async () => {
+    const { ctrl, be } = makeCtrl();
+    await ctrl.ensureStarted();
+    await ctrl.seek(4200);
+    expect(be.seekCalls).toEqual([4200]);
+  });
+});
+
 describe("SpotifyController event re-emission", () => {
   it("re-emits backend trackEnded with the same payload", async () => {
     const { ctrl, be } = makeCtrl();
