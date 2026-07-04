@@ -97,10 +97,17 @@ export class RustLibrespotBackend extends EventEmitter implements SpotifyAudioBa
   // pause command and occupancy auto-pause-when-alone on the Rust backend). Set
   // by pause(), cleared by resume() and playTrack().
   private paused = false;
-  // Robustness: a genuine external stop must be confirmed across TWO consecutive
-  // non-paused is_playing:false polls before we emit trackEnded, so a momentary
-  // mid-track is_playing:false (buffering) can't false-skip. Set on the first
-  // such poll; reset whenever the track is playing again or the track changes.
+  // Robustness (finishedByStop + finishedByNull / R3-1): a "not clearly playing
+  // our track" signal — either a non-paused is_playing:false (external stop) OR
+  // a null item (trackUri===null) observed while our track was playing — must be
+  // confirmed across TWO consecutive non-paused polls before we emit trackEnded.
+  // Both signals can be momentary: is_playing:false from a buffering hiccup; a
+  // null item from a Connect/track handoff boundary or a region-relinked /
+  // restricted item that momentarily maps to uri:null (getPlaybackState omits
+  // the `market` param). Set on the first such poll; reset only when a poll
+  // clearly shows our track playing again (is_playing AND a real item), on track
+  // change, or on playTrack(). Sharing ONE flag keeps both sibling paths from
+  // false-skipping on a single transient poll.
   private stopSeen = false;
   // I(pipe): one teardown per broken librespot->ffmpeg pipe. Both stream ends
   // (ffmpeg.stdin write side, proc.stdout read side) can report the same EPIPE;
@@ -329,10 +336,17 @@ export class RustLibrespotBackend extends EventEmitter implements SpotifyAudioBa
 
     if (state.isPlaying) {
       this.hasPlayed = true;
-      // Playing again -> any earlier is_playing:false was transient, not a stop.
-      this.stopSeen = false;
       // Real playback observed -> the I4 degrade-to-skip watchdog is moot.
       this.clearPlaybackWatchdog();
+    }
+    // Clearly playing our track again (is_playing AND a real item) -> any earlier
+    // transient is_playing:false (buffering) or null item (Connect handoff /
+    // market relink) was a hiccup; drop the pending two-poll end confirmation.
+    // A null item under is_playing:true is NOT "clearly playing" and must NOT
+    // reset the confirmation, or a genuine null-item end could never accumulate
+    // its second poll.
+    if (state.isPlaying && state.trackUri !== null) {
+      this.stopSeen = false;
     }
     if (!this.currentUri || this.endedForCurrent) return;
 
@@ -355,23 +369,31 @@ export class RustLibrespotBackend extends EventEmitter implements SpotifyAudioBa
       !this.paused &&
       state.durationMs > END_OF_TRACK_WINDOW_MS &&
       state.progressMs >= state.durationMs - END_OF_TRACK_WINDOW_MS;
-    // C1(pause-skip): a self-initiated pause (this.paused) reports is_playing:false
-    // with the SAME uri — that is NOT a track end, so never finish while paused.
-    // And even for a genuine external stop, require it to persist across two
-    // consecutive polls (stopSeen) so a momentary mid-track is_playing:false
-    // (buffering) doesn't false-skip. Confirmed stops still emit within ~one
-    // extra poll interval.
-    let finishedByStop = false;
-    if (this.hasPlayed && !state.isPlaying && !this.paused) {
+    // C1(pause-skip) + R3-1(null-item): a self-initiated pause (this.paused)
+    // reports is_playing:false (and can idle to a null item) with the SAME uri —
+    // that is NOT a track end, so never finish while paused. Beyond pause, the
+    // two "not clearly playing our track" signals — an external stop
+    // (is_playing:false) and a null item (trackUri===null) — are BOTH momentary
+    // at the boundaries (buffering; Connect handoff / market relink), so they
+    // share ONE two-poll confirmation (stopSeen): require the signal to persist
+    // across two consecutive non-paused polls before ending. A single transient
+    // stop OR null is absorbed; a confirmed end still emits within ~one extra
+    // poll interval, and a genuine end (item stays null / stopped across two
+    // polls) still fires exactly once.
+    let finishedByStopOrNull = false;
+    if (
+      this.hasPlayed &&
+      !this.paused &&
+      (!state.isPlaying || state.trackUri === null)
+    ) {
       if (this.stopSeen) {
-        finishedByStop = true;
+        finishedByStopOrNull = true;
       } else {
-        this.stopSeen = true; // first non-paused stop poll — await confirmation
+        this.stopSeen = true; // first such poll — await confirmation
       }
     }
-    const finishedByNull = this.hasPlayed && state.trackUri === null;
 
-    if (finishedByProgress || finishedByStop || finishedByNull) {
+    if (finishedByProgress || finishedByStopOrNull) {
       this.endedForCurrent = true; // latch: emit at most once per track
       const endedUri = this.currentUri;
       this.currentUri = null;

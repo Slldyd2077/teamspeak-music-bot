@@ -367,17 +367,69 @@ describe("RustLibrespotBackend track-end poll loop", () => {
     expect(ended).toHaveBeenCalledWith({ uri: "spotify:track:A", reason: "ended" });
   });
 
-  it("emits trackEnded when the track uri transitions to null after playing", async () => {
+  // R3-1: a GENUINE end where the item stays null across TWO consecutive
+  // non-paused polls still emits exactly one trackEnded. The null-item path now
+  // shares the external-stop two-poll confirmation, so a single transient null
+  // (Connect handoff / market relink) no longer skips a still-playing track —
+  // but a persistent null is still detected. (Previously this test asserted a
+  // single null poll ended the track; that encoded the R3-1 corner-case bug.)
+  it("emits trackEnded once when the track uri stays null across TWO consecutive polls after playing", async () => {
     const h = makeHarness();
     const ended = vi.fn();
     h.backend.on("trackEnded", ended);
     await h.backend.playTrack("spotify:track:A");
     h.connect.getPlaybackState
       .mockResolvedValueOnce({ isPlaying: true, progressMs: 1000, trackUri: "spotify:track:A", durationMs: 200000 })
-      .mockResolvedValueOnce({ isPlaying: true, progressMs: 0, trackUri: null, durationMs: 0 });
-    await (h.backend as any).pollState();
-    await (h.backend as any).pollState();
+      .mockResolvedValue({ isPlaying: true, progressMs: 0, trackUri: null, durationMs: 0 });
+    await (h.backend as any).pollState(); // observed playing our uri
+    await (h.backend as any).pollState(); // FIRST null item -> unconfirmed (could be transient)
+    expect(ended).not.toHaveBeenCalled();
+    await (h.backend as any).pollState(); // SECOND consecutive null -> confirmed end
+    await (h.backend as any).pollState(); // idempotent: no second emit for same track
+    expect(ended).toHaveBeenCalledTimes(1);
     expect(ended).toHaveBeenCalledWith({ uri: "spotify:track:A", reason: "ended" });
+  });
+
+  // R3-1: Spotify legitimately returns item:null transiently at a track/Connect
+  // handoff boundary, and getPlaybackState omits the `market` param so a
+  // region-relinked/restricted item can momentarily map to uri:null. A SINGLE
+  // {isPlaying:true, trackUri:null} poll mid-track must NOT skip a still-playing
+  // track; a following poll showing our real uri again confirms it kept playing.
+  it("a transient single null-item poll (isPlaying:true, trackUri:null) followed by our uri again does NOT emit trackEnded", async () => {
+    const h = makeHarness();
+    const ended = vi.fn();
+    h.backend.on("trackEnded", ended);
+    await h.backend.playTrack("spotify:track:A");
+    h.connect.getPlaybackState
+      .mockResolvedValueOnce({ isPlaying: true, progressMs: 5000, trackUri: "spotify:track:A", durationMs: 200000 })
+      .mockResolvedValueOnce({ isPlaying: true, progressMs: 0, trackUri: null, durationMs: 0 })
+      .mockResolvedValue({ isPlaying: true, progressMs: 6000, trackUri: "spotify:track:A", durationMs: 200000 });
+    await (h.backend as any).pollState(); // playing our uri
+    await (h.backend as any).pollState(); // momentary null item (handoff / market relink)
+    await (h.backend as any).pollState(); // our uri again -> confirmation reset, still playing
+    expect(ended).not.toHaveBeenCalled();
+  });
+
+  // R3-1 (pause invariant): a self-paused track must NEVER skip. A {trackUri:null}
+  // poll while WE hold a pause must not be read as a track end (same invariant
+  // the finishedByStop / null-204 paths already enforce with a `!paused` guard).
+  it("does NOT emit trackEnded on a null-item poll while the track is self-paused", async () => {
+    const h = makeHarness();
+    const ended = vi.fn();
+    h.backend.on("trackEnded", ended);
+    await h.backend.playTrack("spotify:track:A");
+    h.connect.getPlaybackState.mockResolvedValueOnce({
+      isPlaying: true, progressMs: 5000, trackUri: "spotify:track:A", durationMs: 200000,
+    });
+    await (h.backend as any).pollState(); // observed playing
+    await h.backend.pause();
+    // While paused, a null item appears across multiple polls (state present, no item).
+    h.connect.getPlaybackState.mockResolvedValue({
+      isPlaying: false, progressMs: 5000, trackUri: null, durationMs: 0,
+    });
+    await (h.backend as any).pollState();
+    await (h.backend as any).pollState();
+    expect(ended).not.toHaveBeenCalled();
   });
 
   it("ignores a null playback state (no active device) without emitting", async () => {
