@@ -291,3 +291,121 @@ describe("GoLibrespotBackend child-process error handling", () => {
     expect(onErr).toHaveBeenCalledWith(err);
   });
 });
+
+// Let queued microtasks (the async reconnect re-sync) settle.
+const flush = () => new Promise<void>((r) => setTimeout(r, 0));
+
+describe("GoLibrespotBackend R4-2: unexpected sidecar exit recovery", () => {
+  it("degrades to trackEnded{reason:'error'}, surfaces 'error', and stops the WS on an UNEXPECTED exit", async () => {
+    const h = makeHarness();
+    await h.backend.start();
+    await h.backend.playTrack("spotify:track:cur"); // sets the current uri
+
+    const ended = vi.fn();
+    const onErr = vi.fn();
+    h.backend.on("trackEnded", ended);
+    h.backend.on("error", onErr);
+
+    // Sidecar dies under us (nonzero exit, no stop() from us).
+    h.gliChild.emit("exit", 1, null);
+
+    expect(ended).toHaveBeenCalledWith({ uri: "spotify:track:cur", reason: "error" });
+    expect(onErr).toHaveBeenCalledTimes(1); // controller told -> rebuilds on next ensureStarted
+    expect(h.events.stop).toHaveBeenCalled(); // WS reconnect loop stopped (no dead-port hammer)
+    expect(h.backend.isReady()).toBe(false);
+  });
+
+  it("emits trackEnded BEFORE error so a listener that tears down still receives the skip", async () => {
+    const h = makeHarness();
+    await h.backend.start();
+    await h.backend.playTrack("spotify:track:cur");
+
+    const order: string[] = [];
+    h.backend.on("trackEnded", () => order.push("trackEnded"));
+    h.backend.on("error", () => order.push("error"));
+    h.gliChild.emit("exit", null, "SIGKILL");
+
+    expect(order).toEqual(["trackEnded", "error"]);
+  });
+
+  it("a stop()-initiated exit emits NEITHER trackEnded NOR error", async () => {
+    const h = makeHarness();
+    await h.backend.start();
+    await h.backend.playTrack("spotify:track:cur");
+
+    const ended = vi.fn();
+    const onErr = vi.fn();
+    h.backend.on("trackEnded", ended);
+    h.backend.on("error", onErr);
+
+    h.backend.stop(); // intentional teardown -> the ensuing 'exit' must be silent
+    h.gliChild.emit("exit", 0, "SIGTERM");
+
+    expect(ended).not.toHaveBeenCalled();
+    expect(onErr).not.toHaveBeenCalled();
+  });
+});
+
+describe("GoLibrespotBackend R4-3: WS reconnect re-sync", () => {
+  const notPlaying = { stopped: true, paused: false, buffering: false, track: null };
+  const stillPlaying = {
+    stopped: false,
+    paused: false,
+    buffering: false,
+    track: {
+      uri: "spotify:track:cur",
+      name: "Song",
+      artist_names: ["A"],
+      album_name: "Alb",
+      album_cover_url: null,
+      position: 1000,
+      duration: 200000,
+    },
+  };
+
+  it("re-queries GET /status on reconnect and emits trackEnded when playback is no longer active", async () => {
+    const h = makeHarness();
+    await h.backend.start();
+    await h.backend.playTrack("spotify:track:cur");
+    h.rest.getStatus.mockResolvedValue(notPlaying as any);
+
+    const ended = vi.fn();
+    h.backend.on("trackEnded", ended);
+    h.events.emit("reconnected");
+    await flush();
+
+    expect(h.rest.getStatus).toHaveBeenCalled();
+    expect(ended).toHaveBeenCalledWith({ uri: "spotify:track:cur", reason: "ended" });
+  });
+
+  it("does NOT emit a spurious trackEnded on reconnect when status shows still-playing", async () => {
+    const h = makeHarness();
+    await h.backend.start();
+    await h.backend.playTrack("spotify:track:cur");
+    h.rest.getStatus.mockResolvedValue(stillPlaying as any);
+
+    const ended = vi.fn();
+    h.backend.on("trackEnded", ended);
+    h.events.emit("reconnected");
+    await flush();
+
+    expect(h.rest.getStatus).toHaveBeenCalled();
+    expect(ended).not.toHaveBeenCalled();
+  });
+
+  it("re-sync is idempotent: a reconnect then a live not_playing emits trackEnded only once", async () => {
+    const h = makeHarness();
+    await h.backend.start();
+    await h.backend.playTrack("spotify:track:cur");
+    h.rest.getStatus.mockResolvedValue(notPlaying as any);
+
+    const ended = vi.fn();
+    h.backend.on("trackEnded", ended);
+    h.events.emit("reconnected");
+    await flush();
+    // A duplicate live event for the same track must not double-advance the queue.
+    h.events.emit("not_playing", { uri: "spotify:track:cur" });
+
+    expect(ended).toHaveBeenCalledTimes(1);
+  });
+});

@@ -215,4 +215,85 @@ describe("GoLibrespotEventClient", () => {
     expect(() => FakeWebSocket.instances[0].emit("error", new Error("net"))).not.toThrow();
     client.stop();
   });
+
+  // R4-3: a WS drop at a track boundary can lose the not_playing/stopped event.
+  // After a successful RE-open the client emits "reconnected" so the backend can
+  // re-query GET /status and reconcile. The FIRST connect must NOT emit it (there
+  // is nothing to reconcile yet).
+  it("emits 'reconnected' after a reconnect open, but NOT on the initial connect", () => {
+    vi.useFakeTimers();
+    try {
+      const client = new GoLibrespotEventClient("ws://x/events", { WebSocketCtor: FakeWebSocket as any });
+      const onReconnected = vi.fn();
+      client.on("reconnected", onReconnected);
+      client.start();
+
+      FakeWebSocket.instances[0].emit("open"); // initial connect
+      expect(onReconnected).not.toHaveBeenCalled(); // no re-sync on first connect
+
+      FakeWebSocket.instances[0].emit("close");
+      vi.advanceTimersByTime(500);
+      expect(FakeWebSocket.instances).toHaveLength(2); // reconnected socket
+      FakeWebSocket.instances[1].emit("open"); // reconnect open
+      expect(onReconnected).toHaveBeenCalledTimes(1);
+      client.stop();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  // R4-5: a socket that is accepted then immediately closed (a flap) must let the
+  // exponential backoff GROW — the old code reset it to 500ms on every 'open',
+  // pinning reconnects at ~2 Hz.
+  it("grows the reconnect backoff across open→immediate-close flaps (no 500ms pin)", () => {
+    vi.useFakeTimers();
+    try {
+      const client = new GoLibrespotEventClient("ws://x/events", { WebSocketCtor: FakeWebSocket as any });
+      client.start();
+      // Flap #1: accept then immediately drop -> next reconnect at 500ms.
+      FakeWebSocket.instances[0].emit("open");
+      FakeWebSocket.instances[0].emit("close");
+      vi.advanceTimersByTime(500);
+      expect(FakeWebSocket.instances).toHaveLength(2);
+
+      // Flap #2: accept then immediately drop -> backoff has doubled to 1000ms.
+      FakeWebSocket.instances[1].emit("open");
+      FakeWebSocket.instances[1].emit("close");
+      vi.advanceTimersByTime(500);
+      expect(FakeWebSocket.instances).toHaveLength(2); // still 2: 500ms is NOT enough now
+      vi.advanceTimersByTime(500);
+      expect(FakeWebSocket.instances).toHaveLength(3); // reconnects only after 1000ms
+      client.stop();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  // R4-5: once a connection has been STABLE (up for >= STABLE_CONNECTION_MS) the
+  // backoff resets, so a later drop reconnects promptly again.
+  it("resets the reconnect backoff after a stable connection", () => {
+    vi.useFakeTimers();
+    try {
+      const client = new GoLibrespotEventClient("ws://x/events", { WebSocketCtor: FakeWebSocket as any });
+      client.start();
+      // Flap once to grow the backoff to 1000ms.
+      FakeWebSocket.instances[0].emit("open");
+      FakeWebSocket.instances[0].emit("close");
+      vi.advanceTimersByTime(500);
+      expect(FakeWebSocket.instances).toHaveLength(2);
+
+      // Now a STABLE connection: open and stay up past the stability threshold.
+      FakeWebSocket.instances[1].emit("open");
+      vi.advanceTimersByTime(5000); // >= STABLE_CONNECTION_MS -> backoff reset to 500
+
+      FakeWebSocket.instances[1].emit("close");
+      vi.advanceTimersByTime(499);
+      expect(FakeWebSocket.instances).toHaveLength(2); // not yet
+      vi.advanceTimersByTime(1);
+      expect(FakeWebSocket.instances).toHaveLength(3); // reconnected at 500ms -> backoff was reset
+      client.stop();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 });

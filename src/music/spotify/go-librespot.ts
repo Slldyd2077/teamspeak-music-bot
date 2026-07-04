@@ -77,6 +77,18 @@ export class GoLibrespotBackend extends EventEmitter implements SpotifyAudioBack
   private events: GoLibrespotEventClient | null = null;
   private ready = false;
   private positionMs = 0;
+  // R4-2: distinguishes an INTENTIONAL teardown (stop()/failed start()) — where a
+  // sidecar exit is expected and must be silent — from an UNEXPECTED death that
+  // must degrade-to-skip + surface an error so the controller relaunches.
+  private stopping = false;
+  // The uri of the track currently loaded in the sidecar (set by playTrack and
+  // refreshed from metadata). Used as the trackEnded uri on an unexpected death
+  // (R4-2) and on reconnect reconciliation (R4-3).
+  private currentUri = "";
+  // At-most-one trackEnded per track. Set when we emit a track-end, cleared when
+  // a new track begins. Keeps the reconnect re-sync (R4-3) from double-emitting
+  // with a live not_playing/stopped event.
+  private endLatched = false;
 
   constructor(o: GoLibrespotBackendOptions) {
     super();
@@ -89,6 +101,11 @@ export class GoLibrespotBackend extends EventEmitter implements SpotifyAudioBack
   }
 
   async start(): Promise<void> {
+    // Fresh lifecycle (also covers a start() after a previous stop() on the same
+    // instance): clear the teardown flag and per-track end state.
+    this.stopping = false;
+    this.currentUri = "";
+    this.endLatched = false;
     const spawn = this.deps.spawn ?? realSpawn;
     const execFileSync = this.deps.execFileSync ?? realExecFileSync;
     const existsSync = this.deps.existsSync ?? realExistsSync;
@@ -157,6 +174,10 @@ export class GoLibrespotBackend extends EventEmitter implements SpotifyAudioBack
       this.proc.on("exit", (code, signal) => {
         this.ready = false;
         this.log.warn({ code, signal }, "go-librespot exited");
+        // R4-2: a stop()-initiated exit is expected — stay silent. Any other exit
+        // is the sidecar dying under us and must be recovered.
+        if (this.stopping) return;
+        this.onUnexpectedExit(code, signal);
       });
 
       // 6. REST client, then poll GET / until the HTTP server answers.
@@ -196,6 +217,70 @@ export class GoLibrespotBackend extends EventEmitter implements SpotifyAudioBack
     }
   }
 
+  /**
+   * At-most-one track-end per track. The WS not_playing/stopped events, the
+   * unexpected-death degrade (R4-2) and the reconnect re-sync (R4-3) all funnel
+   * through here so a track can only advance the queue once.
+   */
+  private emitTrackEnded(e: SpotifyTrackEndedEvent): void {
+    if (this.endLatched) return;
+    this.endLatched = true;
+    this.emit("trackEnded", e);
+  }
+
+  /**
+   * R4-2: the go-librespot sidecar died without a stop() from us. Spotify
+   * auto-advance is driven ONLY by the WS trackEnded event (the player-side stall
+   * watchdog is disabled in external mode), so a silent death would stall the
+   * queue forever. Mirror the Rust I4 degrade-to-skip:
+   *  (a) emit trackEnded{reason:"error"} so BotInstance advances the queue;
+   *  (b) stop the WS reconnect loop so it stops hammering the now-dead API port;
+   *  (c) surface via emitError so the controller tears down + relaunches a fresh
+   *      backend on the next ensureStarted().
+   * trackEnded MUST be emitted BEFORE emitError: the controller's error handler
+   * removeAllListeners() on teardown, so a trackEnded emitted after would be lost.
+   */
+  private onUnexpectedExit(code: number | null, signal: NodeJS.Signals | null): void {
+    // (b) Kill the reconnect loop first — the API port is dead.
+    try {
+      this.events?.stop();
+    } catch {
+      /* ignore */
+    }
+    this.events = null;
+    // (a) Degrade-to-skip only if a track was actually loaded; a death during
+    // startup with nothing playing has no queue item to advance.
+    if (this.currentUri) {
+      this.emitTrackEnded({ uri: this.currentUri, reason: "error" });
+    }
+    // (c) Surface so the controller rebuilds.
+    this.emitError(
+      new Error(
+        `go-librespot exited unexpectedly (code=${code ?? "null"}, signal=${signal ?? "null"})`,
+      ),
+    );
+  }
+
+  /**
+   * R4-3: the WS reconnected after a drop. go-librespot only pushes events (it is
+   * never polled after startup), so a not_playing/stopped emitted during the
+   * down window is lost and the queue would stall. Re-query GET /status and, if
+   * playback is no longer active (the track ended in the gap), emit trackEnded so
+   * the queue advances. Idempotent via the end-latch (no double-emit with a live
+   * event). Only fired on a real reconnect — never the initial connect.
+   */
+  private async reconcileAfterReconnect(): Promise<void> {
+    const rest = this.rest;
+    if (!rest) return;
+    const status = await rest.getStatus();
+    // Couldn't read status — don't guess a track-end.
+    if (!status) return;
+    const active = status.track != null && !status.stopped;
+    if (!active) {
+      this.emitTrackEnded({ uri: this.currentUri, reason: "ended" });
+    }
+  }
+
   private async waitUntilReady(): Promise<void> {
     const sleep = this.deps.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
     const interval = this.deps.pollIntervalMs ?? 200;
@@ -219,18 +304,26 @@ export class GoLibrespotBackend extends EventEmitter implements SpotifyAudioBack
         durationMs: typeof d?.duration === "number" ? d.duration : 0,
       };
       if (typeof d?.position === "number") this.positionMs = d.position;
+      // A new track is now playing: remember it (for R4-2/R4-3) and clear the
+      // per-track end-latch so its eventual end can advance the queue.
+      if (np.uri && np.uri !== this.currentUri) {
+        this.currentUri = np.uri;
+        this.endLatched = false;
+      }
       this.emit("metadata", np);
     });
     ev.on("seek", (d: any) => {
       if (typeof d?.position === "number") this.positionMs = d.position;
     });
     ev.on("not_playing", (d: any) => {
-      const e: SpotifyTrackEndedEvent = { uri: typeof d?.uri === "string" ? d.uri : "", reason: "ended" };
-      this.emit("trackEnded", e);
+      this.emitTrackEnded({ uri: typeof d?.uri === "string" ? d.uri : "", reason: "ended" });
     });
     ev.on("stopped", (d: any) => {
-      const e: SpotifyTrackEndedEvent = { uri: typeof d?.uri === "string" ? d.uri : "", reason: "stopped" };
-      this.emit("trackEnded", e);
+      this.emitTrackEnded({ uri: typeof d?.uri === "string" ? d.uri : "", reason: "stopped" });
+    });
+    // R4-3: reconcile any track-end missed while the WS was down.
+    ev.on("reconnected", () => {
+      void this.reconcileAfterReconnect();
     });
   }
 
@@ -240,6 +333,10 @@ export class GoLibrespotBackend extends EventEmitter implements SpotifyAudioBack
 
   async playTrack(uri: string): Promise<void> {
     if (!this.rest) throw new Error("go-librespot backend not started");
+    // Track what is loaded so an unexpected death (R4-2) / reconnect re-sync
+    // (R4-3) can advance the queue for the right uri, and reset the end-latch.
+    this.currentUri = uri;
+    this.endLatched = false;
     await this.rest.playTrack(uri);
   }
 
@@ -267,6 +364,9 @@ export class GoLibrespotBackend extends EventEmitter implements SpotifyAudioBack
   }
 
   stop(): void {
+    // R4-2: mark this an INTENTIONAL teardown so the go-librespot 'exit' handler
+    // (fired by the SIGTERM below) stays silent instead of degrading-to-skip.
+    this.stopping = true;
     this.ready = false;
     try {
       this.events?.stop();
