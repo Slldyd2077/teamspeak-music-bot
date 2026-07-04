@@ -13,6 +13,7 @@ import {
   type ParsedCommand,
 } from "./commands.js";
 import { parseSongRef, parseSelectionIndex } from "./song-ref.js";
+import { splitTextIntoChunks } from "./text-chunk.js";
 import type { Logger } from "../logger.js";
 import type { BotDatabase, ProfileConfig } from "../data/database.js";
 import type { BotConfig } from "../data/config.js";
@@ -395,7 +396,11 @@ export class BotInstance extends EventEmitter {
     try {
       const response = await this.executeCommand(parsed, msg);
       if (response) {
-        await this.tsClient.sendTextMessage(response);
+        // A single long reply (e.g. full lyrics) would exceed TeamSpeak's
+        // per-message byte cap, so split it and send the chunks in order.
+        for (const chunk of splitTextIntoChunks(response)) {
+          await this.tsClient.sendTextMessage(chunk);
+        }
       }
     } catch (err) {
       this.logger.error({ err, command: parsed.name }, "Command execution error");
@@ -1064,7 +1069,10 @@ export class BotInstance extends EventEmitter {
     const provider = this.getProviderFor(song.platform);
     const lyrics = await provider.getLyrics(song.id);
     if (lyrics.length === 0) return "No lyrics available";
-    const lines = lyrics.slice(0, 10).map((l) => l.text);
+    // Include the FULL lyrics (the send path chunks them under the message
+    // cap). Cap only to avoid pathological spam — far above any normal song.
+    const MAX_LYRIC_LINES = 200;
+    const lines = lyrics.slice(0, MAX_LYRIC_LINES).map((l) => l.text);
     return `Lyrics for ${song.name}:\n${lines.join("\n")}`;
   }
 

@@ -210,3 +210,64 @@ describe("BotInstance.handleTextMessage — command permission gate", () => {
     expect(ctx.executeCommand).toHaveBeenCalledTimes(1);
   });
 });
+
+describe("BotInstance.handleTextMessage — response chunking (#116)", () => {
+  it("splits a long command response into multiple sends, each under the byte cap", async () => {
+    const ctx = makeGateCtx({ adminGroups: [] });
+    const longResponse = Array.from(
+      { length: 200 },
+      (_, i) => `歌词 line number ${i} with some content`,
+    ).join("\n");
+    ctx.executeCommand = vi.fn(async () => longResponse);
+
+    await handleTextMessage.call(ctx, makeMsg("!lyrics"));
+
+    const calls = ctx.tsClient.sendTextMessage.mock.calls;
+    expect(calls.length).toBeGreaterThan(1);
+    for (const [chunk] of calls) {
+      expect(Buffer.byteLength(chunk as string, "utf8")).toBeLessThanOrEqual(900);
+    }
+  });
+
+  it("sends a short command response as a single message", async () => {
+    const ctx = makeGateCtx({ adminGroups: [] });
+    ctx.executeCommand = vi.fn(async () => "short reply");
+
+    await handleTextMessage.call(ctx, makeMsg("!lyrics"));
+
+    expect(ctx.tsClient.sendTextMessage).toHaveBeenCalledTimes(1);
+    expect(ctx.tsClient.sendTextMessage).toHaveBeenCalledWith("short reply");
+  });
+});
+
+const cmdLyrics = (BotInstance.prototype as any).cmdLyrics as (
+  this: unknown,
+) => Promise<string>;
+
+describe("BotInstance.cmdLyrics — full lyrics (#116)", () => {
+  it("returns ALL lyric lines, not just the first 10", async () => {
+    const lyricLines = Array.from({ length: 30 }, (_, i) => ({
+      time: i,
+      text: `lyric line ${i}`,
+    }));
+    const ctx: any = {
+      queue: { current: () => ({ id: "s1", name: "Song", platform: "netease" }) },
+      getProviderFor: () => ({ getLyrics: vi.fn(async () => lyricLines) }),
+    };
+
+    const out = await cmdLyrics.call(ctx);
+
+    for (const l of lyricLines) {
+      expect(out).toContain(l.text);
+    }
+    expect(out.startsWith("Lyrics for Song:")).toBe(true);
+  });
+
+  it("returns 'No lyrics available' when the provider has none", async () => {
+    const ctx: any = {
+      queue: { current: () => ({ id: "s1", name: "Song", platform: "netease" }) },
+      getProviderFor: () => ({ getLyrics: vi.fn(async () => []) }),
+    };
+    expect(await cmdLyrics.call(ctx)).toBe("No lyrics available");
+  });
+});
