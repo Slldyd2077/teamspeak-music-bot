@@ -4,14 +4,10 @@ import { loadConfig, saveConfig, migrateLegacyConfig } from "./data/config.js";
 import { createDatabase } from "./data/database.js";
 import { createLogger } from "./logger.js";
 import { createApiServerManager } from "./music/api-server.js";
-import { NeteaseProvider } from "./music/netease.js";
-import { QQMusicProvider } from "./music/qq.js";
-import { BiliBiliProvider } from "./music/bilibili.js";
-import { LocalMusicProvider } from "./music/local.js";
-import { KugouProvider } from "./music/kugou.js";
 import { createCookieStore } from "./music/auth.js";
 import { createAvatarStore } from "./data/avatars.js";
 import { createPermissionStore } from "./data/permissions.js";
+import { createProviderFactory } from "./bot/provider-factory.js";
 import { BotManager } from "./bot/manager.js";
 import { createWebServer } from "./web/server.js";
 
@@ -54,48 +50,33 @@ async function main() {
   );
   await apiServer.start();
 
-  const neteaseProvider = new NeteaseProvider(apiServer.getNeteaseBaseUrl());
-  const qqProvider = new QQMusicProvider(apiServer.getQQMusicBaseUrl());
-  const bilibiliProvider = new BiliBiliProvider();
-  const localProvider = new LocalMusicProvider(LOCAL_AUDIO_DIR);
-  const kugouProvider = new KugouProvider();
-
   const cookieStore = createCookieStore(COOKIE_DIR);
   const avatarStore = createAvatarStore(AVATAR_DIR);
-  const neteaseCookie = cookieStore.load("netease");
-  if (neteaseCookie) neteaseProvider.setCookie(neteaseCookie);
-  const qqCookie = cookieStore.load("qq");
-  if (qqCookie) qqProvider.setCookie(qqCookie);
-  const bilibiliCookie = cookieStore.load("bilibili");
-  if (bilibiliCookie) bilibiliProvider.setCookie(bilibiliCookie);
-  const kugouCookie = cookieStore.load("kugou");
-  if (kugouCookie) kugouProvider.setCookie(kugouCookie);
-
   const permissions = createPermissionStore(db.db);
 
+  const providerFactory = createProviderFactory({
+    neteaseBaseUrl: apiServer.getNeteaseBaseUrl(),
+    qqMusicBaseUrl: apiServer.getQQMusicBaseUrl(),
+    localAudioDir: LOCAL_AUDIO_DIR,
+  });
+
+  // Per-bot platform cookies: each bot loads its own saved cookie when
+  // constructed (BotManager.buildProvidersFor). No global startup load.
   const botManager = new BotManager(
-    neteaseProvider,
-    qqProvider,
-    bilibiliProvider,
+    providerFactory,
+    cookieStore,
     db,
     config,
     logger,
     avatarStore,
     permissions,
     CONFIG_PATH,
-    localProvider,
-    kugouProvider
   );
   await botManager.loadSavedBots();
 
   const webServer = createWebServer({
     port: config.webPort,
     botManager,
-    neteaseProvider,
-    qqProvider,
-    bilibiliProvider,
-    localProvider,
-    kugouProvider,
     database: db,
     avatarStore,
     config,

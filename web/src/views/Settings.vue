@@ -878,7 +878,7 @@ const qualityLevels = [
 
 async function loadQuality() {
   try {
-    const res = await axios.get('/api/music/quality');
+    const res = await axios.get('/api/music/quality', { params: { botId: store.activeBotId ?? undefined } });
     currentQuality.value = res.data.netease || 'exhigh';
   } catch { /* ignore */ }
 }
@@ -886,7 +886,7 @@ async function loadQuality() {
 async function setQuality(q: string) {
   currentQuality.value = q;
   try {
-    await axios.post('/api/music/quality', { quality: q });
+    await axios.post('/api/music/quality', { quality: q, botId: store.activeBotId ?? undefined });
   } catch { /* ignore */ }
 }
 
@@ -932,11 +932,12 @@ function getQrState(platform: string): QrState {
 
 async function checkAuthStatus() {
   try {
+    const botId = store.activeBotId ?? undefined;
     const [nRes, qRes, bRes, kRes] = await Promise.all([
-      axios.get('/api/auth/status', { params: { platform: 'netease' } }),
-      axios.get('/api/auth/status', { params: { platform: 'qq' } }),
-      axios.get('/api/auth/status', { params: { platform: 'bilibili' } }),
-      axios.get('/api/auth/status', { params: { platform: 'kugou' } }),
+      axios.get('/api/auth/status', { params: { platform: 'netease', botId } }),
+      axios.get('/api/auth/status', { params: { platform: 'qq', botId } }),
+      axios.get('/api/auth/status', { params: { platform: 'bilibili', botId } }),
+      axios.get('/api/auth/status', { params: { platform: 'kugou', botId } }),
     ]);
     Object.assign(neteaseAuth, nRes.data);
     Object.assign(qqAuth, qRes.data);
@@ -961,7 +962,7 @@ async function startQrLogin(platform: string) {
   qr.status = 'waiting';
 
   try {
-    const res = await axios.post('/api/auth/qrcode', { platform });
+    const res = await axios.post('/api/auth/qrcode', { platform, botId: store.activeBotId ?? undefined });
     const { qrUrl, qrImg, key } = res.data;
     qr.key = key;
 
@@ -997,7 +998,7 @@ async function pollQrStatus(platform: string) {
 
   try {
     const res = await axios.get('/api/auth/qrcode/status', {
-      params: { key: qr.key, platform },
+      params: { key: qr.key, platform, botId: store.activeBotId ?? undefined },
     });
     qr.status = res.data.status;
 
@@ -1119,7 +1120,7 @@ async function saveCookie(platform: string) {
     : platform === 'netease' ? neteaseCookie.value : qqCookie.value;
   if (!cookie) return;
   try {
-    await axios.post('/api/auth/cookie', { platform, cookie });
+    await axios.post('/api/auth/cookie', { platform, cookie, botId: store.activeBotId ?? undefined });
     await checkAuthStatus();
   } catch {
     // Ignore

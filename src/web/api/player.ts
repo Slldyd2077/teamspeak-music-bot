@@ -1,7 +1,6 @@
 import { Router } from "express";
 import type { BotManager } from "../../bot/manager.js";
 import type { BotDatabase } from "../../data/database.js";
-import type { MusicProvider } from "../../music/provider.js";
 import type { Logger } from "../../logger.js";
 import { parseCommand } from "../../bot/commands.js";
 import { requireBotAccess } from "../middleware/requirePermission.js";
@@ -11,9 +10,6 @@ export function createPlayerRouter(
   botManager: BotManager,
   logger: Logger,
   database?: BotDatabase,
-  neteaseProvider?: MusicProvider,
-  qqProvider?: MusicProvider,
-  bilibiliProvider?: MusicProvider,
 ): Router {
   const router = Router();
 

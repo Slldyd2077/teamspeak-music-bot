@@ -1,34 +1,56 @@
 import express, { Router } from "express";
+import type { Request, Response } from "express";
 import type { MusicProvider } from "../../music/provider.js";
-import { YouTubeProvider } from "../../music/youtube.js";
+import type { BotManager } from "../../bot/manager.js";
+import type { BotInstance } from "../../bot/instance.js";
 import type { Logger } from "../../logger.js";
 import type { BotConfig } from "../../data/config.js";
 import { requirePermission } from "../middleware/requirePermission.js";
 import { requireNotGuest } from "../middleware/requireNotGuest.js";
 import { authorize } from "../middleware/authorize.js";
 
+type Platform = "netease" | "qq" | "bilibili" | "youtube" | "local" | "kugou";
+
+/**
+ * Per-bot music router. Every platform call is scoped to a bot (which owns its
+ * own provider instances + cookies), so search / playlists / recommend / FM /
+ * quality are all per-bot. `/local/upload` is the exception: local audio is a
+ * shared store (cookie-less), so it uses the shared local provider directly.
+ */
 export function createMusicRouter(
-  neteaseProvider: MusicProvider,
-  qqProvider: MusicProvider,
-  bilibiliProvider: MusicProvider,
+  botManager: BotManager,
   logger: Logger,
-  localProvider?: MusicProvider,
   config?: BotConfig,
-  kugouProvider?: MusicProvider
 ): Router {
   const router = Router();
-  const youtubeProvider: MusicProvider = new YouTubeProvider();
 
   function isLocalAudioEnabled(): boolean {
     return config?.localAudioEnabled !== false;
   }
 
-  function getProvider(platform?: string): MusicProvider {
-    if (platform === "bilibili") return bilibiliProvider;
-    if (platform === "youtube") return youtubeProvider;
-    if (platform === "local" && localProvider) return localProvider;
-    if (platform === "kugou" && kugouProvider) return kugouProvider;
-    return platform === "qq" ? qqProvider : neteaseProvider;
+  function botIdFrom(req: Request): string | undefined {
+    const q = req.query.botId;
+    if (typeof q === "string" && q) return q;
+    const b = (req.body as { botId?: unknown } | undefined)?.botId;
+    return typeof b === "string" && b ? b : undefined;
+  }
+
+  function resolveBot(req: Request, res: Response): BotInstance | null {
+    const botId = botIdFrom(req);
+    if (!botId) {
+      res.status(400).json({ error: "botId is required" });
+      return null;
+    }
+    const bot = botManager.getBot(botId);
+    if (!bot) {
+      res.status(404).json({ error: "Bot not found" });
+      return null;
+    }
+    return bot;
+  }
+
+  function providerFor(bot: BotInstance, platform?: string): MusicProvider {
+    return bot.getProviderFor((platform ?? "netease") as Platform);
   }
 
   router.post(
@@ -47,10 +69,7 @@ export function createMusicRouter(
     }),
     async (req, res) => {
       try {
-        if (!localProvider) {
-          res.status(501).json({ error: "Local upload is not configured" });
-          return;
-        }
+        const localProvider = botManager.getLocalProvider();
         const uploadCapable = localProvider as MusicProvider & {
           uploadAudio?: (input: { buffer: Buffer; originalName: string; mimeType?: string }) => Promise<unknown>;
         };
@@ -93,10 +112,12 @@ export function createMusicRouter(
         res.json({ songs: [], playlists: [], albums: [] });
         return;
       }
-      const provider = getProvider(platform as string);
+      const bot = resolveBot(req, res);
+      if (!bot) return;
+      const provider = providerFor(bot, platform as string);
       const result = await provider.search(
         q as string,
-        parseInt(limit as string) || 20
+        parseInt(limit as string) || 20,
       );
       res.json(result);
     } catch (err) {
@@ -112,13 +133,16 @@ export function createMusicRouter(
         res.status(400).json({ error: "q (query) is required" });
         return;
       }
+      const bot = resolveBot(req, res);
+      if (!bot) return;
       const parsedLimit = parseInt(limit as string) || 20;
+      const empty = Promise.resolve({ songs: [], albums: [], playlists: [] });
       const [neteaseResult, qqResult, bilibiliResult, localResult, kugouResult] = await Promise.allSettled([
-        neteaseProvider.search(q as string, parsedLimit),
-        qqProvider.search(q as string, parsedLimit),
-        bilibiliProvider.search(q as string, parsedLimit),
-        localProvider && isLocalAudioEnabled() ? localProvider.search(q as string, parsedLimit) : Promise.resolve({ songs: [], albums: [], playlists: [] }),
-        kugouProvider ? kugouProvider.search(q as string, parsedLimit) : Promise.resolve({ songs: [], albums: [], playlists: [] }),
+        bot.getProviderFor("netease").search(q as string, parsedLimit),
+        bot.getProviderFor("qq").search(q as string, parsedLimit),
+        bot.getProviderFor("bilibili").search(q as string, parsedLimit),
+        isLocalAudioEnabled() ? bot.getProviderFor("local").search(q as string, parsedLimit) : empty,
+        bot.getProviderFor("kugou").search(q as string, parsedLimit),
       ]);
 
       const songs = [
@@ -150,7 +174,9 @@ export function createMusicRouter(
         res.status(403).json({ error: "本地音频播放已关闭" });
         return;
       }
-      const provider = getProvider(req.query.platform as string);
+      const bot = resolveBot(req, res);
+      if (!bot) return;
+      const provider = providerFor(bot, req.query.platform as string);
       const song = await provider.getSongDetail(req.params.id);
       if (!song) {
         res.status(404).json({ error: "Song not found" });
@@ -164,7 +190,9 @@ export function createMusicRouter(
 
   router.get("/playlist/:id", async (req, res) => {
     try {
-      const provider = getProvider(req.query.platform as string);
+      const bot = resolveBot(req, res);
+      if (!bot) return;
+      const provider = providerFor(bot, req.query.platform as string);
       const songs = await provider.getPlaylistSongs(req.params.id);
       res.json({ songs });
     } catch (err) {
@@ -174,7 +202,9 @@ export function createMusicRouter(
 
   router.get("/recommend/playlists", async (req, res) => {
     try {
-      const provider = getProvider(req.query.platform as string);
+      const bot = resolveBot(req, res);
+      if (!bot) return;
+      const provider = providerFor(bot, req.query.platform as string);
       const playlists = await provider.getRecommendPlaylists();
       res.json({ playlists });
     } catch (err) {
@@ -184,7 +214,9 @@ export function createMusicRouter(
 
   router.get("/album/:id", async (req, res) => {
     try {
-      const provider = getProvider(req.query.platform as string);
+      const bot = resolveBot(req, res);
+      if (!bot) return;
+      const provider = providerFor(bot, req.query.platform as string);
       const songs = await provider.getAlbumSongs(req.params.id);
       res.json({ songs });
     } catch (err) {
@@ -194,7 +226,9 @@ export function createMusicRouter(
 
   router.get("/lyrics/:id", async (req, res) => {
     try {
-      const provider = getProvider(req.query.platform as string);
+      const bot = resolveBot(req, res);
+      if (!bot) return;
+      const provider = providerFor(bot, req.query.platform as string);
       const lyrics = await provider.getLyrics(req.params.id);
       res.json({ lyrics });
     } catch (err) {
@@ -204,7 +238,9 @@ export function createMusicRouter(
 
   router.get("/recommend/songs", requireNotGuest, async (req, res) => {
     try {
-      const provider = getProvider(req.query.platform as string);
+      const bot = resolveBot(req, res);
+      if (!bot) return;
+      const provider = providerFor(bot, req.query.platform as string);
       if (!provider.getDailyRecommendSongs) {
         res.status(501).json({ error: "Not supported by this provider" });
         return;
@@ -219,7 +255,9 @@ export function createMusicRouter(
 
   router.get("/personal/fm", requireNotGuest, async (req, res) => {
     try {
-      const provider = getProvider(req.query.platform as string);
+      const bot = resolveBot(req, res);
+      if (!bot) return;
+      const provider = providerFor(bot, req.query.platform as string);
       if (!provider.getPersonalFm) {
         res.status(501).json({ error: "Not supported by this provider" });
         return;
@@ -234,7 +272,9 @@ export function createMusicRouter(
 
   router.get("/user/playlists", requireNotGuest, async (req, res) => {
     try {
-      const provider = getProvider(req.query.platform as string);
+      const bot = resolveBot(req, res);
+      if (!bot) return;
+      const provider = providerFor(bot, req.query.platform as string);
       if (!provider.getUserPlaylists) {
         res.status(501).json({ error: "Not supported by this provider" });
         return;
@@ -249,7 +289,9 @@ export function createMusicRouter(
 
   router.get("/playlist/:id/detail", async (req, res) => {
     try {
-      const provider = getProvider(req.query.platform as string);
+      const bot = resolveBot(req, res);
+      if (!bot) return;
+      const provider = providerFor(bot, req.query.platform as string);
       if (!provider.getPlaylistDetail) {
         res.status(501).json({ error: "Not supported by this provider" });
         return;
@@ -269,7 +311,11 @@ export function createMusicRouter(
   // B站热门视频
   router.get("/bilibili/popular", async (req, res) => {
     try {
-      const provider = bilibiliProvider as any;
+      const bot = resolveBot(req, res);
+      if (!bot) return;
+      const provider = bot.getProviderFor("bilibili") as MusicProvider & {
+        getPopularVideos?: (limit: number) => Promise<unknown[]>;
+      };
       if (provider.getPopularVideos) {
         const limit = parseInt(req.query.limit as string) || 20;
         const songs = await provider.getPopularVideos(limit);
@@ -283,37 +329,41 @@ export function createMusicRouter(
     }
   });
 
-  // Get current quality
-  router.get("/quality", requireNotGuest, (_req, res) => {
+  // Get current quality (per-bot)
+  router.get("/quality", requireNotGuest, (req, res) => {
+    const bot = resolveBot(req, res);
+    if (!bot) return;
     res.json({
-      netease: neteaseProvider.getQuality(),
-      qq: qqProvider.getQuality(),
-      bilibili: bilibiliProvider.getQuality(),
-      local: localProvider?.getQuality() ?? "original",
-      kugou: kugouProvider?.getQuality() ?? "128",
+      netease: bot.getProviderFor("netease").getQuality(),
+      qq: bot.getProviderFor("qq").getQuality(),
+      bilibili: bot.getProviderFor("bilibili").getQuality(),
+      local: bot.getProviderFor("local").getQuality(),
+      kugou: bot.getProviderFor("kugou").getQuality(),
     });
   });
 
-  // Set quality
+  // Set quality (per-bot)
   router.post("/quality", requirePermission("quality"), (req, res) => {
     const { quality, platform } = req.body;
     if (!quality) {
       res.status(400).json({ error: "quality is required" });
       return;
     }
+    const bot = resolveBot(req, res);
+    if (!bot) return;
     if (!platform || platform === "netease") {
-      neteaseProvider.setQuality(quality);
+      bot.getProviderFor("netease").setQuality(quality);
     }
     if (!platform || platform === "qq") {
-      qqProvider.setQuality(quality);
+      bot.getProviderFor("qq").setQuality(quality);
     }
     if (!platform || platform === "bilibili") {
-      bilibiliProvider.setQuality(quality);
+      bot.getProviderFor("bilibili").setQuality(quality);
     }
-    if ((!platform || platform === "kugou") && kugouProvider) {
-      kugouProvider.setQuality(quality);
+    if (!platform || platform === "kugou") {
+      bot.getProviderFor("kugou").setQuality(quality);
     }
-    logger.info({ quality, platform }, "Audio quality changed");
+    logger.info({ quality, platform, botId: bot.id }, "Audio quality changed");
     res.json({ success: true, quality });
   });
 

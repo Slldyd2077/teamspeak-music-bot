@@ -24,6 +24,7 @@ function makeFakeBot(id: string) {
     executeCommand: async () => "ok",
     getStatus: () => ({ id }),
     getQueue: () => [],
+    getProviderFor: () => makeProvider(),
     getProfileManager: () => ({ getConfig: () => ({}), updateConfig: () => {}, setCustomAvatar: () => {} }),
   };
 }
@@ -63,7 +64,6 @@ function makeApp(user: any) {
   app.use((req, _res, next) => { (req as any).user = user; next(); });
 
   const botManager = makeBotManager();
-  const provider = makeProvider();
 
   app.use("/api/player", createPlayerRouter(botManager, logger));
   app.use(
@@ -77,8 +77,8 @@ function makeApp(user: any) {
       { read: () => null, write: () => "x", remove: () => {} } as any,
     ),
   );
-  app.use("/api/auth", createAuthRouter(provider, provider, provider, logger));
-  app.use("/api/music", createMusicRouter(provider, provider, provider, logger));
+  app.use("/api/auth", createAuthRouter(botManager, { save() {}, load() { return ""; } } as any, logger));
+  app.use("/api/music", createMusicRouter(botManager, logger));
 
   return app;
 }
@@ -195,7 +195,7 @@ describe("permission enforcement on action routes", () => {
       const guestApp = makeApp(guest());
       expect((await request(guestApp).get("/api/music/quality")).status).toBe(403);
       const memberApp = makeApp(member([], "all"));
-      expect((await request(memberApp).get("/api/music/quality")).status).toBe(200);
+      expect((await request(memberApp).get("/api/music/quality").query({ botId: ALLOWED_BOT })).status).toBe(200);
     });
   });
 

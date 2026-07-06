@@ -5,7 +5,8 @@ import {
   type BotInstanceOptions,
 } from "./instance.js";
 import type { MusicProvider } from "../music/provider.js";
-import { YouTubeProvider } from "../music/youtube.js";
+import type { CookieStore, CookiePlatform } from "../music/auth.js";
+import type { ProviderFactory } from "./provider-factory.js";
 import type { BotDatabase } from "../data/database.js";
 import { saveConfig, type BotConfig } from "../data/config.js";
 import type { Logger } from "../logger.js";
@@ -70,12 +71,8 @@ export interface CreateBotParams {
 
 export class BotManager extends EventEmitter {
   private bots = new Map<string, BotInstance>();
-  private neteaseProvider: MusicProvider;
-  private qqProvider: MusicProvider;
-  private bilibiliProvider: MusicProvider;
-  private youtubeProvider: MusicProvider;
-  private localProvider: MusicProvider;
-  private kugouProvider: MusicProvider;
+  private factory: ProviderFactory;
+  private cookieStore: CookieStore;
   private database: BotDatabase;
   private config: BotConfig;
   private logger: Logger;
@@ -84,28 +81,21 @@ export class BotManager extends EventEmitter {
   private configPath: string;
 
   constructor(
-    neteaseProvider: MusicProvider,
-    qqProvider: MusicProvider,
-    bilibiliProvider: MusicProvider,
+    factory: ProviderFactory,
+    cookieStore: CookieStore,
     database: BotDatabase,
     config: BotConfig,
     logger: Logger,
     avatarStore: AvatarStore,
     permissions: PermissionStore,
     configPath: string,
-    localProvider?: MusicProvider,
-    kugouProvider?: MusicProvider
   ) {
     super();
-    this.neteaseProvider = neteaseProvider;
-    this.qqProvider = qqProvider;
-    this.bilibiliProvider = bilibiliProvider;
-    this.youtubeProvider = new YouTubeProvider();
-    this.localProvider = localProvider ?? neteaseProvider;
-    this.kugouProvider = kugouProvider ?? neteaseProvider;
+    this.factory = factory;
+    this.cookieStore = cookieStore;
     // Let the local provider see which uploads are still referenced by any
     // bot's queue, so it never deletes a file another queue/bot still needs.
-    const referenceable = this.localProvider as Partial<{
+    const referenceable = this.factory.localProvider as Partial<{
       setInUseResolver: (resolver: () => Set<string>) => void;
     }>;
     referenceable.setInUseResolver?.(() => this.getReferencedLocalSongIds());
@@ -115,6 +105,49 @@ export class BotManager extends EventEmitter {
     this.avatarStore = avatarStore;
     this.permissions = permissions;
     this.configPath = configPath;
+  }
+
+  /**
+   * Build a fresh per-bot provider set: each cookie-bearing platform gets its
+   * own instance with that bot's saved cookie loaded; local + youtube come from
+   * the shared singletons. Called for every BotInstance construction so a bot
+   * restart picks up cookies saved after it was first loaded.
+   */
+  private buildProvidersFor(botId: string): {
+    neteaseProvider: MusicProvider;
+    qqProvider: MusicProvider;
+    bilibiliProvider: MusicProvider;
+    youtubeProvider: MusicProvider;
+    localProvider: MusicProvider;
+    kugouProvider: MusicProvider;
+  } {
+    const neteaseProvider = this.factory.createNetease();
+    const qqProvider = this.factory.createQQ();
+    const bilibiliProvider = this.factory.createBiliBili();
+    const kugouProvider = this.factory.createKugou();
+    const cookieBearing: Array<[MusicProvider, CookiePlatform]> = [
+      [neteaseProvider, "netease"],
+      [qqProvider, "qq"],
+      [bilibiliProvider, "bilibili"],
+      [kugouProvider, "kugou"],
+    ];
+    for (const [provider, platform] of cookieBearing) {
+      const cookie = this.cookieStore.load(botId, platform);
+      if (cookie) provider.setCookie(cookie);
+    }
+    return {
+      neteaseProvider,
+      qqProvider,
+      bilibiliProvider,
+      kugouProvider,
+      localProvider: this.factory.localProvider,
+      youtubeProvider: this.factory.youtubeProvider,
+    };
+  }
+
+  /** Shared local-audio provider (used by the music router for /local/upload). */
+  getLocalProvider(): MusicProvider {
+    return this.factory.localProvider;
   }
 
   async createBot(params: CreateBotParams): Promise<BotInstance> {
@@ -135,12 +168,7 @@ export class BotManager extends EventEmitter {
         serverProtocol: params.serverProtocol,
         ts6ApiKey: params.ts6ApiKey,
       },
-      neteaseProvider: this.neteaseProvider,
-      qqProvider: this.qqProvider,
-      bilibiliProvider: this.bilibiliProvider,
-      youtubeProvider: this.youtubeProvider,
-      localProvider: this.localProvider,
-      kugouProvider: this.kugouProvider,
+      ...this.buildProvidersFor(id),
       database: this.database,
       config: this.config,
       logger: this.logger,
@@ -275,12 +303,7 @@ export class BotManager extends EventEmitter {
           serverProtocol: proto === "ts3" || proto === "ts6" ? proto : undefined,
           ts6ApiKey: saved.ts6ApiKey || undefined,
         },
-        neteaseProvider: this.neteaseProvider,
-        qqProvider: this.qqProvider,
-        bilibiliProvider: this.bilibiliProvider,
-        youtubeProvider: this.youtubeProvider,
-        localProvider: this.localProvider,
-        kugouProvider: this.kugouProvider,
+        ...this.buildProvidersFor(saved.id),
         database: this.database,
         config: this.config,
         logger: this.logger,
@@ -329,12 +352,7 @@ export class BotManager extends EventEmitter {
           serverProtocol: proto === "ts3" || proto === "ts6" ? proto : undefined,
           ts6ApiKey: saved.ts6ApiKey || undefined,
         },
-        neteaseProvider: this.neteaseProvider,
-        qqProvider: this.qqProvider,
-        bilibiliProvider: this.bilibiliProvider,
-        youtubeProvider: this.youtubeProvider,
-        localProvider: this.localProvider,
-        kugouProvider: this.kugouProvider,
+        ...this.buildProvidersFor(saved.id),
         database: this.database,
         config: this.config,
         logger: this.logger,

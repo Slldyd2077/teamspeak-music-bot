@@ -4,7 +4,6 @@ import path from "node:path";
 import cookieParser from "cookie-parser";
 import { WebSocketServer } from "ws";
 import type { BotManager } from "../bot/manager.js";
-import type { MusicProvider } from "../music/provider.js";
 import type { BotDatabase } from "../data/database.js";
 import type { BotConfig, GuestModeConfig } from "../data/config.js";
 import type { Logger } from "../logger.js";
@@ -35,16 +34,11 @@ const SESSION_CLEANUP_INTERVAL_MS = 60 * 60 * 1000; // 1 hour
 export interface WebServerOptions {
   port: number;
   botManager: BotManager;
-  neteaseProvider: MusicProvider;
-  qqProvider: MusicProvider;
-  bilibiliProvider: MusicProvider;
-  localProvider: MusicProvider;
-  kugouProvider: MusicProvider;
   database: BotDatabase;
   config: BotConfig;
   configPath: string;
   logger: Logger;
-  cookieStore?: CookieStore;
+  cookieStore: CookieStore;
   avatarStore: AvatarStore;
   staticDir?: string;
 }
@@ -125,15 +119,14 @@ export function createWebServer(options: WebServerOptions): WebServer {
   );
   app.use(
     "/api/music",
-    createMusicRouter(options.neteaseProvider, options.qqProvider, options.bilibiliProvider, logger, options.localProvider, options.config, options.kugouProvider)
+    createMusicRouter(options.botManager, logger, options.config)
   );
   app.use("/api/player", createPlayerRouter(
     options.botManager, logger, options.database,
-    options.neteaseProvider, options.qqProvider, options.bilibiliProvider,
   ));
   app.use(
     "/api/auth",
-    createAuthRouter(options.neteaseProvider, options.qqProvider, options.bilibiliProvider, logger, options.cookieStore, options.kugouProvider)
+    createAuthRouter(options.botManager, options.cookieStore, logger)
   );
   app.use("/api/favorites", requireNotGuest, createFavoritesRouter(options.database, logger));
 

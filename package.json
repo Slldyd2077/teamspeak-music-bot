@@ -1,6 +1,6 @@
 {
   "name": "tsmusicbot",
-  "version": "0.3.1",
+  "version": "0.3.2",
   "description": "TeamSpeak music bot with NetEase Cloud Music and QQ Music support",
   "type": "module",
   "scripts": {

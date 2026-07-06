@@ -572,10 +572,11 @@ export const usePlayerStore = defineStore('player', {
       // Always check auth status first — if it changed since the cached
       // fetch (e.g., user logged in/out as a different account), the
       // cached playlists belong to a different user and we MUST refetch.
+      const botId = this.activeBotId ?? undefined;
       const [neAuthRes, qqAuthRes, kugouAuthRes] = await Promise.allSettled([
-        axios.get('/api/auth/status', { params: { platform: 'netease' } }),
-        axios.get('/api/auth/status', { params: { platform: 'qq' } }),
-        axios.get('/api/auth/status', { params: { platform: 'kugou' } }),
+        axios.get('/api/auth/status', { params: { platform: 'netease', botId } }),
+        axios.get('/api/auth/status', { params: { platform: 'qq', botId } }),
+        axios.get('/api/auth/status', { params: { platform: 'kugou', botId } }),
       ]);
       const newAuth = {
         netease: neAuthRes.status === 'fulfilled' && !!neAuthRes.value.data?.loggedIn,
@@ -606,9 +607,9 @@ export const usePlayerStore = defineStore('player', {
       // 2. NetEase data: recommend playlists work anonymously; daily/user
       // playlists need login but Promise.allSettled isolates failures.
       const neteasePromises = [
-        axios.get('/api/music/recommend/playlists', { params: { platform: 'netease' } }),
-        axios.get('/api/music/recommend/songs',     { params: { platform: 'netease' } }),
-        axios.get('/api/music/user/playlists',      { params: { platform: 'netease' } }),
+        axios.get('/api/music/recommend/playlists', { params: { platform: 'netease', botId } }),
+        axios.get('/api/music/recommend/songs',     { params: { platform: 'netease', botId } }),
+        axios.get('/api/music/user/playlists',      { params: { platform: 'netease', botId } }),
       ];
 
       // 3. QQ data: only fetch when QQ is logged in. When not logged in,
@@ -617,9 +618,9 @@ export const usePlayerStore = defineStore('player', {
       const emptySongs     = { data: { songs: [] } };
       const qqPromises = this.authStatus.qq
         ? [
-            axios.get('/api/music/recommend/playlists', { params: { platform: 'qq' } }),
-            axios.get('/api/music/recommend/songs',     { params: { platform: 'qq' } }),
-            axios.get('/api/music/user/playlists',      { params: { platform: 'qq' } }),
+            axios.get('/api/music/recommend/playlists', { params: { platform: 'qq', botId } }),
+            axios.get('/api/music/recommend/songs',     { params: { platform: 'qq', botId } }),
+            axios.get('/api/music/user/playlists',      { params: { platform: 'qq', botId } }),
           ]
         : [
             Promise.resolve(emptyPlaylists),
@@ -631,9 +632,9 @@ export const usePlayerStore = defineStore('player', {
       // so gate all three on auth like QQ.
       const kugouPromises = this.authStatus.kugou
         ? [
-            axios.get('/api/music/recommend/playlists', { params: { platform: 'kugou' } }),
-            axios.get('/api/music/recommend/songs',     { params: { platform: 'kugou' } }),
-            axios.get('/api/music/user/playlists',      { params: { platform: 'kugou' } }),
+            axios.get('/api/music/recommend/playlists', { params: { platform: 'kugou', botId } }),
+            axios.get('/api/music/recommend/songs',     { params: { platform: 'kugou', botId } }),
+            axios.get('/api/music/user/playlists',      { params: { platform: 'kugou', botId } }),
           ]
         : [
             Promise.resolve(emptyPlaylists),
@@ -641,7 +642,7 @@ export const usePlayerStore = defineStore('player', {
             Promise.resolve(emptyPlaylists),
           ];
 
-      const biliPromise = axios.get('/api/music/bilibili/popular?limit=12');
+      const biliPromise = axios.get('/api/music/bilibili/popular', { params: { limit: 12, botId } });
 
       const results = await Promise.allSettled([
         ...neteasePromises,

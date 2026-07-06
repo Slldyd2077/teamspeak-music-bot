@@ -268,7 +268,7 @@ async function doSearch() {
   activeTab.value = 'songs';
   router.replace({ query: { q: query.value } });
   try {
-    const res = await axios.get('/api/music/search/all', { params: { q: query.value } });
+    const res = await axios.get('/api/music/search/all', { params: { q: query.value, botId: store.activeBotId ?? undefined } });
     allSongs.value = res.data.songs ?? [];
     allAlbums.value = res.data.albums ?? [];
     allPlaylists.value = res.data.playlists ?? [];
