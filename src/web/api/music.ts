@@ -224,6 +224,33 @@ export function createMusicRouter(
     }
   });
 
+  // Resolve a song's direct audio URL (SongUrlResult) without playing it on the
+  // bot. External consumers (e.g. S-Live vtuber BGM) fetch the stream themselves;
+  // the TS-channel playback path is untouched. Auth/CSRF come from the /api
+  // middleware chain like every other route; local-audio gating mirrors /song/:id.
+  router.get("/url/:id", async (req, res) => {
+    try {
+      if (req.query.platform === "local" && !isLocalAudioEnabled()) {
+        res.status(403).json({ error: "本地音频播放已关闭" });
+        return;
+      }
+      const bot = resolveBot(req, res);
+      if (!bot) return;
+      const provider = providerFor(bot, req.query.platform as string);
+      const result = await provider.getSongUrl(
+        req.params.id,
+        typeof req.query.quality === "string" ? req.query.quality : undefined,
+      );
+      if (!result || !result.url) {
+        res.status(404).json({ error: "Song URL not available" });
+        return;
+      }
+      res.json(result);
+    } catch (err) {
+      res.status(500).json({ error: (err as Error).message });
+    }
+  });
+
   router.get("/lyrics/:id", async (req, res) => {
     try {
       const bot = resolveBot(req, res);
