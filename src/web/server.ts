@@ -119,7 +119,7 @@ export function createWebServer(options: WebServerOptions): WebServer {
   );
   app.use(
     "/api/music",
-    createMusicRouter(options.botManager, logger, options.config)
+    createMusicRouter(options.botManager, logger, options.config, options.database)
   );
   app.use("/api/player", createPlayerRouter(
     options.botManager, logger, options.database,

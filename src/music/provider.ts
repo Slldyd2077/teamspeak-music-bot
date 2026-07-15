@@ -69,6 +69,10 @@ export interface AuthStatus {
   loggedIn: boolean;
   nickname?: string;
   avatarUrl?: string;
+  /** Whether the provider has verified an active paid music membership. */
+  vip?: boolean;
+  /** Provider-reported membership expiry timestamp in milliseconds. */
+  vipExpiresAt?: number;
 }
 
 export interface MusicProvider {

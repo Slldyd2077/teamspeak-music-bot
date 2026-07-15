@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { mapQqAlbums, mapQqSongs, parseQqTrial } from "./qq.js";
+import { mapQqAlbums, mapQqSongs, parseQqTrial, parseQqVipInfo } from "./qq.js";
 
 describe("QQ adapter", () => {
   it("mapQqSongs maps QQMusicApi-style song entries", () => {
@@ -51,6 +51,15 @@ describe("QQ adapter", () => {
     expect(parseQqTrial({ isTryout: 1, tryBegin: 0, tryEnd: 30000 })).toBe(30);
     // 异常
     expect(parseQqTrial({ isTryout: 1, tryEnd: 0 })).toBeUndefined();
+  });
+
+  it("parseQqVipInfo accepts only QQ's active membership flags", () => {
+    expect(parseQqVipInfo({ iVipFlag: 0, iSuperVip: 0, ieight: 0, itwelve: 0 })).toEqual({ vip: false });
+    expect(parseQqVipInfo({ iVipFlag: 1, sOverDateTime: "2030-03-04 00:00:00" })).toMatchObject({
+      vip: true,
+      vipExpiresAt: expect.any(Number),
+    });
+    expect(parseQqVipInfo({ HugeVip: 1 })).toEqual({ vip: true });
   });
 
   it("mapQqAlbums maps albumMID-style raw entries", () => {

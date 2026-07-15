@@ -993,6 +993,9 @@ export class KugouProvider implements MusicProvider {
         if (data.data.token) this.cookie.token = String(data.data.token);
         if (data.data.userid) this.cookie.userid = String(data.data.userid);
         if (data.data.nickname) this.cookie.nickname = String(data.data.nickname);
+        if (data.data.vip_type != null) this.cookie.vip_type = String(data.data.vip_type);
+        if (data.data.vip_end_time != null) this.cookie.vip_end_time = String(data.data.vip_end_time);
+        if (data.data.vip_expire_time != null) this.cookie.vip_expire_time = String(data.data.vip_expire_time);
         return "confirmed";
       }
       if (status === 2) return "scanned";
@@ -1005,11 +1008,17 @@ export class KugouProvider implements MusicProvider {
 
   async getAuthStatus(): Promise<AuthStatus> {
     if (!this.cookie.token || !this.cookie.userid || this.cookie.userid === "0") {
-      return { loggedIn: false };
+      return { loggedIn: false, vip: false };
     }
+    const rawExpiry = Number(this.cookie.vip_end_time || this.cookie.vip_expire_time || 0);
+    const vipExpiresAt = rawExpiry > 0 && rawExpiry < 10_000_000_000 ? rawExpiry * 1000 : rawExpiry;
+    const hasVipType = Number(this.cookie.vip_type || 0) > 0;
+    const vip = hasVipType && (vipExpiresAt <= 0 || vipExpiresAt > Date.now());
     return {
       loggedIn: true,
       nickname: this.safeNickname(),
+      vip,
+      ...(vipExpiresAt > 0 ? { vipExpiresAt } : {}),
     };
   }
 

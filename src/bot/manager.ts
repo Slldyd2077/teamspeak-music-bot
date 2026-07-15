@@ -135,6 +135,11 @@ export class BotManager extends EventEmitter {
       const cookie = this.cookieStore.load(botId, platform);
       if (cookie) provider.setCookie(cookie);
     }
+    const savedQuality = this.database.getMusicQuality(botId);
+    for (const provider of [neteaseProvider, qqProvider, bilibiliProvider, kugouProvider]) {
+      const quality = savedQuality[provider.platform];
+      if (quality) provider.setQuality(quality);
+    }
     return {
       neteaseProvider,
       qqProvider,

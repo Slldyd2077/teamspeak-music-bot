@@ -151,6 +151,32 @@ describe("database", () => {
     botDb.setCustomAvatarPath("bot-1", null);
     expect(botDb.getCustomAvatarPath("bot-1")).toBeNull();
   });
+
+  it("persists per-bot, per-platform music quality", () => {
+    botDb.saveBotInstance({
+      id: "bot-quality",
+      name: "B",
+      serverAddress: "x",
+      serverPort: 9987,
+      nickname: "n",
+      defaultChannel: "",
+      channelId: "",
+      channelPassword: "",
+      autoStart: false,
+      serverProtocol: "",
+      ts6ApiKey: "",
+      serverPassword: "",
+    });
+
+    botDb.saveMusicQuality("bot-quality", "netease", "lossless");
+    botDb.saveMusicQuality("bot-quality", "qq", "320");
+    botDb.saveMusicQuality("bot-quality", "netease", "hires");
+
+    expect(botDb.getMusicQuality("bot-quality")).toEqual({
+      netease: "hires",
+      qq: "320",
+    });
+  });
 });
 
 describe("guest principal migration", () => {

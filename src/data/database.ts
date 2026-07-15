@@ -76,6 +76,8 @@ export interface BotDatabase {
   saveProfileConfig(botId: string, config: ProfileConfig): void;
   getCustomAvatarPath(botId: string): string | null;
   setCustomAvatarPath(botId: string, path: string | null): void;
+  getMusicQuality(botId: string): Record<string, string>;
+  saveMusicQuality(botId: string, platform: string, quality: string): void;
   addFavorite(userId: string, playlist: { platform: string; playlistId: string; name: string; coverUrl: string; songCount: number }): void;
   removeFavorite(userId: string, playlistId: string, platform: string): boolean;
   getFavorites(userId: string): FavoritePlaylist[];
@@ -215,6 +217,15 @@ function initTables(db: Database.Database): void {
       FOREIGN KEY (userId) REFERENCES users(id) ON DELETE CASCADE
     );
     CREATE INDEX IF NOT EXISTS idx_user_bot_access_userId ON user_bot_access(userId);
+
+    CREATE TABLE IF NOT EXISTS bot_music_quality (
+      botId TEXT NOT NULL,
+      platform TEXT NOT NULL,
+      quality TEXT NOT NULL,
+      updatedAt TEXT NOT NULL DEFAULT (datetime('now')),
+      PRIMARY KEY (botId, platform),
+      FOREIGN KEY (botId) REFERENCES bot_instances(id) ON DELETE CASCADE
+    );
   `);
 }
 
@@ -315,6 +326,14 @@ export function createDatabase(dbPath: string): BotDatabase {
 
   const selectCustomAvatar = db.prepare(`SELECT custom_avatar_path FROM bot_instances WHERE id = ?`);
   const updateCustomAvatar = db.prepare(`UPDATE bot_instances SET custom_avatar_path = ? WHERE id = ?`);
+  const selectMusicQuality = db.prepare(`SELECT platform, quality FROM bot_music_quality WHERE botId = ?`);
+  const upsertMusicQuality = db.prepare(`
+    INSERT INTO bot_music_quality (botId, platform, quality, updatedAt)
+    VALUES (?, ?, ?, datetime('now'))
+    ON CONFLICT(botId, platform) DO UPDATE SET
+      quality = excluded.quality,
+      updatedAt = excluded.updatedAt
+  `);
 
   const insertFavorite = db.prepare(`
     INSERT INTO favorite_playlists (userId, platform, playlistId, name, coverUrl, songCount)
@@ -404,6 +423,15 @@ export function createDatabase(dbPath: string): BotDatabase {
     },
     setCustomAvatarPath(botId, path) {
       updateCustomAvatar.run(path, botId);
+    },
+
+    getMusicQuality(botId) {
+      const rows = selectMusicQuality.all(botId) as Array<{ platform: string; quality: string }>;
+      return Object.fromEntries(rows.map((row) => [row.platform, row.quality]));
+    },
+
+    saveMusicQuality(botId, platform, quality) {
+      upsertMusicQuality.run(botId, platform, quality);
     },
 
     addFavorite(userId, playlist) {

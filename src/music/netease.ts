@@ -284,23 +284,37 @@ export class NeteaseProvider implements MusicProvider {
   }
 
   async getAuthStatus(): Promise<AuthStatus> {
-    if (!this.cookie) return { loggedIn: false };
+    if (!this.cookie) return { loggedIn: false, vip: false };
     try {
-      const res = await this.api.get("/login/status", {
-        params: { ...this.cookieParams },
-      });
-      const profile = res.data?.data?.profile;
+      const [statusResult, vipResult] = await Promise.allSettled([
+        this.api.get("/login/status", { params: { ...this.cookieParams } }),
+        this.api.get("/vip/info", { params: { ...this.cookieParams } }),
+      ]);
+      const profile = statusResult.status === "fulfilled"
+        ? statusResult.value.data?.data?.profile
+        : null;
       if (profile) {
+        const vipData = vipResult.status === "fulfilled" ? vipResult.value.data?.data : null;
+        const expiresAt = vipData && typeof vipData === "object"
+          ? Math.max(
+              0,
+              ...Object.values(vipData)
+                .filter((item): item is Record<string, unknown> => !!item && typeof item === "object")
+                .map((item) => Number(item.expireTime) || 0),
+            )
+          : 0;
         return {
           loggedIn: true,
           nickname: profile.nickname,
           avatarUrl: profile.avatarUrl,
+          vip: expiresAt > Date.now(),
+          ...(expiresAt > 0 ? { vipExpiresAt: expiresAt } : {}),
         };
       }
     } catch {
       // ignore
     }
-    return { loggedIn: false };
+    return { loggedIn: false, vip: false };
   }
 
   async getPersonalFm(): Promise<Song[]> {

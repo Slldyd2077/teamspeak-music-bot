@@ -5,6 +5,13 @@ import type { BotManager } from "../../bot/manager.js";
 import type { BotInstance } from "../../bot/instance.js";
 import type { Logger } from "../../logger.js";
 import type { BotConfig } from "../../data/config.js";
+import type { BotDatabase } from "../../data/database.js";
+import {
+  isQualityPlatform,
+  qualityRequiresVip,
+  validateQuality,
+  type QualityPlatform,
+} from "../../music/quality.js";
 import { requirePermission } from "../middleware/requirePermission.js";
 import { requireNotGuest } from "../middleware/requireNotGuest.js";
 import { authorize } from "../middleware/authorize.js";
@@ -21,6 +28,7 @@ export function createMusicRouter(
   botManager: BotManager,
   logger: Logger,
   config?: BotConfig,
+  database?: BotDatabase,
 ): Router {
   const router = Router();
 
@@ -370,7 +378,7 @@ export function createMusicRouter(
   });
 
   // Set quality (per-bot)
-  router.post("/quality", requirePermission("quality"), (req, res) => {
+  router.post("/quality", requirePermission("quality"), async (req, res) => {
     const { quality, platform } = req.body;
     if (!quality) {
       res.status(400).json({ error: "quality is required" });
@@ -378,20 +386,27 @@ export function createMusicRouter(
     }
     const bot = resolveBot(req, res);
     if (!bot) return;
-    if (!platform || platform === "netease") {
-      bot.getProviderFor("netease").setQuality(quality);
+    if (!isQualityPlatform(platform)) {
+      res.status(400).json({ error: "supported platform is required" });
+      return;
     }
-    if (!platform || platform === "qq") {
-      bot.getProviderFor("qq").setQuality(quality);
+    const normalized = validateQuality(platform, quality);
+    if (!normalized) {
+      res.status(400).json({ error: `unsupported quality for ${platform}` });
+      return;
     }
-    if (!platform || platform === "bilibili") {
-      bot.getProviderFor("bilibili").setQuality(quality);
+    const provider = bot.getProviderFor(platform);
+    if (qualityRequiresVip(platform, normalized)) {
+      const status = await provider.getAuthStatus();
+      if (!status.loggedIn || status.vip !== true) {
+        res.status(403).json({ error: "该音质需要已验证且有效的 VIP 会员" });
+        return;
+      }
     }
-    if (!platform || platform === "kugou") {
-      bot.getProviderFor("kugou").setQuality(quality);
-    }
-    logger.info({ quality, platform, botId: bot.id }, "Audio quality changed");
-    res.json({ success: true, quality });
+    provider.setQuality(normalized);
+    database?.saveMusicQuality(bot.id, platform as QualityPlatform, normalized);
+    logger.info({ quality: normalized, platform, botId: bot.id }, "Audio quality changed");
+    res.json({ success: true, quality: normalized, platform });
   });
 
   return router;

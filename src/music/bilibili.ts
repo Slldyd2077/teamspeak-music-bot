@@ -314,7 +314,7 @@ export class BiliBiliProvider implements MusicProvider {
   // --- Auth Status ---
 
   async getAuthStatus(): Promise<AuthStatus> {
-    if (!this.cookie) return { loggedIn: false };
+    if (!this.cookie) return { loggedIn: false, vip: false };
     try {
       const res = await this.api.get("/x/web-interface/nav", {
         headers: this.cookieHeaders,
@@ -325,12 +325,16 @@ export class BiliBiliProvider implements MusicProvider {
           loggedIn: true,
           nickname: data.uname,
           avatarUrl: data.face,
+          vip: data.vipStatus === 1 && Number(data.vipDueDate || 0) > Date.now(),
+          ...(Number(data.vipDueDate || 0) > 0
+            ? { vipExpiresAt: Number(data.vipDueDate) }
+            : {}),
         };
       }
     } catch {
       // ignore
     }
-    return { loggedIn: false };
+    return { loggedIn: false, vip: false };
   }
 
   /**

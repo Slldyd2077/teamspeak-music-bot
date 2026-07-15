@@ -71,6 +71,24 @@ export function parseQqTrial(playUrl: any): number | undefined {
   return Math.round(secs);
 }
 
+export function parseQqVipInfo(raw: any): { vip: boolean; vipExpiresAt?: number } {
+  if (!raw || typeof raw !== "object") return { vip: false };
+  // These are the exact active-membership flags used by QQ Music's current
+  // web client (userInfo.VipQueryServer / SRFVipQuery_V2).
+  const vip = [raw.iVipFlag, raw.iSuperVip, raw.ieight, raw.itwelve, raw.HugeVip]
+    .some((value) => Number(value) === 1);
+  const expiresAt = Math.max(
+    0,
+    ...[raw.sOverDateTime, raw.superEndTime, raw.eightEndTime, raw.twelveEndTime, raw.HugeVipEnd]
+      .map((value) => typeof value === "string" ? Date.parse(value) : 0)
+      .filter(Number.isFinite),
+  );
+  return {
+    vip,
+    ...(expiresAt > 0 ? { vipExpiresAt: expiresAt } : {}),
+  };
+}
+
 export function mapQqAlbums(raw: any[] | null | undefined): Album[] {
   if (!Array.isArray(raw)) return [];
   return raw.map((a) => {
@@ -354,8 +372,18 @@ export class QQMusicProvider implements MusicProvider {
         };
       }
     } catch {
-      // fall through to stub
+      // fall through to musicu.fcg fallback
     }
+
+    // Fallback: fetch metadata via u.y.qq.com/cgi-bin/musicu.fcg. The bundled
+    // library's /getSongInfo route is broken (upstream code 500001), so the
+    // primary try above almost always falls through here for QQ. Without this,
+    // play-by-id songs carry an empty name → the TS nickname / now-playing
+    // message renders as "♪ 正在播放:  -  []". This endpoint (same host/shape
+    // as search) reliably returns full track_info without requiring login.
+    const detail = await this.fetchSongDetailViaMusicu(songId);
+    if (detail) return detail;
+
     // Minimal stub — resolveAndPlay only needs id + platform to fetch a
     // play URL. Name/artist/album will be empty in play history, but the
     // song will actually play, which is the important part.
@@ -368,6 +396,42 @@ export class QQMusicProvider implements MusicProvider {
       coverUrl: "",
       platform: "qq",
     };
+  }
+
+  /** Fetch a single song's metadata via u.y.qq.com/cgi-bin/musicu.fcg
+   * (module music.pf_song_detail_svr / get_song_detail_yqq). This mirrors the
+   * search path's host + request shape and, unlike the library's /getSongInfo,
+   * actually works against QQ's current API. Returns null on any failure so the
+   * caller can fall back to the minimal stub. */
+  private async fetchSongDetailViaMusicu(songId: string): Promise<Song | null> {
+    try {
+      const reqData = JSON.stringify({
+        req_0: {
+          module: "music.pf_song_detail_svr",
+          method: "get_song_detail_yqq",
+          param: { song_mid: songId, song_type: 0 },
+        },
+      });
+      const res = await qqMusicuApi.get("/cgi-bin/musicu.fcg", {
+        params: { format: "json", data: reqData },
+      });
+      const t = res.data?.req_0?.data?.track_info;
+      if (!t) return null;
+      const albumMid = t.album?.mid ?? t.album?.pmid ?? "";
+      return {
+        id: String(t.mid ?? t.id ?? songId),
+        name: t.name ?? t.title ?? "",
+        artist: (t.singer ?? []).map((a: any) => a.name ?? a.title ?? "").filter(Boolean).join(" / "),
+        album: t.album?.name ?? t.album?.title ?? "",
+        duration: t.interval ?? 0,
+        coverUrl: albumMid
+          ? `https://y.gtimg.cn/music/photo_new/T002R300x300M000${albumMid}.jpg`
+          : "",
+        platform: "qq",
+      };
+    } catch {
+      return null;
+    }
   }
 
   async getPlaylistSongs(playlistId: string): Promise<Song[]> {
@@ -486,7 +550,7 @@ export class QQMusicProvider implements MusicProvider {
   }
 
   async getAuthStatus(): Promise<AuthStatus> {
-    if (!this.cookie) return { loggedIn: false };
+    if (!this.cookie) return { loggedIn: false, vip: false };
     // /getUserAvatar in @sansenjian/qq-music-api 2.x is NOT registered on
     // the main router; the real endpoint is /user/getUserAvatar, and even
     // that just builds a static URL from a uin without validating the
@@ -500,19 +564,36 @@ export class QQMusicProvider implements MusicProvider {
     // is why the regex anchors on a word boundary).
     const uinMatch = /(?:^|; )uin=o?0?(\d+)/.exec(this.cookie);
     const uin = uinMatch ? uinMatch[1] : "";
-    if (!uin) return { loggedIn: false };
+    if (!uin) return { loggedIn: false, vip: false };
     try {
       const res = await this.api.get("/user/getUserPlaylists", {
         params: { uin, ...this.cookieParams },
       });
-      if (res.data?.response?.code !== 0) return { loggedIn: false };
+      if (res.data?.response?.code !== 0) return { loggedIn: false, vip: false };
+      let membership: { vip: boolean; vipExpiresAt?: number } = { vip: false };
+      try {
+        const vipRes = await qqMusicuApi.get("/cgi-bin/musicu.fcg", {
+          params: {
+            data: JSON.stringify(this.buildMusicuPayload(
+              "userInfo.VipQueryServer",
+              "SRFVipQuery_V2",
+              { uin_list: [uin] },
+            )),
+          },
+          headers: this.directCookieHeaders,
+        });
+        membership = parseQqVipInfo(vipRes.data?.req_0?.data?.infoMap?.[uin]);
+      } catch {
+        // Membership must be positively verified before premium quality is allowed.
+      }
       return {
         loggedIn: true,
         nickname: `QQ ${uin}`,
         avatarUrl: `https://q.qlogo.cn/headimg_dl?dst_uin=${uin}&spec=100`,
+        ...membership,
       };
     } catch {
-      return { loggedIn: false };
+      return { loggedIn: false, vip: false };
     }
   }
 
