@@ -85,6 +85,36 @@ export function createPlayerRouter(
     }
   });
 
+  // Pull a short-lived HTTP stream produced by an explicitly authorized
+  // browser capture session. FFmpeg already handles the WebM/Opus stream and
+  // normalizes it to the player's 48 kHz stereo PCM pipeline.
+  router.post("/:botId/live", authorize({ capability: "player.control" }), async (req, res) => {
+    try {
+      const bot = (req as any).bot;
+      const { url, title } = req.body ?? {};
+      if (typeof url !== "string" || !/^https?:\/\/[^\s]+$/i.test(url)) {
+        res.status(400).json({ error: "A valid http(s) live stream URL is required" });
+        return;
+      }
+      if (!bot.isConnected()) {
+        res.status(409).json({ error: "Bot is not connected" });
+        return;
+      }
+
+      await bot.runExclusive(async () => {
+        bot.getPlayer().stop();
+        bot.getQueueManager().clear();
+        bot.getPlayer().resetFailures();
+        bot.getPlayer().play(url);
+        bot.emit("stateChange");
+      });
+      res.json({ ok: true, live: true, title: title || "Live audio" });
+    } catch (err) {
+      logger.error({ err }, "Live audio start failed");
+      res.status(500).json({ error: (err as Error).message });
+    }
+  });
+
   const simpleCommand = (cmdStr: string) => async (req: any, res: any) => {
     try {
       const bot = req.bot;
