@@ -1,0 +1,52 @@
+# ==========================================
+# TSMusicBot Docker Image — 本地验证版（alpine）
+# 复用本地已有的 node:22-alpine，避开 Docker Hub 拉取基础镜像超时。
+# ==========================================
+
+# --- Stage 1: Build backend + frontend ---
+FROM node:22-alpine AS builder
+
+# alpine 用 apk 装编译工具链（opus / better-sqlite3 原生模块需要）
+RUN apk add --no-cache python3 make g++ build-base linux-headers
+
+WORKDIR /app
+
+# Install backend dependencies
+# --ignore-scripts 跳过 ffmpeg-static 的二进制下载（容器内连 127.0.0.1:443 失败，
+# 且 Stage2 已装系统 ffmpeg）；opus / better-sqlite3 有 build 工具，单独 rebuild 本地编译
+COPY package*.json ./
+RUN npm ci --ignore-scripts && npm rebuild @discordjs/opus better-sqlite3
+
+# Install frontend dependencies
+COPY web/package*.json ./web/
+RUN cd web && npm ci
+
+# Copy source and build
+COPY . .
+RUN npm run build
+
+# Install production dependencies (with native addons compiled) in the builder
+RUN rm -rf node_modules && npm ci --production --ignore-scripts && npm rebuild @discordjs/opus better-sqlite3 && npm cache clean --force
+
+# --- Stage 2: Production image ---
+FROM node:22-alpine
+
+# System FFmpeg（ffmpeg-static npm 包的预编译二进制在容器里可能 SIGSEGV，用系统的更稳）
+RUN apk add --no-cache ffmpeg
+
+WORKDIR /app
+
+COPY --from=builder /app/dist ./dist
+COPY --from=builder /app/web/dist ./web/dist
+COPY --from=builder /app/package*.json ./
+COPY --from=builder /app/node_modules ./node_modules
+
+RUN mkdir -p /app/data
+VOLUME ["/app/data"]
+
+EXPOSE 3000
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s \
+    CMD node -e "fetch('http://localhost:3000/api/health').then(r=>r.ok?process.exit(0):process.exit(1)).catch(()=>process.exit(1))"
+
+CMD ["node", "dist/index.js"]

@@ -1,0 +1,15 @@
+# 本地验证用：本地 build（含收藏夹改动）+ 端口映射（Windows 不支持 host 网络）。
+# fork 容器连宿主 TS3 时，bot 的 server address 填 host.docker.internal（Docker Desktop 自动注入）。
+services:
+  tsmusicbot:
+    build:
+      context: .
+      dockerfile: scripts/docker/Dockerfile.local
+    container_name: tsmusicbot-local
+    ports:
+      - "3000:3000"           # WebUI（PowerfulTS 代理连 http://localhost:3000）
+    volumes:
+      - ./data:/app/data      # 配置/数据库/cookie 持久化到宿主，方便查看与重用
+    environment:
+      - NODE_ENV=production
+    restart: unless-stopped
