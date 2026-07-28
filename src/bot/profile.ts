@@ -8,6 +8,8 @@ import type { QueuedSong } from "../audio/queue.js";
 import type { Logger } from "../logger.js";
 
 const TS3_NICKNAME_MAX = 30;
+/** Shown in the bot's nickname while a browser is on the channel voice link. */
+const WEB_VOICE_MARKER = "<WEB通讯> ";
 /** TS3 avatar max size — server default is ~300 KB. Use 200 KB to be safe. */
 const AVATAR_MAX_BYTES = 200 * 1024;
 /** Timeout for file-transfer operations (upload / delete). */
@@ -26,6 +28,8 @@ export class BotProfileManager {
   private config: ProfileConfig;
   private defaultNickname: string;
   private customAvatar: Buffer | null = null;
+  /** True while at least one browser is subscribed to this bot's voice downlink. */
+  private webVoiceActive = false;
   /**
    * Tracks the last song handed to onSongChange. null means stopped/idle.
    * Used by setCustomAvatar to decide whether the new buffer should be
@@ -64,6 +68,23 @@ export class BotProfileManager {
   }
 
   // --- Public API ---
+
+  /**
+   * Mark the bot as carrying a browser voice call, so people in the channel
+   * can tell the sound is a web user rather than the music player.
+   *
+   * Unlike the now-playing nickname this is not decoration, so it applies even
+   * when `nicknameEnabled` is off — it is the only cue that someone is
+   * listening/speaking through the bot.
+   */
+  async setWebVoiceActive(active: boolean): Promise<void> {
+    if (this.webVoiceActive === active) return;
+    this.webVoiceActive = active;
+    // forceNickname matters on the way *out*: with nicknameEnabled off and the
+    // marker just cleared, nothing else would ask for a nickname write and the
+    // bot would sit there tagged <WEB通讯> forever.
+    await this.updateClientProperties(this.currentSong, { forceNickname: true });
+  }
 
   /**
    * Set/clear the persistent idle avatar. Pass null to remove.
@@ -284,24 +305,29 @@ export class BotProfileManager {
    * JSON body, so TS6 received literal backslashes and silently
    * rejected the update.
    */
-  private async updateClientProperties(song: QueuedSong | null): Promise<void> {
+  private async updateClientProperties(
+    song: QueuedSong | null,
+    options: { forceNickname?: boolean } = {},
+  ): Promise<void> {
     const rawProps: Record<string, string | number> = {};
 
     // --- Nickname ---
-    if (this.config.nicknameEnabled && !this.permDenied.nickname) {
-      if (!song) {
-        rawProps.client_nickname = this.defaultNickname;
-      } else {
-        const nickname = this.buildNickname(song);
-        if (nickname) {
-          rawProps.client_nickname = nickname;
-        }
+    // The web-voice marker has to drive this too, otherwise turning it on or off
+    // would never reach TeamSpeak on bots that keep nicknameEnabled off.
+    const wantNickname = this.config.nicknameEnabled || this.webVoiceActive || options.forceNickname;
+    if (wantNickname && !this.permDenied.nickname) {
+      const nickname = this.renderNickname(song);
+      if (nickname) {
+        rawProps.client_nickname = nickname;
       }
     }
 
     // --- Away status ---
     if (this.config.awayStatusEnabled && !this.permDenied.awayStatus) {
-      if (song) {
+      // A browser call keeps the bot busy without going through the queue:
+      // /api/player/:botId/live drives the player directly, so `song` stays null
+      // and the bot used to sit there flagged AFK "\u7B49\u5F85\u64AD\u653E" for the whole call.
+      if (song || this.webVoiceActive) {
         rawProps.client_away = 0;
       } else {
         rawProps.client_away = 1;
@@ -342,24 +368,43 @@ export class BotProfileManager {
   }
 
   /**
-   * Build a nickname string that fits within TS3_NICKNAME_MAX.
-   * Uses UTF-8 byte length for the limit since TS3 counts bytes,
-   * not characters.
+   * Full nickname for the current state: the web-voice marker (when active) in
+   * front of the now-playing or plain name.
+   *
+   * The marker costs 12 of the 30 bytes, so the base name is built inside what
+   * is left rather than joined and trimmed afterwards, which could slice the
+   * marker itself in half.
    */
-  private buildNickname(song: QueuedSong): string | null {
+  private renderNickname(song: QueuedSong | null): string | null {
+    const marker = this.webVoiceActive ? WEB_VOICE_MARKER : "";
+    const budget = TS3_NICKNAME_MAX - Buffer.byteLength(marker, "utf8");
+    if (budget <= 0) return null;
+
+    const decorated = song && this.config.nicknameEnabled
+      ? this.buildNickname(song, budget)
+      : null;
+    // buildNickname returns null when the decoration alone busts the budget;
+    // fall back to the plain name so the marker still shows.
+    return marker + (decorated ?? this.truncateUtf8(this.defaultNickname, budget));
+  }
+
+  private buildNickname(song: QueuedSong, maxBytes: number): string | null {
     const songInfo = `${song.name} - ${song.artist}`;
     const prefix = "\u266A "; // ♪
     const sep = " - ";
     const suffix = `${sep}${this.defaultNickname}`;
 
     const overheadBytes = Buffer.byteLength(prefix, "utf8") + Buffer.byteLength(suffix, "utf8");
-    if (overheadBytes >= TS3_NICKNAME_MAX) {
+    if (overheadBytes >= maxBytes) {
       // Default nickname alone is too long with decoration — skip
       return null;
     }
 
-    const maxSongBytes = TS3_NICKNAME_MAX - overheadBytes;
+    const maxSongBytes = maxBytes - overheadBytes;
     const truncated = this.truncateUtf8(songInfo, maxSongBytes);
+    // Nothing of the title survived the budget (happens once the web-voice
+    // marker is also in play) — let the caller fall back to the plain name.
+    if (!truncated) return null;
     return `${prefix}${truncated}${suffix}`;
   }
 
@@ -369,11 +414,15 @@ export class BotProfileManager {
    * into account. Never splits a multi-byte character.
    */
   private truncateUtf8(str: string, maxBytes: number): string {
+    // Must never hand back more than maxBytes: this used to return the 3-byte
+    // ellipsis for any budget, which pushed the nickname past the TS3 limit
+    // once the web-voice marker took a bite out of it.
+    if (maxBytes <= 0) return "";
     if (Buffer.byteLength(str, "utf8") <= maxBytes) return str;
     const ellipsis = "\u2026"; // …
     const ellipsisBytes = Buffer.byteLength(ellipsis, "utf8"); // 3
     const target = maxBytes - ellipsisBytes;
-    if (target <= 0) return ellipsis;
+    if (target <= 0) return maxBytes >= ellipsisBytes ? ellipsis : "";
     // Walk characters, accumulating byte length
     let byteLen = 0;
     let end = 0;

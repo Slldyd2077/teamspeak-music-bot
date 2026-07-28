@@ -3,6 +3,7 @@ import {
   TS3Client,
   type TS3ClientOptions,
   type TS3TextMessage,
+  type TS3VoiceFrame,
 } from "../ts-protocol/client.js";
 import { AudioPlayer } from "../audio/player.js";
 import { PlayQueue, PlayMode, type QueuedSong } from "../audio/queue.js";
@@ -54,6 +55,10 @@ export interface BotStatus {
   volume: number;
   playMode: PlayMode;
   elapsed: number; // ground truth elapsed seconds from frame count
+  /** Live TeamSpeak client id (0 when disconnected). Lets callers locate this
+   *  bot in a ServerQuery clientlist without matching on a nickname that
+   *  changes with the current song / web-voice marker. */
+  clientId: number;
   /** 当前曲实际播放时长（秒）。试听片段=试听秒数；完整曲=duration。缺失时前端回退 currentSong.duration。 */
   effectiveDuration?: number;
 }
@@ -189,6 +194,10 @@ export class BotInstance extends EventEmitter {
   }
 
   private setupTsEvents(): void {
+    this.tsClient.on("voiceFrame", (frame: TS3VoiceFrame) => {
+      this.emit("voiceFrame", frame);
+    });
+
     this.tsClient.on("textMessage", (msg: TS3TextMessage) => {
       this.handleTextMessage(msg).catch((err) => {
         this.logger.error({ err }, "Unhandled error in text message handler");
@@ -1203,7 +1212,18 @@ export class BotInstance extends EventEmitter {
       playMode: this.queue.getMode(),
       elapsed: this.player.getElapsed(),
       effectiveDuration: this.effectiveDuration,
+      clientId: this.tsClient.getClientId(),
     };
+  }
+
+  /** Move this bot into a channel, surfacing wrong-password/permission errors. */
+  async joinChannelById(cid: number, password?: string): Promise<void> {
+    await this.tsClient.joinChannelById(cid, password);
+  }
+
+  /** Show/hide the `<WEB通讯>` nickname marker while a browser is on the voice link. */
+  async setWebVoiceActive(active: boolean): Promise<void> {
+    await this.profileManager.setWebVoiceActive(active);
   }
 
   getQueue(): QueuedSong[] {

@@ -16,6 +16,7 @@ import {
   type ClientLeftViewEvent,
   type ClientMovedEvent,
   type FileUploadInfo,
+  type VoiceData,
 } from "@honeybbq/teamspeak-client";
 import type { Logger } from "../logger.js";
 import {
@@ -63,6 +64,13 @@ export interface TS3TextMessage {
   message: string;
   targetMode: number; // 1=private, 2=channel, 3=server
   invokerGroups: string[]; // sender's TS server-group ids; [] when not in view cache
+}
+
+/** One raw Opus packet received from another TeamSpeak client. */
+export interface TS3VoiceFrame {
+  clientId: number;
+  codec: number;
+  data: Buffer;
 }
 
 /**
@@ -225,6 +233,19 @@ export class TS3Client extends EventEmitter {
       this.emit("textMessage", toTS3TextMessage(msg));
     });
 
+    this.client.on("voiceData", (voice: VoiceData) => {
+      // teamspeak-client already suppresses our own packets. Keep this guard
+      // as defense-in-depth and copy the subarray before the UDP packet can be
+      // released by the protocol layer.
+      if (voice.clientId === this.clientId) return;
+      const frame: TS3VoiceFrame = {
+        clientId: voice.clientId,
+        codec: voice.codec,
+        data: Buffer.from(voice.data),
+      };
+      this.emit("voiceFrame", frame);
+    });
+
     this.client.on("disconnected", (err) => {
       this.logger.warn({ err: err?.message }, "Connection closed");
       this.clientId = 0;
@@ -278,6 +299,20 @@ export class TS3Client extends EventEmitter {
     }
 
     this.emit("connected");
+  }
+
+  /**
+   * Join a channel by id and let failures propagate.
+   *
+   * joinChannel() logs and swallows because it backs a chat command with nobody
+   * to report back to. The web API needs the error so it can tell the user the
+   * channel password was wrong — and moving as this client (rather than via a
+   * ServerQuery admin) is what makes the server check the password at all.
+   */
+  async joinChannelById(cid: number, password?: string): Promise<void> {
+    if (!this.client) throw new Error("not connected to TeamSpeak");
+    await clientMove(this.client, this.clientId, BigInt(cid), password);
+    this.logger.info({ cid }, "Joined channel by id");
   }
 
   async joinChannel(channelName: string, password?: string): Promise<void> {

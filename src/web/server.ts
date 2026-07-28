@@ -19,6 +19,7 @@ import { createAuditStore } from "../data/audit.js";
 import { createAuditRouter } from "./api/audit.js";
 import { createFavoritesRouter } from "./api/favorites.js";
 import { setupWebSocket } from "./websocket.js";
+import { setupVoiceDownlink } from "./voice-downlink.js";
 import { createUserStore } from "../data/users.js";
 import { createSessionStore } from "../data/sessions.js";
 import { createPermissionStore } from "../data/permissions.js";
@@ -148,11 +149,17 @@ export function createWebServer(options: WebServerOptions): WebServer {
 
   // ─── WebSocket with manual upgrade auth ────────────────────────────────
   const wss = new WebSocketServer({ noServer: true });
+  const voiceWss = new WebSocketServer({ noServer: true });
   wss.on("error", (err) => {
     logger.error({ err }, "WebSocket server error");
   });
+  voiceWss.on("error", (err) => {
+    logger.error({ err }, "Voice WebSocket server error");
+  });
   server.on("upgrade", (req, socket, head) => {
-    if (req.url !== "/ws") {
+    const pathname = new URL(req.url ?? "/", "http://localhost").pathname;
+    const voiceMatch = /^\/api\/voice\/downlink\/([0-9a-fA-F-]{1,64})$/.exec(pathname);
+    if (pathname !== "/ws" && !voiceMatch) {
       socket.destroy();
       return;
     }
@@ -177,6 +184,18 @@ export function createWebServer(options: WebServerOptions): WebServer {
       socket.destroy();
       return;
     }
+    if (voiceMatch) {
+      if (result.role === "guest" || !options.botManager.getBot(voiceMatch[1]!)) {
+        socket.write("HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n");
+        socket.destroy();
+        return;
+      }
+      voiceWss.handleUpgrade(req, socket, head, (ws) => {
+        (ws as unknown as { voiceBotId: string }).voiceBotId = voiceMatch[1]!;
+        voiceWss.emit("connection", ws, req);
+      });
+      return;
+    }
     // Guest sessions are only valid while guest mode is enabled.
     if (result.role === "guest" && !options.config.guestMode.enabled) {
       socket.write("HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\n");
@@ -197,6 +216,7 @@ export function createWebServer(options: WebServerOptions): WebServer {
     });
   });
   const controller = setupWebSocket(wss, options.botManager, logger);
+  const voiceController = setupVoiceDownlink(voiceWss, options.botManager, logger);
   onGuestPolicyChanged = controller.refreshGuestPolicy;
 
   // ─── Session cleanup interval ──────────────────────────────────────────
@@ -224,7 +244,9 @@ export function createWebServer(options: WebServerOptions): WebServer {
         cleanupTimer = null;
       }
       controller.cleanup();
+      voiceController.cleanup();
       wss.close();
+      voiceWss.close();
       server.close();
     },
   };

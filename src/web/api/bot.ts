@@ -119,6 +119,34 @@ export function createBotRouter(
   });
 
   // Get saved config for a bot
+  // Move the bot into a channel as itself, so the server enforces the channel
+  // password. Doing this over ServerQuery instead would silently bypass it:
+  // query admins normally hold b_channel_join_ignore_password.
+  router.post("/:id/channel", requirePermission("bot.manage"), requireBotAccess("id"), async (req, res) => {
+    const bot = botManager.getBot(req.params.id);
+    if (!bot) {
+      res.status(404).json({ error: "Bot not found" });
+      return;
+    }
+    const cid = Number(req.body?.cid);
+    if (!Number.isInteger(cid) || cid <= 0) {
+      res.status(400).json({ error: "cid must be a positive integer" });
+      return;
+    }
+    const raw = req.body?.password;
+    const password = typeof raw === "string" && raw.length > 0 ? raw : undefined;
+    try {
+      await bot.joinChannelById(cid, password);
+      res.json({ success: true });
+    } catch (err) {
+      // ServerError carries the TeamSpeak error id (781 = wrong channel password).
+      const tsErrorId = Number((err as { id?: string }).id ?? 0) || null;
+      const message = (err as { serverMessage?: string }).serverMessage ?? (err as Error).message;
+      logger.warn({ err, botId: req.params.id, cid }, "Failed to join channel");
+      res.status(tsErrorId ? 409 : 500).json({ error: message, tsErrorId });
+    }
+  });
+
   router.get("/:id/config", requirePermission("bot.manage"), requireBotAccess("id"), (req, res) => {
     const saved = botManager.getBotConfig(req.params.id);
     if (!saved) {
