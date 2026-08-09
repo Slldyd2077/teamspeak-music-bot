@@ -2,7 +2,23 @@ import { describe, it, expect } from "vitest";
 import { mkdtempSync, writeFileSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { buildFfmpegArgs, shouldUsePowerShellDownload, cleanupTempDir, shouldEndOnStall, volumeToFactor } from "./player.js";
+import {
+  buildFfmpegArgs,
+  buildPlaybackDiagnostics,
+  cleanupTempDir,
+  getPlaybackBufferPolicy,
+  isNearPlaybackEnd,
+  isPcmFrameVoiced,
+  shouldEndOnStall,
+  shouldUsePowerShellDownload,
+  trimRealtimePcmBuffer,
+  volumeToFactor,
+} from "./player.js";
+import { PCM_FRAME_BYTES } from "./encoder.js";
+import {
+  createRealtimePcmIngressTelemetry,
+  updateRealtimePcmIngressTelemetry,
+} from "./realtime-voice-telemetry.js";
 
 function getHeadersArg(args: string[]): string {
   const idx = args.indexOf("-headers");
@@ -86,6 +102,100 @@ describe("buildFfmpegArgs", () => {
     expect(args).toContain("-f");
     expect(args).toContain("s16le");
     expect(args[args.length - 1]).toBe("-");
+  });
+
+  it("uses low-latency input flags for a realtime voice relay", () => {
+    const args = buildFfmpegArgs("https://example.com/live/audio", 0, { realtime: true });
+    const inputIndex = args.indexOf("-i");
+
+    for (const flag of ["-analyzeduration", "-probesize", "-fflags", "-flags"]) {
+      expect(args.indexOf(flag)).toBeGreaterThanOrEqual(0);
+      expect(args.indexOf(flag)).toBeLessThan(inputIndex);
+    }
+    expect(args[args.indexOf("-analyzeduration") + 1]).toBe("0");
+    expect(args[args.indexOf("-probesize") + 1]).toBe("32");
+    expect(args[args.indexOf("-fflags") + 1]).toBe("nobuffer");
+    expect(args[args.indexOf("-flags") + 1]).toBe("low_delay");
+  });
+
+  it("does not change the buffered media decoder defaults", () => {
+    const args = buildFfmpegArgs("https://example.com/song.mp3", 0);
+    expect(args).not.toContain("-analyzeduration");
+    expect(args).not.toContain("-fflags");
+  });
+});
+
+describe("realtime PCM freshness policy", () => {
+  it("does not treat unknown-duration realtime input as a near-end song", () => {
+    expect(isNearPlaybackEnd("realtime", 0, 0)).toBe(false);
+    expect(isNearPlaybackEnd("realtime", 0, 600)).toBe(false);
+    expect(isNearPlaybackEnd("media", 0, 0)).toBe(true);
+    expect(isNearPlaybackEnd("media", 120, 116)).toBe(true);
+    expect(isNearPlaybackEnd("media", 120, 30)).toBe(false);
+  });
+
+  it("caps live voice backlog at no more than 250ms without pausing the decoder", () => {
+    const live = getPlaybackBufferPolicy("realtime");
+    const media = getPlaybackBufferPolicy("media");
+
+    expect(live.maxBufferedMs).toBeLessThanOrEqual(250);
+    expect(live.dropOldest).toBe(true);
+    expect(live.pauseDecoder).toBe(false);
+    expect(media.dropOldest).toBe(false);
+    expect(media.pauseDecoder).toBe(true);
+  });
+
+  it("drops only the oldest complete PCM frames and retains the freshest audio", () => {
+    const frames = [1, 2, 3, 4, 5].map(value => Buffer.alloc(PCM_FRAME_BYTES, value));
+    const result = trimRealtimePcmBuffer(Buffer.concat(frames), PCM_FRAME_BYTES * 3);
+
+    expect(result.droppedBytes).toBe(PCM_FRAME_BYTES * 2);
+    expect(result.buffer.length).toBe(PCM_FRAME_BYTES * 3);
+    expect(result.buffer[0]).toBe(3);
+    expect(result.buffer[PCM_FRAME_BYTES]).toBe(4);
+    expect(result.buffer[PCM_FRAME_BYTES * 2]).toBe(5);
+  });
+
+  it("does not copy or drop audio while the realtime buffer is within budget", () => {
+    const input = Buffer.alloc(PCM_FRAME_BYTES * 2, 7);
+    const result = trimRealtimePcmBuffer(input, PCM_FRAME_BYTES * 3);
+
+    expect(result.droppedBytes).toBe(0);
+    expect(result.buffer).toBe(input);
+  });
+
+  it("reports the live buffer and discarded backlog in milliseconds", () => {
+    const ingress = updateRealtimePcmIngressTelemetry(
+      createRealtimePcmIngressTelemetry(),
+      { voiced: true, receivedAt: 1_234 },
+    ).state;
+    const diagnostics = buildPlaybackDiagnostics(
+      "realtime",
+      PCM_FRAME_BYTES * 6,
+      PCM_FRAME_BYTES * 50,
+      false,
+      ingress,
+    );
+
+    expect(diagnostics).toEqual({
+      mode: "realtime",
+      bufferedMs: 120,
+      maxBufferedMs: 240,
+      droppedMs: 1000,
+      decoderPaused: false,
+      decodedSpeechStarts: 1,
+      lastDecodedPcmAt: 1234,
+      lastDecodedSpeechStartedAt: 1234,
+    });
+  });
+
+  it("distinguishes a voiced PCM frame from transport silence", () => {
+    const silence = Buffer.alloc(PCM_FRAME_BYTES);
+    const voiced = Buffer.alloc(PCM_FRAME_BYTES);
+    voiced.writeInt16LE(900, 200);
+
+    expect(isPcmFrameVoiced(silence)).toBe(false);
+    expect(isPcmFrameVoiced(voiced)).toBe(true);
   });
 });
 
