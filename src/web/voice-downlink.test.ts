@@ -1,11 +1,15 @@
 import { EventEmitter } from "node:events";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
   encodeVoicePacket,
   opusPacketDurationSamples,
   setupVoiceDownlink,
   VOICE_PACKET_HEADER_BYTES,
 } from "./voice-downlink.js";
+
+vi.mock("ws", () => ({
+  WebSocket: { OPEN: 1 },
+}));
 
 describe("voice downlink packet format", () => {
   it("computes Opus duration from the TOC instead of hard-coding 20 ms", () => {
@@ -45,8 +49,11 @@ function fakeSocket(botId: string, sent: Buffer[]) {
   const ws = new EventEmitter() as any;
   ws.voiceBotId = botId;
   ws.readyState = 1;
+  ws.closeCalls = [] as Array<{ code?: number; reason?: string }>;
   ws.send = (data: Buffer) => sent.push(data);
-  ws.close = () => {};
+  ws.close = (code?: number, reason?: string) => {
+    ws.closeCalls.push({ code, reason });
+  };
   return ws;
 }
 
@@ -120,6 +127,82 @@ describe("voice downlink fanout", () => {
     expect(bot.webVoiceCalls).toEqual([true]);
 
     other.emit("close");
+    expect(bot.webVoiceCalls).toEqual([true, false]);
+  });
+
+  it("actively closes and detaches when the bot TS connection drops", () => {
+    const bot = fakeBot();
+    const sent: Buffer[] = [];
+    const ws = fakeSocket("bot-a", sent);
+    const wss = new EventEmitter() as any;
+    setupVoiceDownlink(
+      wss,
+      { getBot: (id: string) => (id === "bot-a" ? bot : undefined) } as any,
+      { debug() {}, warn() {} } as any,
+    );
+
+    wss.emit("connection", ws);
+    expect(bot.listenerCount("voiceFrame")).toBe(1);
+    expect(bot.listenerCount("disconnected")).toBe(1);
+
+    bot.emit("disconnected");
+
+    expect(ws.closeCalls).toHaveLength(1);
+    expect(ws.closeCalls[0].reason).toMatch(/disconnect/i);
+    expect(bot.listenerCount("voiceFrame")).toBe(0);
+    expect(bot.listenerCount("disconnected")).toBe(0);
+    expect(bot.webVoiceCalls).toEqual([true, false]);
+
+    ws.emit("close");
+    bot.emit("voiceFrame", { clientId: 7, codec: 4, data: Buffer.from([0x08]) });
+    expect(sent).toHaveLength(0);
+    expect(ws.closeCalls).toHaveLength(1);
+    expect(bot.webVoiceCalls).toEqual([true, false]);
+  });
+
+  it("keeps a healthy downlink open and forwards voice frames", () => {
+    const bot = fakeBot();
+    const sent: Buffer[] = [];
+    const ws = fakeSocket("bot-a", sent);
+    const wss = new EventEmitter() as any;
+    setupVoiceDownlink(
+      wss,
+      { getBot: (id: string) => (id === "bot-a" ? bot : undefined) } as any,
+      { debug() {}, warn() {} } as any,
+    );
+
+    wss.emit("connection", ws);
+    bot.emit("voiceFrame", { clientId: 9, codec: 5, data: Buffer.from([0x08, 0xaa]) });
+
+    expect(ws.closeCalls).toEqual([]);
+    expect(sent).toHaveLength(1);
+    expect(sent[0][0]).toBe(1);
+    expect(sent[0][1]).toBe(5);
+    expect(sent[0].readUInt16BE(2)).toBe(9);
+  });
+
+  it("closes every listener exactly once when their shared bot disconnects", () => {
+    const bot = fakeBot();
+    const sent: Buffer[] = [];
+    const first = fakeSocket("bot-a", sent);
+    const second = fakeSocket("bot-a", sent);
+    const wss = new EventEmitter() as any;
+    setupVoiceDownlink(
+      wss,
+      { getBot: (id: string) => (id === "bot-a" ? bot : undefined) } as any,
+      { debug() {}, warn() {} } as any,
+    );
+
+    wss.emit("connection", first);
+    wss.emit("connection", second);
+    expect(bot.listenerCount("disconnected")).toBe(2);
+
+    bot.emit("disconnected");
+
+    expect(first.closeCalls).toHaveLength(1);
+    expect(second.closeCalls).toHaveLength(1);
+    expect(bot.listenerCount("voiceFrame")).toBe(0);
+    expect(bot.listenerCount("disconnected")).toBe(0);
     expect(bot.webVoiceCalls).toEqual([true, false]);
   });
 });
