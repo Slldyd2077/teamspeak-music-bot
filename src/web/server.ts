@@ -77,7 +77,7 @@ export function createWebServer(options: WebServerOptions): WebServer {
 
   // ─── Public routes (no auth, no CSRF) ───────────────────────────────────
   app.get("/api/health", (_req, res) => {
-    res.json({ status: "ok", version: "0.3.3" });
+    res.json({ status: "ok", version: "0.3.4" });
   });
 
   app.get("/api/config/public-url", (_req, res) => {
