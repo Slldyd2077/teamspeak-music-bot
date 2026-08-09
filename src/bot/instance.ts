@@ -5,7 +5,17 @@ import {
   type TS3TextMessage,
   type TS3VoiceFrame,
 } from "../ts-protocol/client.js";
-import { AudioPlayer } from "../audio/player.js";
+import {
+  AudioPlayer,
+  type PlaybackDiagnostics,
+  type PlayerFrameMetadata,
+} from "../audio/player.js";
+import {
+  createRealtimeVoiceTelemetry,
+  updateRealtimeVoiceTelemetry,
+  visibleRealtimeVoiceTelemetry,
+  type RealtimeVoiceTelemetry,
+} from "../audio/realtime-voice-telemetry.js";
 import { PlayQueue, PlayMode, type QueuedSong } from "../audio/queue.js";
 import type { MusicProvider, Song } from "../music/provider.js";
 import {
@@ -61,6 +71,9 @@ export interface BotStatus {
   clientId: number;
   /** 当前曲实际播放时长（秒）。试听片段=试听秒数；完整曲=duration。缺失时前端回退 currentSong.duration。 */
   effectiveDuration?: number;
+  /** Decoder backlog for latency-sensitive live voice and ordinary media. */
+  audioPipeline: PlaybackDiagnostics;
+  liveVoice: RealtimeVoiceTelemetry;
 }
 
 export class BotInstance extends EventEmitter {
@@ -95,6 +108,7 @@ export class BotInstance extends EventEmitter {
   /** 当前曲实际播放时长（试听片段秒数或完整 duration）；resolveAndPlay 赋值。 */
   private effectiveDuration: number | undefined;
   private playGate: Promise<unknown> = Promise.resolve();
+  private liveVoiceTelemetry = createRealtimeVoiceTelemetry();
 
   constructor(options: BotInstanceOptions) {
     super();
@@ -139,8 +153,24 @@ export class BotInstance extends EventEmitter {
   }
 
   private setupPlayerEvents(): void {
-    this.player.on("frame", (opusFrame: Buffer) => {
+    this.player.on("frame", (opusFrame: Buffer, metadata: PlayerFrameMetadata) => {
       this.tsClient.sendVoiceData(opusFrame);
+      if (metadata.mode !== "realtime") return;
+
+      const update = updateRealtimeVoiceTelemetry(this.liveVoiceTelemetry, {
+        voiced: metadata.voiced,
+        bufferedMs: metadata.diagnostics.bufferedMs,
+        sentAt: Date.now(),
+      });
+      this.liveVoiceTelemetry = update.state;
+      if (update.speechStarted) {
+        this.logger.info({
+          sentAt: update.state.lastSpeechStartedAt,
+          bufferedMs: metadata.diagnostics.bufferedMs,
+          maxBufferedMs: metadata.diagnostics.maxBufferedMs,
+          droppedMs: metadata.diagnostics.droppedMs,
+        }, "Realtime voice first voiced TeamSpeak frame sent");
+      }
     });
 
     this.player.on("trackEnd", () => {
@@ -1199,7 +1229,12 @@ export class BotInstance extends EventEmitter {
     return next;
   }
 
+  resetLiveVoiceTelemetry(): void {
+    this.liveVoiceTelemetry = createRealtimeVoiceTelemetry();
+  }
+
   getStatus(): BotStatus {
+    const audioPipeline = this.player.getPlaybackDiagnostics();
     return {
       id: this.id,
       name: this.name,
@@ -1213,6 +1248,11 @@ export class BotInstance extends EventEmitter {
       elapsed: this.player.getElapsed(),
       effectiveDuration: this.effectiveDuration,
       clientId: this.tsClient.getClientId(),
+      audioPipeline,
+      liveVoice: visibleRealtimeVoiceTelemetry(
+        audioPipeline.mode,
+        this.liveVoiceTelemetry,
+      ),
     };
   }
 

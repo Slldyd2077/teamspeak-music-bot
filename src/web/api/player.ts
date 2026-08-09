@@ -105,7 +105,8 @@ export function createPlayerRouter(
         bot.getPlayer().stop();
         bot.getQueueManager().clear();
         bot.getPlayer().resetFailures();
-        bot.getPlayer().play(url);
+        bot.resetLiveVoiceTelemetry();
+        bot.getPlayer().playLive(url);
         bot.emit("stateChange");
       });
       res.json({ ok: true, live: true, title: title || "Live audio" });

@@ -5,6 +5,11 @@ import { accessSync, chmodSync, constants, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createOpusEncoder, PCM_FRAME_BYTES, type Encoder } from "./encoder.js";
+import {
+  createRealtimePcmIngressTelemetry,
+  updateRealtimePcmIngressTelemetry,
+  type RealtimePcmIngressTelemetry,
+} from "./realtime-voice-telemetry.js";
 import type { Logger } from "../logger.js";
 
 const require = createRequire(import.meta.url);
@@ -94,7 +99,15 @@ export function cleanupTempDir(dir: string): void {
   }
 }
 
-export function buildFfmpegArgs(url: string, seekSeconds: number): string[] {
+export interface FfmpegInputOptions {
+  realtime?: boolean;
+}
+
+export function buildFfmpegArgs(
+  url: string,
+  seekSeconds: number,
+  options: FfmpegInputOptions = {},
+): string[] {
   const args: string[] = [];
   const isHttp = /^https?:\/\//i.test(url);
 
@@ -122,6 +135,14 @@ export function buildFfmpegArgs(url: string, seekSeconds: number): string[] {
       "-reconnect_delay_max", "30",
       "-reconnect_on_network_error", "1",
       "-reconnect_on_http_error", "4xx,5xx",
+    );
+  }
+  if (isHttp && options.realtime) {
+    args.push(
+      "-analyzeduration", "0",
+      "-probesize", "32",
+      "-fflags", "nobuffer",
+      "-flags", "low_delay",
     );
   }
   if (seekSeconds > 0) args.push("-ss", String(seekSeconds));
@@ -168,14 +189,125 @@ export function volumeToFactor(volume: number): number {
 }
 
 export interface PlayerEvents {
-  frame: (opusFrame: Buffer) => void;
+  frame: (opusFrame: Buffer, metadata: PlayerFrameMetadata) => void;
   trackEnd: () => void;
   error: (err: Error) => void;
 }
 
 export type PlayerState = "idle" | "playing" | "paused";
+export type PlaybackMode = "media" | "realtime";
 
 const FRAME_DURATION_MS = 20;
+const MEDIA_BUFFER_HIGH_WATER = 640 * 1024;
+const MEDIA_BUFFER_LOW_WATER = 256 * 1024;
+const REALTIME_MAX_BUFFER_FRAMES = 12;
+const REALTIME_MAX_BUFFER_BYTES = PCM_FRAME_BYTES * REALTIME_MAX_BUFFER_FRAMES;
+
+export function isNearPlaybackEnd(
+  mode: PlaybackMode,
+  durationSeconds: number,
+  elapsedSeconds: number,
+): boolean {
+  if (mode === "realtime") return false;
+  return durationSeconds > 0 ? (durationSeconds - elapsedSeconds) <= 5 : true;
+}
+
+export interface PlaybackBufferPolicy {
+  highWaterBytes: number;
+  lowWaterBytes: number;
+  maxBufferedMs: number;
+  dropOldest: boolean;
+  pauseDecoder: boolean;
+}
+
+export function getPlaybackBufferPolicy(mode: PlaybackMode): PlaybackBufferPolicy {
+  if (mode === "realtime") {
+    return {
+      highWaterBytes: REALTIME_MAX_BUFFER_BYTES,
+      lowWaterBytes: 0,
+      maxBufferedMs: REALTIME_MAX_BUFFER_FRAMES * FRAME_DURATION_MS,
+      dropOldest: true,
+      pauseDecoder: false,
+    };
+  }
+  return {
+    highWaterBytes: MEDIA_BUFFER_HIGH_WATER,
+    lowWaterBytes: MEDIA_BUFFER_LOW_WATER,
+    maxBufferedMs: (MEDIA_BUFFER_HIGH_WATER / PCM_FRAME_BYTES) * FRAME_DURATION_MS,
+    dropOldest: false,
+    pauseDecoder: true,
+  };
+}
+
+export interface TrimmedPcmBuffer {
+  buffer: Buffer;
+  droppedBytes: number;
+}
+
+export interface PlaybackDiagnostics {
+  mode: PlaybackMode;
+  bufferedMs: number;
+  maxBufferedMs: number;
+  droppedMs: number;
+  decoderPaused: boolean;
+  decodedSpeechStarts: number;
+  lastDecodedPcmAt: number;
+  lastDecodedSpeechStartedAt: number;
+}
+
+export interface PlayerFrameMetadata {
+  mode: PlaybackMode;
+  voiced: boolean;
+  diagnostics: PlaybackDiagnostics;
+}
+
+function pcmBytesToMs(bytes: number): number {
+  return Math.round((Math.max(0, bytes) / PCM_FRAME_BYTES) * FRAME_DURATION_MS);
+}
+
+export function buildPlaybackDiagnostics(
+  mode: PlaybackMode,
+  bufferedBytes: number,
+  droppedBytes: number,
+  decoderPaused: boolean,
+  ingress: RealtimePcmIngressTelemetry = createRealtimePcmIngressTelemetry(),
+): PlaybackDiagnostics {
+  return {
+    mode,
+    bufferedMs: pcmBytesToMs(bufferedBytes),
+    maxBufferedMs: getPlaybackBufferPolicy(mode).maxBufferedMs,
+    droppedMs: pcmBytesToMs(droppedBytes),
+    decoderPaused,
+    decodedSpeechStarts: ingress.speechStarts,
+    lastDecodedPcmAt: ingress.lastPcmAt,
+    lastDecodedSpeechStartedAt: ingress.lastSpeechStartedAt,
+  };
+}
+
+export function trimRealtimePcmBuffer(
+  buffer: Buffer,
+  maxBytes = REALTIME_MAX_BUFFER_BYTES,
+): TrimmedPcmBuffer {
+  const alignedMaxBytes = Math.max(
+    PCM_FRAME_BYTES,
+    Math.floor(maxBytes / PCM_FRAME_BYTES) * PCM_FRAME_BYTES,
+  );
+  if (buffer.length <= alignedMaxBytes) return { buffer, droppedBytes: 0 };
+
+  const excessBytes = buffer.length - alignedMaxBytes;
+  const droppedBytes = Math.ceil(excessBytes / PCM_FRAME_BYTES) * PCM_FRAME_BYTES;
+  return {
+    buffer: buffer.subarray(Math.min(droppedBytes, buffer.length)),
+    droppedBytes: Math.min(droppedBytes, buffer.length),
+  };
+}
+
+export function isPcmFrameVoiced(frame: Buffer, peakThreshold = 256): boolean {
+  for (let offset = 0; offset + 1 < frame.length; offset += 2) {
+    if (Math.abs(frame.readInt16LE(offset)) >= peakThreshold) return true;
+  }
+  return false;
+}
 
 export class AudioPlayer extends EventEmitter {
   private ffmpeg: ChildProcess | null = null;
@@ -190,8 +322,10 @@ export class AudioPlayer extends EventEmitter {
   private seekOffset = 0;
   private framesPlayed = 0;
   private sessionId = 0;
-  private static readonly BUFFER_HIGH_WATER = 640 * 1024;
-  private static readonly BUFFER_LOW_WATER = 256 * 1024;
+  private playbackMode: PlaybackMode = "media";
+  private realtimeDroppedBytes = 0;
+  private realtimeIngress = createRealtimePcmIngressTelemetry();
+  private realtimeIngressCarry = Buffer.alloc(0);
   private ffmpegPaused = false;
   private spawnFailed = false;
   private consecutiveFailures = 0;
@@ -215,11 +349,20 @@ export class AudioPlayer extends EventEmitter {
     this.logger = logger;
   }
 
-  play(url: string, seekSeconds = 0, songDuration = 0): void {
+  play(
+    url: string,
+    seekSeconds = 0,
+    songDuration = 0,
+    options: FfmpegInputOptions = {},
+  ): void {
     // 1. 停止当前所有播放，自增 sessionId 屏蔽旧回调 （
     this.stop();
 
     const currentSessionId = this.sessionId; 
+    this.playbackMode = options.realtime ? "realtime" : "media";
+    this.realtimeDroppedBytes = 0;
+    this.realtimeIngress = createRealtimePcmIngressTelemetry();
+    this.realtimeIngressCarry = Buffer.alloc(0);
     this.currentUrl = url;
     this.seekOffset = seekSeconds;
     this.framesPlayed = 0;
@@ -241,7 +384,7 @@ export class AudioPlayer extends EventEmitter {
       return;
     }
 
-    const args = buildFfmpegArgs(url, seekSeconds);
+    const args = buildFfmpegArgs(url, seekSeconds, options);
 
     const ffmpegBin = getFfmpegCommand();
     this.ffmpeg = spawn(ffmpegBin, args, { stdio: ["ignore", "pipe", "pipe"] });
@@ -258,8 +401,19 @@ export class AudioPlayer extends EventEmitter {
         return;
       }
       
-      this.pcmBuffer = Buffer.concat([this.pcmBuffer, chunk]);
-      if (this.pcmBuffer.length > AudioPlayer.BUFFER_HIGH_WATER && !this.ffmpegPaused && this.ffmpeg?.stdout) {
+      if (this.playbackMode === "realtime") this.observeRealtimePcm(chunk);
+      const combined = Buffer.concat([this.pcmBuffer, chunk]);
+      if (this.playbackMode === "realtime") {
+        const trimmed = trimRealtimePcmBuffer(combined);
+        this.pcmBuffer = trimmed.buffer;
+        this.realtimeDroppedBytes += trimmed.droppedBytes;
+      } else {
+        this.pcmBuffer = combined;
+      }
+      if (this.playbackMode === "media"
+        && this.pcmBuffer.length > MEDIA_BUFFER_HIGH_WATER
+        && !this.ffmpegPaused
+        && this.ffmpeg?.stdout) {
         this.ffmpeg.stdout.pause();
         this.ffmpegPaused = true;
       }
@@ -285,6 +439,10 @@ export class AudioPlayer extends EventEmitter {
 
     this.state = "playing";
     this.startFrameLoop();
+  }
+
+  playLive(url: string): void {
+    this.play(url, 0, 0, { realtime: true });
   }
 
   private playViaPowerShellDownload(url: string, seekSeconds: number, sessionId: number): void {
@@ -384,7 +542,7 @@ export class AudioPlayer extends EventEmitter {
     this.ffmpeg.stdout!.on("data", (chunk: Buffer) => {
       if (this.sessionId !== sessionId) return;
       this.pcmBuffer = Buffer.concat([this.pcmBuffer, chunk]);
-      if (this.pcmBuffer.length > AudioPlayer.BUFFER_HIGH_WATER && !this.ffmpegPaused && this.ffmpeg?.stdout) {
+      if (this.pcmBuffer.length > MEDIA_BUFFER_HIGH_WATER && !this.ffmpegPaused && this.ffmpeg?.stdout) {
         this.ffmpeg.stdout.pause();
         this.ffmpegPaused = true;
       }
@@ -443,6 +601,10 @@ export class AudioPlayer extends EventEmitter {
 
     this.ffmpegPaused = false;
     this.spawnFailed = false;
+    this.playbackMode = "media";
+    this.realtimeDroppedBytes = 0;
+    this.realtimeIngress = createRealtimePcmIngressTelemetry();
+    this.realtimeIngressCarry = Buffer.alloc(0);
     this.state = "idle";
     this.currentUrl = "";
     this.seekOffset = 0;
@@ -498,9 +660,11 @@ export class AudioPlayer extends EventEmitter {
       // 条件1: FFmpeg仍在运行但缓冲区不足一帧，且连续多次无法获取数据
       // 条件2: 已播放时间接近歌曲结尾（最后5秒内）或未知时长
       const elapsed = this.getElapsed();
-      const isNearEnd = this.currentSongDuration > 0 
-        ? (this.currentSongDuration - elapsed) <= 5 // 距离结尾不足5秒
-        : true; // 未知时长时保守处理
+      const isNearEnd = isNearPlaybackEnd(
+        this.playbackMode,
+        this.currentSongDuration,
+        elapsed,
+      );
       
       if (this.ffmpeg !== null && this.pcmBuffer.length < PCM_FRAME_BYTES) {
         this.emptyFrameAttempts++;
@@ -568,7 +732,7 @@ export class AudioPlayer extends EventEmitter {
     const pcmFrame = this.pcmBuffer.subarray(0, PCM_FRAME_BYTES);
     this.pcmBuffer = this.pcmBuffer.subarray(PCM_FRAME_BYTES);
 
-    if (this.ffmpegPaused && this.pcmBuffer.length < AudioPlayer.BUFFER_LOW_WATER && this.ffmpeg?.stdout) {
+    if (this.ffmpegPaused && this.pcmBuffer.length < MEDIA_BUFFER_LOW_WATER && this.ffmpeg?.stdout) {
       this.ffmpeg.stdout.resume();
       this.ffmpegPaused = false;
     }
@@ -576,7 +740,12 @@ export class AudioPlayer extends EventEmitter {
     try {
       const adjusted = this.applyVolume(pcmFrame);
       const opusFrame = this.encoder.encode(adjusted);
-      this.emit("frame", opusFrame);
+      const diagnostics = this.getPlaybackDiagnostics();
+      this.emit("frame", opusFrame, {
+        mode: this.playbackMode,
+        voiced: this.playbackMode === "realtime" && isPcmFrameVoiced(adjusted),
+        diagnostics,
+      } satisfies PlayerFrameMetadata);
       this.framesPlayed++;
       this.healthyFrames++;
       if (this.healthyFrames >= AudioPlayer.HEALTHY_FRAME_RESET) {
@@ -586,6 +755,28 @@ export class AudioPlayer extends EventEmitter {
     } catch (err) {
       this.emit("error", err as Error);
     }
+  }
+
+  private observeRealtimePcm(chunk: Buffer): void {
+    const combined = Buffer.concat([this.realtimeIngressCarry, chunk]);
+    const receivedAt = Date.now();
+    let offset = 0;
+    while (offset + PCM_FRAME_BYTES <= combined.length) {
+      const frame = combined.subarray(offset, offset + PCM_FRAME_BYTES);
+      const update = updateRealtimePcmIngressTelemetry(this.realtimeIngress, {
+        voiced: isPcmFrameVoiced(frame),
+        receivedAt,
+      });
+      this.realtimeIngress = update.state;
+      if (update.speechStarted) {
+        this.logger.info({
+          decodedAt: receivedAt,
+          bufferedMs: pcmBytesToMs(this.pcmBuffer.length),
+        }, "Realtime decoder first voiced PCM received");
+      }
+      offset += PCM_FRAME_BYTES;
+    }
+    this.realtimeIngressCarry = Buffer.from(combined.subarray(offset));
   }
 
   private applyVolume(pcm: Buffer): Buffer {
@@ -601,6 +792,15 @@ export class AudioPlayer extends EventEmitter {
   }
 
   getElapsed(): number { return this.seekOffset + (this.framesPlayed * FRAME_DURATION_MS) / 1000; }
+  getPlaybackDiagnostics(): PlaybackDiagnostics {
+    return buildPlaybackDiagnostics(
+      this.playbackMode,
+      this.pcmBuffer.length,
+      this.realtimeDroppedBytes,
+      this.ffmpegPaused,
+      this.realtimeIngress,
+    );
+  }
   seek(seconds: number): void { 
     if (this.currentUrl && Number.isFinite(seconds) && seconds >= 0) {
       this.play(this.currentUrl, seconds, this.currentSongDuration);
