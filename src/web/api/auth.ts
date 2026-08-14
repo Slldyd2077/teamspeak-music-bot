@@ -294,5 +294,48 @@ export function createAuthRouter(
     res.json({ success: true });
   });
 
+  // Platform logout: drop the bot's saved credential and reset the live
+  // provider so its auth status flips to logged-out without a bot restart.
+  // Query params (platform, botId) mirror the save path — proxies send
+  // DELETE with a query string.
+  router.delete("/cookie", requirePermission("platform.auth"), (req, res) => {
+    const platform = typeof req.query.platform === "string" ? req.query.platform : undefined;
+    if (!platform) {
+      res.status(400).json({ error: "platform is required" });
+      return;
+    }
+    if (platform === "youtube" || platform === "local" || platform === "spotify") {
+      res.status(400).json({ error: `${platform} 没有可退出的平台登录` });
+      return;
+    }
+    const bot = resolveBot(req, res);
+    if (!bot) return;
+    try {
+      if (platform === "jellyfin") {
+        cookieStore.delete(bot.id, "jellyfin");
+        const jellyfin = bot.getProviderFor("jellyfin") as MusicProvider & {
+          configure?: (cfg: JellyfinConfig) => void;
+        };
+        // Empty config → isConfigured() false → getAuthStatus loggedIn:false.
+        jellyfin.configure?.({
+          serverUrl: "",
+          authMode: "userpass",
+          username: "",
+          password: "",
+          apiKey: "",
+          userId: "",
+        });
+      } else {
+        const plat = cookiePlatform(platform);
+        cookieStore.delete(bot.id, plat);
+        providerFor(bot, platform).setCookie("");
+      }
+      logger.info({ platform, botId: bot.id }, "Platform credential cleared");
+      res.json({ success: true });
+    } catch (err) {
+      res.status(500).json({ error: (err as Error).message });
+    }
+  });
+
   return router;
 }

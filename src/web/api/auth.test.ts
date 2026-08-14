@@ -123,3 +123,57 @@ describe("auth router POST /jellyfin/login (per-bot)", () => {
     expect(configure).not.toHaveBeenCalled();
   });
 });
+
+describe("auth router DELETE /cookie (platform logout)", () => {
+  function mount(user: unknown = { role: "admin" }) {
+    const del = vi.fn();
+    const setCookie = vi.fn();
+    const netease = {
+      platform: "netease",
+      setCookie,
+    } as unknown as MusicProvider;
+    const cookieStore = {
+      load: () => "",
+      save: vi.fn(),
+      delete: del,
+    } as unknown as CookieStore;
+    const bot = {
+      id: BOT_ID,
+      getProviderFor: (p: string) =>
+        p === "netease" ? netease : ({ platform: p, setCookie: vi.fn(), configure: vi.fn() } as unknown as MusicProvider),
+    } as unknown as BotInstance;
+    const botManager = { getBot: (id: string) => (id === BOT_ID ? bot : undefined) } as unknown as BotManager;
+    const app = express();
+    app.use(express.json());
+    app.use((req, _res, next) => { (req as { user?: unknown }).user = user; next(); });
+    app.use("/api/auth", createAuthRouter(botManager, cookieStore, undefined, pino({ level: "silent" })));
+    return { app, del, setCookie };
+  }
+
+  it("deletes the bot's saved cookie and resets the live provider", async () => {
+    const { app, del, setCookie } = mount();
+    const res = await request(app).delete(`/api/auth/cookie?platform=netease&botId=${BOT_ID}`);
+    expect(res.status).toBe(200);
+    expect(del).toHaveBeenCalledWith(BOT_ID, "netease");
+    expect(setCookie).toHaveBeenCalledWith("");
+  });
+
+  it("rejects platforms with no login to clear", async () => {
+    const { app, del } = mount();
+    const res = await request(app).delete(`/api/auth/cookie?platform=youtube&botId=${BOT_ID}`);
+    expect(res.status).toBe(400);
+    expect(del).not.toHaveBeenCalled();
+  });
+
+  it("requires a platform", async () => {
+    const { app } = mount();
+    const res = await request(app).delete(`/api/auth/cookie?botId=${BOT_ID}`);
+    expect(res.status).toBe(400);
+  });
+
+  it("is 403 for a member lacking platform.auth", async () => {
+    const { app } = mount({ role: "member", capabilities: new Set([]) });
+    const res = await request(app).delete(`/api/auth/cookie?platform=netease&botId=${BOT_ID}`);
+    expect(res.status).toBe(403);
+  });
+});

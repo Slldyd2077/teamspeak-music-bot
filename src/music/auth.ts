@@ -17,6 +17,8 @@ export type CookiePlatform = "netease" | "qq" | "bilibili" | "kugou" | "jellyfin
 export interface CookieStore {
   save(botId: string, platform: CookiePlatform, cookie: string): void;
   load(botId: string, platform: CookiePlatform): string;
+  /** Remove a bot's saved credential (platform logout). Idempotent. */
+  delete(botId: string, platform: CookiePlatform): void;
 }
 
 export function createCookieStore(cookieDir: string): CookieStore {
@@ -46,6 +48,15 @@ export function createCookieStore(cookieDir: string): CookieStore {
         return data.cookie ?? "";
       } catch {
         return "";
+      }
+    },
+
+    delete(botId, platform) {
+      const filePath = path.join(cookieDir, botId, `${platform}.json`);
+      try {
+        fs.unlinkSync(filePath);
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
       }
     },
   };
