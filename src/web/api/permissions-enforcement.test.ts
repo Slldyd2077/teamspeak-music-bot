@@ -77,7 +77,7 @@ function makeApp(user: any) {
       { read: () => null, write: () => "x", remove: () => {} } as any,
     ),
   );
-  app.use("/api/auth", createAuthRouter(botManager, { save() {}, load() { return ""; } } as any, logger));
+  app.use("/api/auth", createAuthRouter(botManager, { save() {}, load() { return ""; } } as any, undefined, logger));
   app.use("/api/music", createMusicRouter(botManager, logger));
 
   return app;

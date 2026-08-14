@@ -10,6 +10,7 @@ import {
   updateRealtimePcmIngressTelemetry,
   type RealtimePcmIngressTelemetry,
 } from "./realtime-voice-telemetry.js";
+import type { Readable } from "node:stream";
 import type { Logger } from "../logger.js";
 
 const require = createRequire(import.meta.url);
@@ -52,7 +53,7 @@ const resolvedFfmpeg: string = (() => {
   return "ffmpeg";
 })();
 
-function getFfmpegCommand(): string {
+export function getFfmpegCommand(): string {
   return resolvedFfmpeg;
 }
 
@@ -314,6 +315,15 @@ export class AudioPlayer extends EventEmitter {
   private encoder: Encoder;
   private state: PlayerState = "idle";
   private volume = 75;
+  /**
+   * A transient gain envelope layered on top of the persisted user volume.
+   * Voice ducking drives this value; keeping it separate means a temporary
+   * attenuation can never leak into the saved volume setting.
+   */
+  private duckingRampStartGain = 1;
+  private duckingTargetGain = 1;
+  private duckingRampStartedAt = 0;
+  private duckingRampDurationMs = 0;
   private pcmBuffer: Buffer = Buffer.alloc(0);
   private logger: Logger;
   private frameLoopRunning = false;
@@ -330,6 +340,11 @@ export class AudioPlayer extends EventEmitter {
   private spawnFailed = false;
   private consecutiveFailures = 0;
   private static readonly MAX_CONSECUTIVE_FAILURES = 3;
+  // Media-mode buffer water marks live at module scope (MEDIA_BUFFER_*), where
+  // the buffer-policy helpers can use them; these aliases keep the historical
+  // static names working for the external PCM path (playPcmStream).
+  private static readonly BUFFER_HIGH_WATER = MEDIA_BUFFER_HIGH_WATER;
+  private static readonly BUFFER_LOW_WATER = MEDIA_BUFFER_LOW_WATER;
   private healthyFrames = 0;
   private static readonly HEALTHY_FRAME_RESET = 50; // ~1 second of audio
   private downloader: ChildProcess | null = null;
@@ -342,6 +357,22 @@ export class AudioPlayer extends EventEmitter {
   // transient underrun never trips it.
   private static readonly MAX_STALL_ATTEMPTS = 3000;
   private currentSongDuration = 0; // 当前歌曲总时长（秒）
+
+  // --- External PCM mode (Stage 2: go-librespot Spotify sidecar) ---
+  // When true, PCM arrives from a long-lived external Readable instead of a
+  // per-URL ffmpeg: this.ffmpeg stays null, and the underrun-driven trackEnd
+  // branches are suppressed (advance is driven by the controller, not EOF).
+  //
+  // CORRECTION C2: externalStream is the backend's LONG-LIVED, SHARED ffmpeg
+  // stdout (one stream reused across every track). Teardown must DETACH (remove
+  // the listeners we added + pause), never destroy it. We keep references to the
+  // exact handler functions so detach can removeListener precisely.
+  private externalMode = false;
+  private externalStream: Readable | null = null;
+  private onExternalEnd: (() => void) | null = null;
+  private externalDataHandler: ((chunk: Buffer) => void) | null = null;
+  private externalEndHandler: (() => void) | null = null;
+  private externalErrorHandler: ((err: Error) => void) | null = null;
 
   constructor(logger: Logger) {
     super();
@@ -570,6 +601,117 @@ export class AudioPlayer extends EventEmitter {
     this.startFrameLoop();
   }
 
+  /**
+   * External-PCM mode (Stage 2 go-librespot Spotify sidecar).
+   *
+   * Feeds an already-normalized 48kHz/s16le/stereo PCM Readable (the
+   * go-librespot FIFO -> ffmpeg output) straight into the existing pcmBuffer +
+   * 20ms frame loop + Opus encoder + "frame" emission, WITHOUT spawning a
+   * per-URL ffmpeg. The url play() path is left completely untouched.
+   *
+   * Track advance is NOT driven by buffer underrun here (the sidecar stream is
+   * continuous and never EOFs per song); the caller drives advance via the
+   * SpotifyController "trackEnded" WebSocket event. onExternalEnd fires only if
+   * the underlying readable itself ends or errors.
+   *
+   * CORRECTION C2: the readable is the backend's long-lived, SHARED ffmpeg
+   * stdout reused across every track — a gapless track change is just LATER PCM
+   * on this SAME already-attached stream (no re-attach). Teardown DETACHES
+   * (removes our listeners + pauses); it never destroys the shared stream.
+   */
+  playPcmStream(readable: Readable, opts: { onExternalEnd?: () => void } = {}): void {
+    // 1. Fence current playback: stop() bumps sessionId, clears pcmBuffer, kills
+    //    any ffmpeg, and DETACHES (never destroys) any prior external stream.
+    this.stop();
+
+    const currentSessionId = this.sessionId;
+    this.externalMode = true;
+    this.externalStream = readable;
+    this.onExternalEnd = opts.onExternalEnd ?? null;
+    // Leave this.ffmpeg = null; clear currentUrl so seek() cannot respawn ffmpeg.
+    this.currentUrl = "";
+    this.seekOffset = 0;
+    this.framesPlayed = 0;
+    this.healthyFrames = 0;
+    this.ffmpegPaused = false;
+    this.spawnFailed = false;
+    this.emptyFrameAttempts = 0;
+    this.currentSongDuration = 0;
+
+    // Same ingestion + high-water backpressure as the ffmpeg.stdout handler,
+    // but pausing the Readable instead of ffmpeg.stdout. sessionId-guarded so
+    // stale sidecar PCM can't leak into a new track after stop()/skip. Handler
+    // refs are stored so detach can remove exactly these listeners (C2).
+    const onData = (chunk: Buffer): void => {
+      if (this.sessionId !== currentSessionId) return;
+      this.pcmBuffer = Buffer.concat([this.pcmBuffer, chunk]);
+      if (
+        this.pcmBuffer.length > AudioPlayer.BUFFER_HIGH_WATER &&
+        !this.ffmpegPaused &&
+        this.externalStream === readable
+      ) {
+        readable.pause();
+        this.ffmpegPaused = true;
+      }
+    };
+    const onEnd = (): void => {
+      if (this.sessionId !== currentSessionId) return;
+      this.onExternalEnd?.();
+    };
+    const onError = (err: Error): void => {
+      if (this.sessionId !== currentSessionId) return;
+      this.logger.warn({ err }, "External PCM stream error");
+      this.onExternalEnd?.();
+    };
+
+    this.externalDataHandler = onData;
+    this.externalEndHandler = onEnd;
+    this.externalErrorHandler = onError;
+
+    readable.on("data", onData);
+    readable.on("end", onEnd);
+    readable.on("error", onError);
+
+    // CORRECTION C1: explicitly resume a re-attached, previously-paused Readable.
+    // The backend's SHARED stdout is reused across every track; a prior non-spotify
+    // advance ran stop() -> detachExternalStream() which pause()d it (state.flowing =
+    // false). Node's Readable.on('data') only auto-resumes when flowing !== false, so
+    // re-attaching a paused stream would leave it stuck: onData never fires, pcmBuffer
+    // stays empty, and a later Spotify track plays only silence. resume() is safe/
+    // idempotent on a first attach (never-paused/already-flowing) stream.
+    readable.resume();
+
+    this.state = "playing";
+    this.startFrameLoop();
+  }
+
+  /**
+   * CORRECTION C2: DETACH, never destroy. The external readable is the backend's
+   * long-lived, SHARED ffmpeg stdout reused across every track; destroying it
+   * would kill the sidecar pipe for all future tracks. Remove only the listeners
+   * WE added and pause the flow so stale PCM stops landing in pcmBuffer, then
+   * clear the external-mode state.
+   */
+  private detachExternalStream(): void {
+    const stream = this.externalStream;
+    if (stream) {
+      if (this.externalDataHandler) stream.off("data", this.externalDataHandler);
+      if (this.externalEndHandler) stream.off("end", this.externalEndHandler);
+      if (this.externalErrorHandler) stream.off("error", this.externalErrorHandler);
+      try {
+        stream.pause();
+      } catch {
+        /* best-effort: never destroy the shared sidecar stream */
+      }
+    }
+    this.externalDataHandler = null;
+    this.externalEndHandler = null;
+    this.externalErrorHandler = null;
+    this.externalStream = null;
+    this.externalMode = false;
+    this.onExternalEnd = null;
+  }
+
   stop(): void {
     // 3. 递增 ID 是最有效的逻辑“隔离墙”
     this.sessionId++; 
@@ -598,6 +740,11 @@ export class AudioPlayer extends EventEmitter {
       cleanupTempDir(this.currentTempDir);
       this.currentTempDir = null;
     }
+
+    // CORRECTION C2: tear down external mode by DETACHING (remove our listeners +
+    // pause) — never destroy the shared, long-lived sidecar stream. The
+    // sessionId++ above already fences the external data/end/error handlers.
+    this.detachExternalStream();
 
     this.ffmpegPaused = false;
     this.spawnFailed = false;
@@ -666,7 +813,17 @@ export class AudioPlayer extends EventEmitter {
         elapsed,
       );
       
-      if (this.ffmpeg !== null && this.pcmBuffer.length < PCM_FRAME_BYTES) {
+      // External mode: the sidecar PCM stream is continuous and never EOFs per
+      // song; a transient underrun must NOT end the track (advance is driven by
+      // the controller). Skip BOTH drain/stall branches while externalMode.
+      //
+      // R3-4: gate BOTH end-detection branches on state==="playing". While paused
+      // the loop still ticks (so a resumed stream can refill), but it must NOT
+      // accumulate stall attempts or emit trackEnd — otherwise pausing a stalled/
+      // unknown-duration stream would auto-advance ~5s later. Because the if is
+      // now false while paused, the else resets emptyFrameAttempts to 0, so a
+      // resumed healthy stream starts fresh and never ends instantly.
+      if (this.state === "playing" && !this.externalMode && this.ffmpeg !== null && this.pcmBuffer.length < PCM_FRAME_BYTES) {
         this.emptyFrameAttempts++;
         
         // End the track when FFmpeg has gone silent: quickly if we're near the
@@ -691,20 +848,20 @@ export class AudioPlayer extends EventEmitter {
             nearEnd: isNearEnd,
           }, "FFmpeg stopped outputting data, ending track");
           this.frameLoopRunning = false;
-          if (this.state !== "idle") {
-            this.state = "idle";
-            // 清理FFmpeg进程
-            if (this.ffmpeg) {
-              const procToKill = this.ffmpeg;
-              const pidToKill = procToKill.pid;
-              this.ffmpeg = null;
-              if (pidToKill) {
-                this.forceCleanup(procToKill, pidToKill);
-              }
+          // The outer gate guarantees state==="playing" here, so no !=="idle"
+          // guard is needed: end the track directly.
+          this.state = "idle";
+          // 清理FFmpeg进程
+          if (this.ffmpeg) {
+            const procToKill = this.ffmpeg;
+            const pidToKill = procToKill.pid;
+            this.ffmpeg = null;
+            if (pidToKill) {
+              this.forceCleanup(procToKill, pidToKill);
             }
-            this.consecutiveFailures = 0;
-            this.emit("trackEnd");
           }
+          this.consecutiveFailures = 0;
+          this.emit("trackEnd");
           return;
         }
       } else {
@@ -712,14 +869,15 @@ export class AudioPlayer extends EventEmitter {
         this.emptyFrameAttempts = 0;
       }
 
-      if (!this.ffmpeg && this.pcmBuffer.length < PCM_FRAME_BYTES) {
+      // R3-4: likewise gated on state==="playing" — a drained/EOF'd stream must
+      // not emit trackEnd while paused; end-detection resumes on resume().
+      if (this.state === "playing" && !this.externalMode && !this.ffmpeg && this.pcmBuffer.length < PCM_FRAME_BYTES) {
         this.frameLoopRunning = false;
-        if (this.state !== "idle") {
-          this.state = "idle";
-          if (!this.spawnFailed) {
-            this.consecutiveFailures = 0;
-            this.emit("trackEnd");
-          }
+        // Outer gate guarantees state==="playing"; end directly (no !=="idle" guard).
+        this.state = "idle";
+        if (!this.spawnFailed) {
+          this.consecutiveFailures = 0;
+          this.emit("trackEnd");
         }
         return;
       }
@@ -728,13 +886,24 @@ export class AudioPlayer extends EventEmitter {
   }
 
   private sendNextFrame(): void {
-    if (this.pcmBuffer.length < PCM_FRAME_BYTES) return;
+    if (this.pcmBuffer.length < PCM_FRAME_BYTES) {
+      // External mode: the sidecar PCM stream is long-lived and must NOT end on
+      // a transient underrun. Emit an encoded silence frame so the 20ms voice
+      // timeline stays continuous instead of returning (which would desync TS).
+      if (this.externalMode) this.emitSilenceFrame();
+      return;
+    }
     const pcmFrame = this.pcmBuffer.subarray(0, PCM_FRAME_BYTES);
     this.pcmBuffer = this.pcmBuffer.subarray(PCM_FRAME_BYTES);
 
-    if (this.ffmpegPaused && this.pcmBuffer.length < MEDIA_BUFFER_LOW_WATER && this.ffmpeg?.stdout) {
-      this.ffmpeg.stdout.resume();
-      this.ffmpegPaused = false;
+    if (this.ffmpegPaused && this.pcmBuffer.length < MEDIA_BUFFER_LOW_WATER) {
+      if (this.externalMode && this.externalStream) {
+        this.externalStream.resume();
+        this.ffmpegPaused = false;
+      } else if (this.ffmpeg?.stdout) {
+        this.ffmpeg.stdout.resume();
+        this.ffmpegPaused = false;
+      }
     }
 
     try {
@@ -762,7 +931,7 @@ export class AudioPlayer extends EventEmitter {
     const receivedAt = Date.now();
     let offset = 0;
     while (offset + PCM_FRAME_BYTES <= combined.length) {
-      const frame = combined.subarray(offset, offset + PCM_FRAME_BYTES);
+      const frame = combined.subarray(offset, PCM_FRAME_BYTES);
       const update = updateRealtimePcmIngressTelemetry(this.realtimeIngress, {
         voiced: isPcmFrameVoiced(frame),
         receivedAt,
@@ -779,18 +948,73 @@ export class AudioPlayer extends EventEmitter {
     this.realtimeIngressCarry = Buffer.from(combined.subarray(offset));
   }
 
+  private emitSilenceFrame(): void {
+    try {
+      const opusFrame = this.encoder.encode(Buffer.alloc(PCM_FRAME_BYTES));
+      this.emit("frame", opusFrame, {
+        mode: this.playbackMode,
+        voiced: false,
+        diagnostics: this.getPlaybackDiagnostics(),
+      } satisfies PlayerFrameMetadata);
+      this.framesPlayed++;
+    } catch (err) {
+      this.emit("error", err as Error);
+    }
+  }
+
   private applyVolume(pcm: Buffer): Buffer {
-    const factor = volumeToFactor(this.volume);
-    // factor === 1 only at volume 100; skip the per-sample loop at full loudness.
-    if (factor >= 1) return Buffer.from(pcm);
+    const baseFactor = volumeToFactor(this.volume);
+    const now = performance.now();
+    const startDuckingGain = this.duckingGainAt(now);
+    const endDuckingGain = this.duckingGainAt(now + FRAME_DURATION_MS);
+    const startFactor = baseFactor * startDuckingGain;
+    const endFactor = baseFactor * endDuckingGain;
+
+    if (startFactor >= 1 && endFactor >= 1) {
+      return Buffer.from(pcm);
+    }
+
     const out = Buffer.alloc(pcm.length);
+    // Most frames are outside the short attack/release windows. Preserve the
+    // old constant-factor hot path instead of doing interpolation per sample.
+    if (startFactor === endFactor) {
+      for (let i = 0; i < pcm.length; i += 2) {
+        const sample = Math.round(pcm.readInt16LE(i) * startFactor);
+        out.writeInt16LE(Math.max(-32768, Math.min(32767, sample)), i);
+      }
+      return out;
+    }
+
+    // PCM is fixed at stereo s16le. Use one gain for each L/R pair so a ramp
+    // never creates a tiny channel imbalance, and span the whole 20 ms frame.
+    const stereoFrames = Math.max(1, Math.ceil(pcm.length / 4));
     for (let i = 0; i < pcm.length; i += 2) {
-      let sample = Math.round(pcm.readInt16LE(i) * factor);
+      const frameIndex = Math.floor(i / 4);
+      const progress = stereoFrames === 1 ? 0 : frameIndex / (stereoFrames - 1);
+      const factor = startFactor + (endFactor - startFactor) * progress;
+      const sample = Math.round(pcm.readInt16LE(i) * factor);
       out.writeInt16LE(Math.max(-32768, Math.min(32767, sample)), i);
     }
     return out;
   }
 
+  private duckingGainAt(at: number): number {
+    if (this.duckingRampDurationMs <= 0) return this.duckingTargetGain;
+
+    const progress = Math.max(
+      0,
+      Math.min(1, (at - this.duckingRampStartedAt) / this.duckingRampDurationMs),
+    );
+    return (
+      this.duckingRampStartGain +
+      (this.duckingTargetGain - this.duckingRampStartGain) * progress
+    );
+  }
+
+  // NOTE: in external (Spotify sidecar) mode getElapsed() is frame-count based
+  // (framesPlayed includes silence frames emitted on underrun) and therefore
+  // only APPROXIMATE — the authoritative position is the controller's live
+  // status.track.position. This approximation is acceptable for Spotify.
   getElapsed(): number { return this.seekOffset + (this.framesPlayed * FRAME_DURATION_MS) / 1000; }
   getPlaybackDiagnostics(): PlaybackDiagnostics {
     return buildPlaybackDiagnostics(
@@ -801,7 +1025,11 @@ export class AudioPlayer extends EventEmitter {
       this.realtimeIngress,
     );
   }
-  seek(seconds: number): void { 
+  seek(seconds: number): void {
+    // External (Spotify sidecar) mode: local seek is a no-op. Respawning ffmpeg
+    // on the spotify: sentinel would collide with the continuous PCM source;
+    // transport is delegated to the SpotifyController by the caller (Task 7).
+    if (this.externalMode) return;
     if (this.currentUrl && Number.isFinite(seconds) && seconds >= 0) {
       this.play(this.currentUrl, seconds, this.currentSongDuration);
     }
@@ -811,5 +1039,25 @@ export class AudioPlayer extends EventEmitter {
   resetFailures(): void { this.consecutiveFailures = 0; }
   setVolume(vol: number): void { this.volume = Math.max(0, Math.min(100, vol)); }
   getVolume(): number { return this.volume; }
+  /** Set the temporary voice-ducking gain (0=silent, 1=unchanged). */
+  setDuckingGain(gain: number, rampMs = 0): void {
+    if (!Number.isFinite(gain)) return;
+
+    const now = performance.now();
+    const currentGain = this.duckingGainAt(now);
+    const targetGain = Math.max(0, Math.min(1, gain));
+    const duration = Number.isFinite(rampMs) ? Math.max(0, rampMs) : 0;
+
+    this.duckingRampStartGain = currentGain;
+    this.duckingTargetGain = targetGain;
+    this.duckingRampStartedAt = now;
+    this.duckingRampDurationMs =
+      duration > 0 && currentGain !== targetGain ? duration : 0;
+  }
+  getDuckingGain(): number { return this.duckingGainAt(performance.now()); }
   getState(): PlayerState { return this.state; }
+  // True only while attached to an external (Spotify sidecar) PCM stream. Used
+  // by the orchestrator to decide whether to re-attach: stop() detaches (sets
+  // externalMode=false) so this is false after any player.stop().
+  isExternalActive(): boolean { return this.externalMode; }
 }

@@ -205,6 +205,20 @@ describe("LocalMusicProvider quota", () => {
   });
 });
 
+describe("LocalMusicProvider search pagination", () => {
+  it("slices [offset, offset+limit) instead of the first page", async () => {
+    const recs = ["a", "b", "c", "d"].map((id) => makeRecord(id));
+    seed(recs); // newest-first order preserved: a, b, c, d
+    const p = new LocalMusicProvider(dir);
+
+    const page1 = await p.search("", 2); // offset defaults to 0
+    expect(page1.songs.map((s) => s.id)).toEqual(["a", "b"]);
+
+    const page2 = await p.search("", 2, 2);
+    expect(page2.songs.map((s) => s.id)).toEqual(["c", "d"]);
+  });
+});
+
 describe("LocalMusicProvider filename handling", () => {
   it("accepts a long filename without dropping its extension", async () => {
     const p = new LocalMusicProvider(dir);

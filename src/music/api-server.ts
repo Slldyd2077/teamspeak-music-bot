@@ -5,6 +5,10 @@ import type { Server } from "node:http";
 export interface ApiServerOptions {
   neteasePort: number;
   qqMusicPort: number;
+  /** Provider gating (#enabledProviders): when false, the corresponding
+   *  embedded sidecar API server is never started and its port never bound. */
+  neteaseEnabled?: boolean;
+  qqEnabled?: boolean;
 }
 
 export interface ApiServerManager {
@@ -65,34 +69,43 @@ export function createApiServerManager(
 
   return {
     async start(): Promise<void> {
+      // Provider gating: with the jellyfin-only default config neither legacy
+      // sidecar starts, so ports 3001/3200 are never opened.
+      if (options.neteaseEnabled === false && options.qqEnabled === false) {
+        logger.info("NetEase/QQ providers disabled — embedded music API servers not started");
+        return;
+      }
       logger.info("Starting embedded music API servers...");
 
       // Start NetEase Cloud Music API
-      try {
-        const portFree = await isPortFree(options.neteasePort);
-        if (!portFree) {
-          logger.info(
-            { port: options.neteasePort },
-            "NetEase API port already in use — reusing existing instance"
-          );
-        } else {
-          const ncmModule = await import("NeteaseCloudMusicApi") as any;
-          const serverObj = ncmModule.server ?? ncmModule.default?.server;
-          const app = await serverObj.serveNcmApi({ port: options.neteasePort });
-          neteaseServer = app;
-          logger.info(
-            { port: options.neteasePort },
-            "NetEase Cloud Music API started"
-          );
+      if (options.neteaseEnabled !== false) {
+        try {
+          const portFree = await isPortFree(options.neteasePort);
+          if (!portFree) {
+            logger.info(
+              { port: options.neteasePort },
+              "NetEase API port already in use — reusing existing instance"
+            );
+          } else {
+            const ncmModule = await import("NeteaseCloudMusicApi") as any;
+            const serverObj = ncmModule.server ?? ncmModule.default?.server;
+            const app = await serverObj.serveNcmApi({ port: options.neteasePort });
+            neteaseServer = app;
+            logger.info(
+              { port: options.neteasePort },
+              "NetEase Cloud Music API started"
+            );
+          }
+        } catch (err) {
+          logger.error({ err }, "Failed to start NetEase Cloud Music API");
         }
-      } catch (err) {
-        logger.error({ err }, "Failed to start NetEase Cloud Music API");
       }
 
       // Start QQ Music API. Older versions auto-started on import; the
       // current fork (2.2.11+) only listens when run as `require.main`,
       // so we explicitly call .listen() on the imported Koa app and keep
       // the server handle for clean shutdown.
+      if (options.qqEnabled === false) return;
       try {
         const portFree = await isPortFree(options.qqMusicPort);
         if (!portFree) {
@@ -101,7 +114,25 @@ export function createApiServerManager(
             "QQ Music API port already in use — reusing existing instance"
           );
         } else {
-          const qqModule = (await import("@sansenjian/qq-music-api")) as any;
+          // Pin the upstream server to the configured port before importing.
+          // The package derives its default port from process.env.PORT (falling
+          // back to 3200) and, in some historical versions, auto-started that
+          // server as an import side effect. Aligning PORT with qqMusicApiPort
+          // guarantees the sidecar can never bind a different port than the one
+          // the client base URL (getQQMusicBaseUrl) targets — the root cause of
+          // issue #122, where an old build listened on 3300 while the client
+          // requested 3200. Restore the previous value right after import so we
+          // never leak the override into the rest of the process (e.g. the web
+          // server or the NetEase sidecar, which also read PORT as a fallback).
+          const prevPortEnv = process.env.PORT;
+          process.env.PORT = String(options.qqMusicPort);
+          let qqModule: any;
+          try {
+            qqModule = (await import("@sansenjian/qq-music-api")) as any;
+          } finally {
+            if (prevPortEnv === undefined) delete process.env.PORT;
+            else process.env.PORT = prevPortEnv;
+          }
           // The module's export structure varies between versions:
           //   2.2.11+: default → Koa app (has .listen)
           //   2.2.10:  default → wrapper object whose .default is the Koa app
@@ -111,16 +142,34 @@ export function createApiServerManager(
             ? candidate
             : candidate.default ?? null;
           if (koaApp && typeof koaApp.listen === "function") {
-            qqMusicServer = await new Promise<Server>((resolve, reject) => {
-              const srv = koaApp.listen(options.qqMusicPort, "127.0.0.1", () =>
-                resolve(srv)
+            // A version that auto-started on import has already bound the
+            // configured port (thanks to the PORT alignment above); reuse it
+            // rather than racing a second listen that would fail EADDRINUSE.
+            const stillFree = await isPortFree(options.qqMusicPort);
+            if (!stillFree) {
+              logger.info(
+                { port: options.qqMusicPort },
+                "QQ Music API already listening on the configured port (auto-started on import) — reusing embedded instance"
               );
-              srv.on("error", reject);
-            });
-            logger.info(
-              { port: options.qqMusicPort },
-              "QQ Music API started"
-            );
+            } else {
+              qqMusicServer = await new Promise<Server>((resolve, reject) => {
+                const srv = koaApp.listen(options.qqMusicPort, "127.0.0.1", () =>
+                  resolve(srv)
+                );
+                srv.on("error", reject);
+              });
+              // Log the port actually bound (read from the socket) rather than
+              // the requested one, so operators can spot a mismatch in the logs.
+              const addr = qqMusicServer.address();
+              const boundPort =
+                addr && typeof addr === "object" && addr !== null
+                  ? addr.port
+                  : options.qqMusicPort;
+              logger.info(
+                { port: boundPort },
+                "QQ Music API started"
+              );
+            }
           } else {
             logger.warn("QQ Music API module does not expose a Koa app");
           }

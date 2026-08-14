@@ -1,5 +1,5 @@
-import { describe, it, expect } from "vitest";
-import { parseLyrics, mapNeteaseAlbums, mapNeteaseSongs, parseNeteaseTrial } from "./netease.js";
+import { describe, it, expect, vi } from "vitest";
+import { parseLyrics, mapNeteaseAlbums, mapNeteaseSongs, parseNeteaseTrial, NeteaseProvider } from "./netease.js";
 
 describe("NetEase adapter", () => {
   it("parses LRC format lyrics", () => {
@@ -91,5 +91,51 @@ describe("NetEase adapter", () => {
     expect(parseNeteaseTrial({ freeTrialInfo: { start: 0, end: 30000 } })).toBe(30);
     // 异常 end<=start
     expect(parseNeteaseTrial({ freeTrialInfo: { start: 0, end: 0 } })).toBeUndefined();
+  });
+});
+
+describe("NeteaseProvider.search pagination", () => {
+  function mockProvider() {
+    const p = new NeteaseProvider("http://x");
+    const get = vi.fn().mockResolvedValue({
+      data: { result: { songs: [], playlists: [], albums: [] } },
+    });
+    (p as any).api = { get };
+    return { p, get };
+  }
+
+  /** Find the /cloudsearch call whose params.type matches. */
+  function callByType(get: ReturnType<typeof vi.fn>, type: number) {
+    const call = get.mock.calls.find((c: any[]) => c[1]?.params?.type === type);
+    expect(call, `expected a /cloudsearch call with type=${type}`).toBeTruthy();
+    return call![1].params as Record<string, unknown>;
+  }
+
+  it("forwards offset for songs and uses real limit+offset for playlists/albums", async () => {
+    const { p, get } = mockProvider();
+    await p.search("hello", 20, 20);
+
+    // songs (type 1): offset forwarded, limit unchanged
+    const songs = callByType(get, 1);
+    expect(songs.limit).toBe(20);
+    expect(songs.offset).toBe(20);
+
+    // playlists (type 1000): limit-driven (NOT hardcoded 10) + offset
+    const playlists = callByType(get, 1000);
+    expect(playlists.limit).toBe(20);
+    expect(playlists.offset).toBe(20);
+
+    // albums (type 10): limit-driven (NOT hardcoded 10) + offset
+    const albums = callByType(get, 10);
+    expect(albums.limit).toBe(20);
+    expect(albums.offset).toBe(20);
+  });
+
+  it("defaults offset to 0 (backward compatible)", async () => {
+    const { p, get } = mockProvider();
+    await p.search("hello", 20);
+    expect(callByType(get, 1).offset).toBe(0);
+    expect(callByType(get, 1000).offset).toBe(0);
+    expect(callByType(get, 10).offset).toBe(0);
   });
 });

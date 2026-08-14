@@ -56,23 +56,35 @@
     <div v-if="loading" class="loading">搜索中...</div>
 
     <template v-else-if="allSongs.length || allAlbums.length || allPlaylists.length">
+      <!-- Only enabled sources are offered (enabledProviders gate); Jellyfin
+           (opt-in) comes first when enabled. -->
       <div class="source-bar">
         <button
+          v-if="sourceEnabled('jellyfin')"
+          class="source-btn"
+          :class="{ active: selectedSource === 'jellyfin' }"
+          @click="selectedSource = 'jellyfin'"
+        >Jellyfin</button>
+        <button
+          v-if="sourceEnabled('netease')"
           class="source-btn"
           :class="{ active: selectedSource === 'netease' }"
           @click="selectedSource = 'netease'"
         >网易云</button>
         <button
+          v-if="sourceEnabled('qq')"
           class="source-btn"
           :class="{ active: selectedSource === 'qq' }"
           @click="selectedSource = 'qq'"
         >QQ</button>
         <button
+          v-if="sourceEnabled('bilibili')"
           class="source-btn"
           :class="{ active: selectedSource === 'bilibili' }"
           @click="selectedSource = 'bilibili'"
         >B站</button>
         <button
+          v-if="sourceEnabled('kugou')"
           class="source-btn"
           :class="{ active: selectedSource === 'kugou' }"
           @click="selectedSource = 'kugou'"
@@ -165,6 +177,13 @@
           @add="store.addSong(song)"
         />
       </section>
+
+      <div v-if="showLoadMore" class="load-more-wrap">
+        <button class="load-more-btn" :disabled="currentLoadingMore" @click="loadMore">
+          <Icon v-if="currentLoadingMore" icon="mdi:loading" class="spin" />
+          {{ currentLoadingMore ? '加载中...' : '加载更多' }}
+        </button>
+      </div>
     </template>
 
     <div v-else-if="searched" class="empty">未找到相关结果</div>
@@ -180,6 +199,9 @@ import { usePlayerStore } from '../stores/player.js';
 import type { Song } from '../stores/player.js';
 import SongCard from '../components/SongCard.vue';
 import CoverArt from '../components/CoverArt.vue';
+import { mergeDedup, hasMore, nextOffset } from './searchPagination.js';
+
+const PAGE_SIZE = 20;
 
 const store = usePlayerStore();
 const route = useRoute();
@@ -187,18 +209,22 @@ const router = useRouter();
 
 const SOURCE_STORAGE_KEY = 'search-source';
 
-type SearchSource = 'netease' | 'qq' | 'bilibili' | 'local' | 'kugou';
+type SearchSource = 'jellyfin' | 'netease' | 'qq' | 'bilibili' | 'local' | 'kugou';
+
+const SEARCH_SOURCES: SearchSource[] = ['jellyfin', 'netease', 'qq', 'bilibili', 'local', 'kugou'];
 
 function loadSource(): SearchSource {
   try {
     const stored = localStorage.getItem(SOURCE_STORAGE_KEY);
-    if (stored === 'netease' || stored === 'qq' || stored === 'bilibili' || stored === 'local' || stored === 'kugou') return stored;
+    if (SEARCH_SOURCES.includes(stored as SearchSource)) return stored as SearchSource;
   } catch { /* localStorage blocked */ }
   return 'netease';
 }
 
+type TabType = 'songs' | 'albums' | 'playlists';
+
 const query = ref((route.query.q as string) || '');
-const activeTab = ref<'songs' | 'albums' | 'playlists'>('songs');
+const activeTab = ref<TabType>('songs');
 const selectedSource = ref<SearchSource>(loadSource());
 
 interface Album { id: string; name: string; artist: string; coverUrl: string; songCount?: number; platform: string; }
@@ -207,6 +233,9 @@ interface Playlist { id: string; name: string; coverUrl: string; songCount?: num
 const allSongs = ref<Song[]>([]);
 const allAlbums = ref<Album[]>([]);
 const allPlaylists = ref<Playlist[]>([]);
+// "加载更多" 分页状态：hasMore 按 (类型, 音源) 记录，loadingMore 按类型记录。
+const hasMoreMap = ref<Record<string, boolean>>({});
+const loadingMore = ref<Record<TabType, boolean>>({ songs: false, albums: false, playlists: false });
 const loading = ref(false);
 const searched = ref(false);
 const uploading = ref(false);
@@ -229,6 +258,97 @@ const filteredPlaylists = computed(() =>
 );
 
 const hasLocalSongs = computed(() => localAudioEnabled.value && allSongs.value.some((s) => s.platform === 'local'));
+
+// Server-side source gate (enabledProviders). Until /providers loads, the
+// store list is empty — treat that as "everything shown" so a slow request
+// doesn't blank the bar.
+function sourceEnabled(p: string): boolean {
+  return store.enabledProviders.length === 0 || store.enabledProviders.includes(p);
+}
+
+/** Snap a disabled/stale selection to the configured default (or first enabled). */
+function fixupSelectedSource() {
+  if (selectedSource.value === 'local' || sourceEnabled(selectedSource.value)) return;
+  const def = store.defaultSource as SearchSource;
+  selectedSource.value = SEARCH_SOURCES.includes(def) && sourceEnabled(def)
+    ? def
+    : SEARCH_SOURCES.find((s) => s !== 'local' && sourceEnabled(s)) ?? 'netease';
+}
+
+// ---- 分页 / 加载更多 ----
+function pageKey(type: TabType, source: string): string {
+  return `${type}:${source}`;
+}
+
+const currentItems = computed(() => {
+  if (activeTab.value === 'albums') return filteredAlbums.value;
+  if (activeTab.value === 'playlists') return filteredPlaylists.value;
+  return filteredSongs.value;
+});
+
+const currentLoadingMore = computed(() => loadingMore.value[activeTab.value]);
+
+const currentHasMore = computed(
+  () => hasMoreMap.value[pageKey(activeTab.value, selectedSource.value)] ?? false
+);
+
+// 有结果、还有下一页时才显示按钮；加载中时按钮保留但禁用并显示 spinner。
+const showLoadMore = computed(() => currentItems.value.length > 0 && currentHasMore.value);
+
+function resetPagination() {
+  hasMoreMap.value = {};
+  loadingMore.value = { songs: false, albums: false, playlists: false };
+}
+
+// 记录某个 (类型, 音源) 是否还有更多：返回条数 === PAGE_SIZE 视为还有下一页。
+function setHasMore(type: TabType, source: string, returnedCount: number) {
+  hasMoreMap.value = {
+    ...hasMoreMap.value,
+    [pageKey(type, source)]: hasMore(returnedCount, PAGE_SIZE),
+  };
+}
+
+// 初始 /search/all 返回的是各音源合并的首页，按音源分组统计每种类型的条数。
+function recordInitialHasMore(items: { platform: string }[], type: TabType) {
+  const counts: Record<string, number> = {};
+  for (const it of items) counts[it.platform] = (counts[it.platform] ?? 0) + 1;
+  const next = { ...hasMoreMap.value };
+  for (const [source, count] of Object.entries(counts)) {
+    next[pageKey(type, source)] = hasMore(count, PAGE_SIZE);
+  }
+  hasMoreMap.value = next;
+}
+
+async function loadMore() {
+  const type = activeTab.value;
+  const source = selectedSource.value;
+  if (loadingMore.value[type]) return;
+  if (!currentHasMore.value) return;
+  const offset = nextOffset(currentItems.value.length, PAGE_SIZE);
+  loadingMore.value = { ...loadingMore.value, [type]: true };
+  try {
+    const res = await axios.get('/api/music/search', {
+      params: { q: query.value, platform: source, limit: PAGE_SIZE, offset },
+    });
+    if (type === 'albums') {
+      const incoming = (res.data.albums ?? []) as Album[];
+      allAlbums.value = mergeDedup(allAlbums.value, incoming);
+      setHasMore(type, source, incoming.length);
+    } else if (type === 'playlists') {
+      const incoming = (res.data.playlists ?? []) as Playlist[];
+      allPlaylists.value = mergeDedup(allPlaylists.value, incoming);
+      setHasMore(type, source, incoming.length);
+    } else {
+      const incoming = (res.data.songs ?? []) as Song[];
+      allSongs.value = mergeDedup(allSongs.value, incoming);
+      setHasMore(type, source, incoming.length);
+    }
+  } catch {
+    // 保留 hasMore 现状，允许用户重试。
+  } finally {
+    loadingMore.value = { ...loadingMore.value, [type]: false };
+  }
+}
 
 // Persist source preference
 watch(selectedSource, (src) => {
@@ -266,12 +386,16 @@ async function doSearch() {
   loading.value = true;
   searched.value = true;
   activeTab.value = 'songs';
+  resetPagination();
   router.replace({ query: { q: query.value } });
   try {
     const res = await axios.get('/api/music/search/all', { params: { q: query.value, botId: store.activeBotId ?? undefined } });
     allSongs.value = res.data.songs ?? [];
     allAlbums.value = res.data.albums ?? [];
     allPlaylists.value = res.data.playlists ?? [];
+    recordInitialHasMore(allSongs.value, 'songs');
+    recordInitialHasMore(allAlbums.value, 'albums');
+    recordInitialHasMore(allPlaylists.value, 'playlists');
   } catch {
     allSongs.value = []; allAlbums.value = []; allPlaylists.value = [];
   } finally {
@@ -357,6 +481,7 @@ function badgeLabel(platform: string): string {
   if (platform === 'youtube') return 'YouTube';
   if (platform === 'local') return '本地';
   if (platform === 'kugou') return '酷狗';
+  if (platform === 'jellyfin') return 'Jellyfin';
   return '网易云';
 }
 
@@ -366,6 +491,7 @@ function badgeClass(platform: string): string {
   if (platform === 'youtube') return 'badge-youtube';
   if (platform === 'local') return 'badge-local';
   if (platform === 'kugou') return 'badge-kugou';
+  if (platform === 'jellyfin') return 'badge-jellyfin';
   return 'badge-netease';
 }
 
@@ -381,9 +507,11 @@ async function loadLocalAudioSetting() {
   }
 }
 
-onMounted(() => {
+onMounted(async () => {
   loadLocalAudioSetting();
   if (query.value) doSearch();
+  await store.fetchProviders();
+  fixupSelectedSource();
 });
 </script>
 
@@ -601,6 +729,45 @@ onMounted(() => {
 .result-section {
   margin-bottom: 32px;
 }
+
+.load-more-wrap {
+  display: flex;
+  justify-content: center;
+  margin: 8px 0 32px;
+}
+
+.load-more-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 9px 28px;
+  border-radius: var(--radius-md);
+  font-size: 14px;
+  font-family: inherit;
+  font-weight: var(--fw-semi);
+  color: var(--text-secondary);
+  background: var(--bg-card);
+  cursor: pointer;
+  transition: color var(--transition-fast), background var(--transition-fast);
+
+  &:hover:not(:disabled) {
+    color: var(--color-primary);
+    background: rgba(51, 94, 234, 0.12);
+  }
+
+  &:disabled {
+    cursor: not-allowed;
+    opacity: 0.7;
+  }
+
+  .spin {
+    animation: load-more-spin 0.8s linear infinite;
+  }
+}
+
+@keyframes load-more-spin {
+  to { transform: rotate(360deg); }
+}
 .card-grid {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(140px, 1fr));
@@ -655,6 +822,11 @@ onMounted(() => {
 .badge-kugou {
   background: var(--brand-kugou-12);
   color: var(--brand-kugou);
+}
+
+.badge-jellyfin {
+  background: var(--brand-jellyfin-12);
+  color: var(--brand-jellyfin);
 }
 
 .fav-badge {

@@ -1,10 +1,9 @@
-import express, { Router } from "express";
-import type { Request, Response } from "express";
-import type { MusicProvider } from "../../music/provider.js";
+import express, { Router, type Request, type Response } from "express";
+import type { MusicProvider, Song, Album } from "../../music/provider.js";
 import type { BotManager } from "../../bot/manager.js";
 import type { BotInstance } from "../../bot/instance.js";
 import type { Logger } from "../../logger.js";
-import type { BotConfig } from "../../data/config.js";
+import { isProviderEnabled, defaultPlatform, type BotConfig } from "../../data/config.js";
 import type { BotDatabase } from "../../data/database.js";
 import {
   isQualityPlatform,
@@ -16,7 +15,15 @@ import { requirePermission } from "../middleware/requirePermission.js";
 import { requireNotGuest } from "../middleware/requireNotGuest.js";
 import { authorize } from "../middleware/authorize.js";
 
-type Platform = "netease" | "qq" | "bilibili" | "youtube" | "local" | "kugou";
+type Platform =
+  | "netease"
+  | "qq"
+  | "bilibili"
+  | "youtube"
+  | "local"
+  | "kugou"
+  | "spotify"
+  | "jellyfin";
 
 /**
  * Per-bot music router. Every platform call is scoped to a bot (which owns its
@@ -59,6 +66,25 @@ export function createMusicRouter(
 
   function providerFor(bot: BotInstance, platform?: string): MusicProvider {
     return bot.getProviderFor((platform ?? "netease") as Platform);
+  }
+
+  /**
+   * Provider gating for user-supplied platform params. No platform → the
+   * configured default (see defaultPlatform(); netease in the default config).
+   * A disabled platform gets a friendly 400 and null back — the handler must
+   * return immediately. Without a config (unit-test routers), everything
+   * stays enabled.
+   */
+  function resolveProvider(req: Request, res: Response, platform?: unknown): MusicProvider | null {
+    const bot = resolveBot(req, res);
+    if (!bot) return null;
+    const requested = typeof platform === "string" && platform ? platform : undefined;
+    const target = requested ?? (config ? defaultPlatform(config) : "netease");
+    if (config && !isProviderEnabled(config, target)) {
+      res.status(400).json({ error: `音源未启用：${target} (provider disabled)` });
+      return null;
+    }
+    return providerFor(bot, target);
   }
 
   router.post(
@@ -111,7 +137,7 @@ export function createMusicRouter(
 
   router.get("/search", async (req, res) => {
     try {
-      const { q, platform, limit } = req.query;
+      const { q, platform, limit, offset } = req.query;
       if (!q) {
         res.status(400).json({ error: "q (query) is required" });
         return;
@@ -120,12 +146,15 @@ export function createMusicRouter(
         res.json({ songs: [], playlists: [], albums: [] });
         return;
       }
-      const bot = resolveBot(req, res);
-      if (!bot) return;
-      const provider = providerFor(bot, platform as string);
+      const provider = resolveProvider(req, res, platform);
+      if (!provider) return;
+      // Server-side pagination: offset lets the web load past the first page.
+      // Clamp to >= 0 so a bad/negative value falls back to the first page.
+      const parsedOffset = Math.max(0, parseInt(offset as string) || 0);
       const result = await provider.search(
         q as string,
         parseInt(limit as string) || 20,
+        parsedOffset
       );
       res.json(result);
     } catch (err) {
@@ -144,16 +173,26 @@ export function createMusicRouter(
       const bot = resolveBot(req, res);
       if (!bot) return;
       const parsedLimit = parseInt(limit as string) || 20;
-      const empty = Promise.resolve({ songs: [], albums: [], playlists: [] });
-      const [neteaseResult, qqResult, bilibiliResult, localResult, kugouResult] = await Promise.allSettled([
-        bot.getProviderFor("netease").search(q as string, parsedLimit),
-        bot.getProviderFor("qq").search(q as string, parsedLimit),
-        bot.getProviderFor("bilibili").search(q as string, parsedLimit),
-        isLocalAudioEnabled() ? bot.getProviderFor("local").search(q as string, parsedLimit) : empty,
-        bot.getProviderFor("kugou").search(q as string, parsedLimit),
+      // Spotify is intentionally EXCLUDED from unified /search/all in Stage 1:
+      // its tracks are metadata-only until the librespot audio backend is
+      // attached; Spotify search remains available from its own tab via
+      // /search?platform=spotify. Provider gating (#enabledProviders): disabled
+      // sources are skipped, not searched. Jellyfin (an opt-in source) leads
+      // the merged results when enabled — a self-hosted library match is
+      // almost always the wanted one.
+      const enabled = (p: string) => !config || isProviderEnabled(config, p);
+      const none = { songs: [], albums: [], playlists: [] };
+      const [jellyfinResult, neteaseResult, qqResult, bilibiliResult, localResult, kugouResult] = await Promise.allSettled([
+        enabled("jellyfin") ? bot.getProviderFor("jellyfin").search(q as string, parsedLimit) : Promise.resolve(none),
+        enabled("netease") ? bot.getProviderFor("netease").search(q as string, parsedLimit) : Promise.resolve(none),
+        enabled("qq") ? bot.getProviderFor("qq").search(q as string, parsedLimit) : Promise.resolve(none),
+        enabled("bilibili") ? bot.getProviderFor("bilibili").search(q as string, parsedLimit) : Promise.resolve(none),
+        isLocalAudioEnabled() ? bot.getProviderFor("local").search(q as string, parsedLimit) : Promise.resolve(none),
+        enabled("kugou") ? bot.getProviderFor("kugou").search(q as string, parsedLimit) : Promise.resolve(none),
       ]);
 
       const songs = [
+        ...(jellyfinResult.status === "fulfilled" ? jellyfinResult.value.songs : []),
         ...(neteaseResult.status === "fulfilled" ? neteaseResult.value.songs : []),
         ...(qqResult.status === "fulfilled" ? qqResult.value.songs : []),
         ...(bilibiliResult.status === "fulfilled" ? bilibiliResult.value.songs : []),
@@ -161,10 +200,12 @@ export function createMusicRouter(
         ...(kugouResult.status === "fulfilled" ? kugouResult.value.songs : []),
       ];
       const albums = [
+        ...(jellyfinResult.status === "fulfilled" ? jellyfinResult.value.albums : []),
         ...(neteaseResult.status === "fulfilled" ? neteaseResult.value.albums : []),
         ...(qqResult.status === "fulfilled" ? qqResult.value.albums : []),
       ];
       const playlists = [
+        ...(jellyfinResult.status === "fulfilled" ? jellyfinResult.value.playlists : []),
         ...(neteaseResult.status === "fulfilled" ? neteaseResult.value.playlists : []),
         ...(qqResult.status === "fulfilled" ? qqResult.value.playlists : []),
       ];
@@ -182,9 +223,8 @@ export function createMusicRouter(
         res.status(403).json({ error: "本地音频播放已关闭" });
         return;
       }
-      const bot = resolveBot(req, res);
-      if (!bot) return;
-      const provider = providerFor(bot, req.query.platform as string);
+      const provider = resolveProvider(req, res, req.query.platform);
+      if (!provider) return;
       const song = await provider.getSongDetail(req.params.id);
       if (!song) {
         res.status(404).json({ error: "Song not found" });
@@ -198,9 +238,8 @@ export function createMusicRouter(
 
   router.get("/playlist/:id", async (req, res) => {
     try {
-      const bot = resolveBot(req, res);
-      if (!bot) return;
-      const provider = providerFor(bot, req.query.platform as string);
+      const provider = resolveProvider(req, res, req.query.platform);
+      if (!provider) return;
       const songs = await provider.getPlaylistSongs(req.params.id);
       res.json({ songs });
     } catch (err) {
@@ -210,9 +249,8 @@ export function createMusicRouter(
 
   router.get("/recommend/playlists", async (req, res) => {
     try {
-      const bot = resolveBot(req, res);
-      if (!bot) return;
-      const provider = providerFor(bot, req.query.platform as string);
+      const provider = resolveProvider(req, res, req.query.platform);
+      if (!provider) return;
       const playlists = await provider.getRecommendPlaylists();
       res.json({ playlists });
     } catch (err) {
@@ -222,9 +260,8 @@ export function createMusicRouter(
 
   router.get("/album/:id", async (req, res) => {
     try {
-      const bot = resolveBot(req, res);
-      if (!bot) return;
-      const provider = providerFor(bot, req.query.platform as string);
+      const provider = resolveProvider(req, res, req.query.platform);
+      if (!provider) return;
       const songs = await provider.getAlbumSongs(req.params.id);
       res.json({ songs });
     } catch (err) {
@@ -242,9 +279,8 @@ export function createMusicRouter(
         res.status(403).json({ error: "本地音频播放已关闭" });
         return;
       }
-      const bot = resolveBot(req, res);
-      if (!bot) return;
-      const provider = providerFor(bot, req.query.platform as string);
+      const provider = resolveProvider(req, res, req.query.platform);
+      if (!provider) return;
       const result = await provider.getSongUrl(
         req.params.id,
         typeof req.query.quality === "string" ? req.query.quality : undefined,
@@ -261,9 +297,8 @@ export function createMusicRouter(
 
   router.get("/lyrics/:id", async (req, res) => {
     try {
-      const bot = resolveBot(req, res);
-      if (!bot) return;
-      const provider = providerFor(bot, req.query.platform as string);
+      const provider = resolveProvider(req, res, req.query.platform);
+      if (!provider) return;
       const lyrics = await provider.getLyrics(req.params.id);
       res.json({ lyrics });
     } catch (err) {
@@ -273,9 +308,8 @@ export function createMusicRouter(
 
   router.get("/recommend/songs", requireNotGuest, async (req, res) => {
     try {
-      const bot = resolveBot(req, res);
-      if (!bot) return;
-      const provider = providerFor(bot, req.query.platform as string);
+      const provider = resolveProvider(req, res, req.query.platform);
+      if (!provider) return;
       if (!provider.getDailyRecommendSongs) {
         res.status(501).json({ error: "Not supported by this provider" });
         return;
@@ -290,9 +324,8 @@ export function createMusicRouter(
 
   router.get("/personal/fm", requireNotGuest, async (req, res) => {
     try {
-      const bot = resolveBot(req, res);
-      if (!bot) return;
-      const provider = providerFor(bot, req.query.platform as string);
+      const provider = resolveProvider(req, res, req.query.platform);
+      if (!provider) return;
       if (!provider.getPersonalFm) {
         res.status(501).json({ error: "Not supported by this provider" });
         return;
@@ -307,9 +340,8 @@ export function createMusicRouter(
 
   router.get("/user/playlists", requireNotGuest, async (req, res) => {
     try {
-      const bot = resolveBot(req, res);
-      if (!bot) return;
-      const provider = providerFor(bot, req.query.platform as string);
+      const provider = resolveProvider(req, res, req.query.platform);
+      if (!provider) return;
       if (!provider.getUserPlaylists) {
         res.status(501).json({ error: "Not supported by this provider" });
         return;
@@ -324,9 +356,8 @@ export function createMusicRouter(
 
   router.get("/playlist/:id/detail", async (req, res) => {
     try {
-      const bot = resolveBot(req, res);
-      if (!bot) return;
-      const provider = providerFor(bot, req.query.platform as string);
+      const provider = resolveProvider(req, res, req.query.platform);
+      if (!provider) return;
       if (!provider.getPlaylistDetail) {
         res.status(501).json({ error: "Not supported by this provider" });
         return;
@@ -364,7 +395,112 @@ export function createMusicRouter(
     }
   });
 
-  // Get current quality (per-bot)
+  // Enabled sources + default platform, for the web UI (source tabs, default
+  // search/playback source). Without a config (unit-test routers) everything
+  // reports enabled with the legacy netease default.
+  router.get("/providers", (_req, res) => {
+    const ALL_PLATFORMS = [
+      "jellyfin",
+      "netease",
+      "qq",
+      "bilibili",
+      "youtube",
+      "kugou",
+      "spotify",
+      "local",
+    ];
+    res.json({
+      enabled: config ? ALL_PLATFORMS.filter((p) => isProviderEnabled(config, p)) : ALL_PLATFORMS,
+      default: config ? defaultPlatform(config) : "netease",
+    });
+  });
+
+  // ─── Jellyfin home-page data (per-bot) ──────────────────────────────────
+  // The concrete JellyfinProvider surface these endpoints consume; the router
+  // only knows the MusicProvider interface, so narrow structurally (same
+  // pattern as localProvider.uploadAudio above).
+  type JellyfinHomeProvider = MusicProvider & {
+    getLatestAlbums?: (limit?: number) => Promise<Album[]>;
+    getMostPlayed?: (limit?: number) => Promise<Song[]>;
+    getFavoriteSongs?: (limit?: number) => Promise<Song[]>;
+    getGenres?: (limit?: number) => Promise<{ id: string; name: string }[]>;
+    getGenreSongs?: (genreId: string, limit?: number) => Promise<Song[]>;
+  };
+
+  /** Resolve the bot's jellyfin provider; 400 when the source is disabled. */
+  function jellyfinForBot(req: Request, res: Response): JellyfinHomeProvider | null {
+    const bot = resolveBot(req, res);
+    if (!bot) return null;
+    if (config && !isProviderEnabled(config, "jellyfin")) {
+      res.status(400).json({ error: "音源未启用：jellyfin (provider disabled)" });
+      return null;
+    }
+    return bot.getProviderFor("jellyfin") as JellyfinHomeProvider;
+  }
+
+  router.get("/jellyfin/latest-albums", async (req, res) => {
+    try {
+      const p = jellyfinForBot(req, res);
+      if (!p) return;
+      const limit = parseInt(req.query.limit as string) || 12;
+      res.json({ albums: (await p.getLatestAlbums?.(limit)) ?? [] });
+    } catch (err) {
+      logger.error({ err }, "Jellyfin latest albums failed");
+      res.status(500).json({ error: (err as Error).message });
+    }
+  });
+
+  router.get("/jellyfin/most-played", async (req, res) => {
+    try {
+      const p = jellyfinForBot(req, res);
+      if (!p) return;
+      const limit = parseInt(req.query.limit as string) || 12;
+      res.json({ songs: (await p.getMostPlayed?.(limit)) ?? [] });
+    } catch (err) {
+      logger.error({ err }, "Jellyfin most played failed");
+      res.status(500).json({ error: (err as Error).message });
+    }
+  });
+
+  // Favorites are account-level data — guests don't get them (matches the
+  // requireNotGuest gate on /user/playlists).
+  router.get("/jellyfin/favorites", requireNotGuest, async (req, res) => {
+    try {
+      const p = jellyfinForBot(req, res);
+      if (!p) return;
+      const limit = parseInt(req.query.limit as string) || 100;
+      res.json({ songs: (await p.getFavoriteSongs?.(limit)) ?? [] });
+    } catch (err) {
+      logger.error({ err }, "Jellyfin favorites failed");
+      res.status(500).json({ error: (err as Error).message });
+    }
+  });
+
+  router.get("/jellyfin/genres", async (req, res) => {
+    try {
+      const p = jellyfinForBot(req, res);
+      if (!p) return;
+      const limit = parseInt(req.query.limit as string) || 30;
+      res.json({ genres: (await p.getGenres?.(limit)) ?? [] });
+    } catch (err) {
+      logger.error({ err }, "Jellyfin genres failed");
+      res.status(500).json({ error: (err as Error).message });
+    }
+  });
+
+  router.get("/jellyfin/genre/:id/songs", async (req, res) => {
+    try {
+      const p = jellyfinForBot(req, res);
+      if (!p) return;
+      const limit = parseInt(req.query.limit as string) || 100;
+      res.json({ songs: (await p.getGenreSongs?.(req.params.id, limit)) ?? [] });
+    } catch (err) {
+      logger.error({ err }, "Jellyfin genre songs failed");
+      res.status(500).json({ error: (err as Error).message });
+    }
+  });
+
+  // Get current quality (per-bot, all platforms)
   router.get("/quality", requireNotGuest, (req, res) => {
     const bot = resolveBot(req, res);
     if (!bot) return;
@@ -374,10 +510,12 @@ export function createMusicRouter(
       bilibili: bot.getProviderFor("bilibili").getQuality(),
       local: bot.getProviderFor("local").getQuality(),
       kugou: bot.getProviderFor("kugou").getQuality(),
+      spotify: bot.getProviderFor("spotify").getQuality(),
+      jellyfin: bot.getProviderFor("jellyfin").getQuality(),
     });
   });
 
-  // Set quality (per-bot)
+  // Set quality (per-bot, per-platform; persisted in the bot_music_quality table)
   router.post("/quality", requirePermission("quality"), async (req, res) => {
     const { quality, platform } = req.body;
     if (!quality) {

@@ -5,6 +5,7 @@ import type { CookieStore, CookiePlatform } from "../../music/auth.js";
 import type { BotManager } from "../../bot/manager.js";
 import type { BotInstance } from "../../bot/instance.js";
 import type { Logger } from "../../logger.js";
+import type { BotConfig, JellyfinConfig } from "../../data/config.js";
 import { requirePermission } from "../middleware/requirePermission.js";
 import { requireNotGuest } from "../middleware/requireNotGuest.js";
 
@@ -19,6 +20,7 @@ type Platform = "netease" | "qq" | "bilibili" | "youtube" | "local" | "kugou";
 export function createAuthRouter(
   botManager: BotManager,
   cookieStore: CookieStore,
+  _config: BotConfig | undefined,
   logger: Logger,
 ): Router {
   const router = Router();
@@ -116,6 +118,107 @@ export function createAuthRouter(
     }
   });
 
+  // ─── Jellyfin (per-bot connection) ─────────────────────────────────────
+  // Jellyfin has no QR/cookie flow — each bot's connection is configured with
+  // its own credentials, persisted as a JSON blob in the bot's cookie slot.
+  // The live provider instance is reconfigured in place so a save takes effect
+  // without reconnecting the bot.
+  type JellyfinCapable = MusicProvider & {
+    configure?: (cfg: JellyfinConfig) => void;
+    testConnection?: (
+      candidate?: JellyfinConfig,
+    ) => Promise<{ ok: boolean; serverName?: string; version?: string; error?: string }>;
+  };
+
+  function jellyfinForBot(
+    req: Request,
+    res: Response,
+  ): { bot: BotInstance; provider: JellyfinCapable } | null {
+    const bot = resolveBot(req, res);
+    if (!bot) return null;
+    const provider = bot.getProviderFor("jellyfin") as JellyfinCapable;
+    if (!provider.configure || !provider.testConnection) {
+      res.status(501).json({ error: "Jellyfin provider not available" });
+      return null;
+    }
+    return { bot, provider };
+  }
+
+  /** The bot's stored jellyfin credentials (for masked-field fallbacks). */
+  function storedJellyfinCredentials(botId: string): Partial<JellyfinConfig> {
+    try {
+      return JSON.parse(cookieStore.load(botId, "jellyfin") || "{}") as Partial<JellyfinConfig>;
+    } catch {
+      return {};
+    }
+  }
+
+  function jellyfinCandidateFrom(
+    body: Record<string, unknown>,
+    stored: Partial<JellyfinConfig>,
+  ): JellyfinConfig {
+    const str = (v: unknown, fallback: string) =>
+      typeof v === "string" && v.trim() !== "" ? v.trim() : fallback;
+    return {
+      serverUrl: str(body.serverUrl, stored.serverUrl ?? ""),
+      authMode:
+        body.authMode === "apikey" || body.authMode === "userpass"
+          ? body.authMode
+          : stored.authMode ?? "userpass",
+      username: str(body.username, stored.username ?? ""),
+      password: str(body.password, stored.password ?? ""),
+      apiKey: str(body.apiKey, stored.apiKey ?? ""),
+      userId: str(body.userId, stored.userId ?? ""),
+    };
+  }
+
+  // Round-trips /System/Info so Settings can verify form values BEFORE saving.
+  // Empty/missing credential fields fall back to the bot's stored credentials,
+  // so a masked (not re-entered) password still tests the live setup.
+  router.post("/jellyfin/test", requirePermission("platform.auth"), async (req, res) => {
+    const target = jellyfinForBot(req, res);
+    if (!target) return;
+    try {
+      const body = (req.body ?? {}) as Record<string, unknown>;
+      const stored = storedJellyfinCredentials(target.bot.id);
+      res.json(await target.provider.testConnection!(jellyfinCandidateFrom(body, stored)));
+    } catch (err) {
+      logger.error({ err }, "Jellyfin test connection failed");
+      res.status(500).json({ error: (err as Error).message });
+    }
+  });
+
+  // Save this bot's Jellyfin credentials: persist to the bot's cookie slot,
+  // reconfigure the live provider (configure() drops the cached token only
+  // when credential-relevant fields actually changed), and verify.
+  router.post("/jellyfin/login", requirePermission("platform.auth"), async (req, res) => {
+    const target = jellyfinForBot(req, res);
+    if (!target) return;
+    try {
+      const body = (req.body ?? {}) as Record<string, unknown>;
+      const stored = storedJellyfinCredentials(target.bot.id);
+      const candidate = jellyfinCandidateFrom(body, stored);
+      if (!candidate.serverUrl) {
+        res.status(400).json({ error: "serverUrl is required" });
+        return;
+      }
+      botManager.saveJellyfinCredentials(target.bot.id, {
+        serverUrl: candidate.serverUrl,
+        authMode: candidate.authMode,
+        username: candidate.username,
+        password: candidate.password,
+        apiKey: candidate.apiKey,
+      });
+      target.provider.configure!(candidate);
+      const result = await target.provider.testConnection!(candidate);
+      logger.info({ botId: target.bot.id, ok: result.ok }, "Jellyfin connection saved");
+      res.json(result);
+    } catch (err) {
+      logger.error({ err }, "Jellyfin login failed");
+      res.status(500).json({ error: (err as Error).message });
+    }
+  });
+
   router.post("/sms/send", requirePermission("platform.auth"), async (req, res) => {
     try {
       const { phone } = req.body;
@@ -173,6 +276,14 @@ export function createAuthRouter(
       res
         .status(400)
         .json({ error: "YouTube does not use cookies (uses yt-dlp binary)" });
+      return;
+    }
+    // Jellyfin auth uses the per-bot /jellyfin/login route (credential blob),
+    // not a manual cookie; falling through would clobber the NetEase entry.
+    if (platform === "jellyfin") {
+      res
+        .status(400)
+        .json({ error: "Jellyfin 通过 /api/auth/jellyfin/login 配置连接，不支持手动 Cookie" });
       return;
     }
     const bot = resolveBot(req, res);

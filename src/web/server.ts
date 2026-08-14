@@ -18,6 +18,15 @@ import { createUsersRouter } from "./api/users.js";
 import { createAuditStore } from "../data/audit.js";
 import { createAuditRouter } from "./api/audit.js";
 import { createFavoritesRouter } from "./api/favorites.js";
+import { createSavedQueuesRouter } from "./api/saved-queues.js";
+import { createSpotifyRouter } from "./api/spotify.js";
+import type { SpotifyOAuth } from "../music/spotify/spotify-oauth.js";
+import type { SpotifyProvider } from "../music/spotify/provider.js";
+import { resolveSpotifyBackendKind } from "../music/spotify/backend-select.js";
+import {
+  isGoLibrespotPresent,
+  isLibrespotPresent,
+} from "../music/spotify/binary.js";
 import { setupWebSocket } from "./websocket.js";
 import { setupVoiceDownlink } from "./voice-downlink.js";
 import { createUserStore } from "../data/users.js";
@@ -42,6 +51,9 @@ export interface WebServerOptions {
   cookieStore: CookieStore;
   avatarStore: AvatarStore;
   staticDir?: string;
+  /** Process-wide shared Spotify OAuth (single account, Stage 3). When set, the
+   *  /api/spotify {login,callback,status} router is mounted. */
+  spotifyOAuth?: SpotifyOAuth;
 }
 
 export interface WebServer {
@@ -58,12 +70,19 @@ export function createWebServer(options: WebServerOptions): WebServer {
     app.set("trust proxy", true);
   }
 
-  // Security headers: prevent the WebUI from being embedded in a third-party
-  // iframe (clickjacking defence). CSP frame-ancestors is the modern equivalent
-  // of X-Frame-Options; both are set for compatibility across browsers.
+  // Security headers:
+  //  • X-Frame-Options / CSP frame-ancestors — prevent the WebUI from being
+  //    embedded in a third-party iframe (clickjacking defence). CSP
+  //    frame-ancestors is the modern equivalent of X-Frame-Options; both are
+  //    set for compatibility across browsers.
+  //  • X-Robots-Tag — keep deployed instances out of search-engine indexes
+  //    (issue #128: searching "TsmusicBot" surfaced strangers' WebUI URLs).
+  //    Set on EVERY response so JSON/API responses and the SPA shell are all
+  //    covered; complements /robots.txt and the <meta name="robots"> tag.
   app.use((_req, res, next) => {
     res.setHeader("X-Frame-Options", "DENY");
     res.setHeader("Content-Security-Policy", "frame-ancestors 'none'");
+    res.setHeader("X-Robots-Tag", "noindex, nofollow");
     next();
   });
 
@@ -76,8 +95,15 @@ export function createWebServer(options: WebServerOptions): WebServer {
   const permissions = createPermissionStore(options.database.db);
 
   // ─── Public routes (no auth, no CSRF) ───────────────────────────────────
+  // Disallow every crawler (issue #128). Declared before the static SPA
+  // fallback so this wins over index.html for /robots.txt. Belt-and-braces
+  // with the X-Robots-Tag header above and the <meta name="robots"> tag.
+  app.get("/robots.txt", (_req, res) => {
+    res.type("text/plain").send("User-agent: *\nDisallow: /\n");
+  });
+
   app.get("/api/health", (_req, res) => {
-    res.json({ status: "ok", version: "0.3.3" });
+    res.json({ status: "ok", version: "0.4.0" });
   });
 
   app.get("/api/config/public-url", (_req, res) => {
@@ -116,6 +142,14 @@ export function createWebServer(options: WebServerOptions): WebServer {
       options.database,
       options.avatarStore,
       (cfg) => onGuestPolicyChanged(cfg),
+      // I2: so saving a Client ID in Settings re-configures the live OAuth
+      // (no restart needed for the UI-entered-creds -> Connect flow).
+      options.spotifyOAuth,
+      // R2-4: so saving Spotify creds in Settings also refreshes the live Web API
+      // search provider (search + getAuthStatus) without a process restart. The
+      // provider lives on the shared factory (see index.ts); narrow it here for
+      // the setCreds contract. Jellyfin is per-bot (no global re-configure).
+      options.botManager.getSpotifyProvider() as SpotifyProvider,
     )
   );
   app.use(
@@ -127,9 +161,47 @@ export function createWebServer(options: WebServerOptions): WebServer {
   ));
   app.use(
     "/api/auth",
-    createAuthRouter(options.botManager, options.cookieStore, logger)
+    createAuthRouter(options.botManager, options.cookieStore, options.config, logger)
   );
+  if (options.spotifyOAuth) {
+    app.use(
+      "/api/spotify",
+      createSpotifyRouter({
+        oauth: options.spotifyOAuth,
+        logger,
+        getBackendInfo: () => {
+          // PATH-aware presence (Bug m1): a PATH-installed binary (bare name)
+          // is resolved against $PATH, not existsSync()'d against cwd.
+          const goPresent = isGoLibrespotPresent();
+          const rustPresent = isLibrespotPresent();
+          const resolved = resolveSpotifyBackendKind(
+            options.config.spotify.backend,
+            goPresent,
+            rustPresent,
+          );
+          return {
+            backend: resolved ?? "none",
+            deviceName: options.config.spotify.deviceName,
+            binaryAvailable: resolved !== null,
+          };
+        },
+        webUiRedirect: "/",
+      }),
+    );
+  }
   app.use("/api/favorites", requireNotGuest, createFavoritesRouter(options.database, logger));
+  // Saved queues (Feature 1, #119). Members + admins only (requireNotGuest);
+  // the router itself 403s every route unless savedQueuesEnabled is on.
+  app.use(
+    "/api/saved-queues",
+    requireNotGuest,
+    createSavedQueuesRouter(
+      options.database,
+      options.botManager,
+      () => options.config.savedQueuesEnabled,
+      logger,
+    ),
+  );
 
   // admin-only routes
   app.use("/api/users", requireAdmin, createUsersRouter(users, sessions, audit, logger, permissions));

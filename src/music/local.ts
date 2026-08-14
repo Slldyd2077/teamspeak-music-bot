@@ -214,12 +214,12 @@ export class LocalMusicProvider implements MusicProvider {
     return song;
   }
 
-  async search(query: string, limit = 20): Promise<SearchResult> {
+  async search(query: string, limit = 20, offset = 0): Promise<SearchResult> {
     const q = query.trim().toLowerCase();
     const songs = this.records
       .filter((r) => existsSync(r.filePath))
       .filter((r) => !q || `${r.name} ${r.artist} ${r.album} ${r.originalName}`.toLowerCase().includes(q))
-      .slice(0, limit)
+      .slice(offset, offset + limit)
       .map((r) => this.toSong(r));
     return { songs, playlists: [], albums: [] };
   }

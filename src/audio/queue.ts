@@ -10,10 +10,23 @@ export interface QueuedSong {
   name: string;
   artist: string;
   album: string;
-  platform: "netease" | "qq" | "bilibili" | "youtube" | "local" | "kugou";
+  platform: "netease" | "qq" | "bilibili" | "youtube" | "local" | "kugou" | "spotify" | "jellyfin";
   url?: string; // resolved lazily at play time
   coverUrl: string;
   duration: number; // seconds
+  requestedBy?: string;
+}
+
+/**
+ * A persistable view of a queue: its songs (minus the lazily-resolved `url`),
+ * the current index, and the play mode. Used to snapshot/restore the live queue
+ * across restarts (issue #119). Derived state (playedIndices/history/forward
+ * stack) is intentionally NOT captured — restore() rebuilds it consistently.
+ */
+export interface QueueSnapshot {
+  songs: Omit<QueuedSong, "url">[];
+  currentIndex: number;
+  mode: PlayMode;
 }
 
 export class PlayQueue {
@@ -47,8 +60,12 @@ export class PlayQueue {
    * or queue empty), so the existing "add → idle bot starts playing"
    * flow continues to work.
    *
-   * Shifts playedIndices and history entries > currentIndex by +1 so
-   * their references stay valid after the splice.
+   * Shifts playedIndices, history and forwardStack entries > currentIndex
+   * by +1 so their references stay valid after the splice.
+   *
+   * In the random modes the array position alone means nothing — next()
+   * picks from the shuffle bag — so the insert slot is also recorded on
+   * the forward stack, which next() consults first (issue #141).
    */
   addNext(song: QueuedSong): void {
     if (this.currentIndex < 0 || this.songs.length === 0) {
@@ -67,6 +84,23 @@ export class PlayQueue {
     this.history = this.history.map((i) =>
       i > this.currentIndex ? i + 1 : i,
     );
+
+    this.forwardStack = this.forwardStack.map((i) =>
+      i > this.currentIndex ? i + 1 : i,
+    );
+
+    // Push AFTER the shift, or the slot we just claimed would be shifted
+    // too. Stacking makes repeated !pn play in the order the queue shows
+    // them (each insert lands in front of the previous one), matching what
+    // sequential mode does with the same array. Bounded like history: drop the
+    // OLDEST pending entry rather than refusing the newest, so the song the
+    // user just asked for is always the one that gets honoured.
+    if (this.mode === PlayMode.Random || this.mode === PlayMode.RandomLoop) {
+      this.forwardStack.push(insertAt);
+      if (this.forwardStack.length > PlayQueue.HISTORY_LIMIT) {
+        this.forwardStack.shift();
+      }
+    }
   }
 
   remove(index: number): QueuedSong | null {
@@ -90,6 +124,13 @@ export class PlayQueue {
     // Same shift logic for history — drop entries pointing at the
     // removed song; shift entries > index down by 1.
     this.history = this.history
+      .filter((idx) => idx !== index)
+      .map((idx) => (idx > index ? idx - 1 : idx));
+
+    // …and for the forward stack, which now also carries !pn insert slots
+    // (issue #141). Left unshifted, a removal elsewhere in the queue would
+    // silently repoint the entry at whatever song slid into that slot.
+    this.forwardStack = this.forwardStack
       .filter((idx) => idx !== index)
       .map((idx) => (idx > index ? idx - 1 : idx));
 
@@ -172,15 +213,22 @@ export class PlayQueue {
       }
       case PlayMode.Random:
       case PlayMode.RandomLoop: {
-        // 优先回到前进栈记录的位置（prev 退回的歌）
-        if (this.forwardStack.length > 0) {
+        // 优先回到前进栈记录的位置（prev 退回的歌，或 !pn 插入的歌）。
+        // Keep popping past entries that no longer point anywhere useful,
+        // the way prev() walks past stale history entries. Without the loop a
+        // prev() that pushed the current index would swallow the pending !pn
+        // entry behind it. The range check is belt-and-braces — addNext and
+        // remove keep the stack in sync — but an out-of-range index here would
+        // set currentIndex out of bounds and hand back `undefined`, which
+        // BotInstance.playNext reads as end-of-queue and stops playback.
+        while (this.forwardStack.length > 0) {
           const target = this.forwardStack.pop()!;
-          if (target !== this.currentIndex) {
-            this.pushHistory(this.currentIndex);
-            this.currentIndex = target;
-            this.playedIndices.add(target);
-            return this.songs[target];
-          }
+          if (target < 0 || target >= this.songs.length) continue;
+          if (target === this.currentIndex) continue;
+          this.pushHistory(this.currentIndex);
+          this.currentIndex = target;
+          this.playedIndices.add(target);
+          return this.songs[target];
         }
 
         // Shuffle bag: pick uniformly from the songs not yet played this
@@ -298,5 +346,33 @@ export class PlayQueue {
   /** Number of songs not yet played in Random mode. */
   unplayedCount(): number {
     return this.songs.length - this.playedIndices.size;
+  }
+
+  /**
+   * Capture the queue as a persistable snapshot (songs minus `url`, current
+   * index, mode). Songs keep their `requestedBy` so restored play-history
+   * attribution stays correct. See restore().
+   */
+  snapshot(): QueueSnapshot {
+    return {
+      songs: this.songs.map(({ url: _url, ...s }) => s),
+      currentIndex: this.currentIndex,
+      mode: this.mode,
+    };
+  }
+
+  /**
+   * Replace the queue contents from a snapshot. Rebuilds the derived
+   * playedIndices/history/forwardStack to a clean, consistent state for the
+   * restored index (an out-of-range index degrades to -1 = "nothing current").
+   */
+  restore(s: QueueSnapshot): void {
+    this.songs = s.songs.map((song) => ({ ...song }));
+    this.mode = s.mode;
+    this.currentIndex =
+      s.currentIndex >= 0 && s.currentIndex < this.songs.length ? s.currentIndex : -1;
+    this.playedIndices = new Set(this.currentIndex >= 0 ? [this.currentIndex] : []);
+    this.history = [];
+    this.forwardStack = [];
   }
 }

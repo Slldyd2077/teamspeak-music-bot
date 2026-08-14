@@ -10,10 +10,21 @@ export interface Song {
   album: string;
   duration: number;
   coverUrl: string;
-  platform: 'netease' | 'qq' | 'bilibili' | 'youtube' | 'local' | 'kugou';
+  platform: 'netease' | 'qq' | 'bilibili' | 'youtube' | 'local' | 'kugou' | 'spotify' | 'jellyfin';
+  requestedBy?: string;
+  playedAt?: string;
 }
 
-export type Source = 'netease' | 'qq' | 'kugou';
+export type Source = 'jellyfin' | 'netease' | 'qq' | 'kugou' | 'spotify';
+
+export interface AlbumItem {
+  id: string;
+  name: string;
+  artist: string;
+  coverUrl: string;
+  songCount: number;
+  platform: string;
+}
 
 export interface BotStatus {
   id: string;
@@ -99,12 +110,26 @@ export const usePlayerStore = defineStore('player', {
     timings: {} as Record<string, TimingState>,
     theme: 'dark' as 'dark' | 'light',
 
+    // Which sources the server has enabled (GET /api/music/providers) and the
+    // configured default. Empty until fetched — sections stay hidden briefly.
+    enabledProviders: [] as string[],
+    defaultSource: 'netease' as string,
+
+    // Whether the admin enabled save/load queues (#119). Gates the nav entry
+    // and the /saved-queues page. Fetched from /api/bot/settings (non-guest).
+    savedQueuesEnabled: false,
+
     // Home page cache, split by source
-    recommendPlaylists: { netease: [] as PlaylistItem[], qq: [] as PlaylistItem[], kugou: [] as PlaylistItem[] },
-    dailySongs:         { netease: [] as Song[],         qq: [] as Song[],         kugou: [] as Song[] },
-    userPlaylists:      { netease: [] as PlaylistItem[], qq: [] as PlaylistItem[], kugou: [] as PlaylistItem[] },
+    recommendPlaylists: { netease: [] as PlaylistItem[], qq: [] as PlaylistItem[], kugou: [] as PlaylistItem[], spotify: [] as PlaylistItem[] },
+    dailySongs:         { netease: [] as Song[],         qq: [] as Song[],         kugou: [] as Song[], spotify: [] as Song[] },
+    userPlaylists:      { jellyfin: [] as PlaylistItem[], netease: [] as PlaylistItem[], qq: [] as PlaylistItem[], kugou: [] as PlaylistItem[], spotify: [] as PlaylistItem[] },
     bilibiliPopular: [] as Song[],
-    authStatus: { netease: false, qq: false, kugou: false },
+    // Jellyfin home sections (shown only when the optional source is enabled)
+    jellyfinLatestAlbums: [] as AlbumItem[],
+    jellyfinMostPlayed: [] as Song[],
+    jellyfinFavorites: [] as Song[],
+    jellyfinGenres: [] as { id: string; name: string }[],
+    authStatus: { jellyfin: false, netease: false, qq: false, kugou: false, spotify: false },
     lastFetchTime: 0,
 
     // Favorited playlists (fetched from server, isolated per WebUI user)
@@ -152,13 +177,19 @@ export const usePlayerStore = defineStore('player', {
       const maxDuration = this.activeBot.currentSong.duration || Infinity;
       return interpolateElapsed(timing, this.isPaused, maxDuration);
     },
-    /** Sources that are currently logged in. Order: netease before qq. */
+    /** Sources that are currently logged in. Jellyfin (when enabled) leads. */
     availableSources(): Source[] {
       const s: Source[] = [];
+      if (this.authStatus.jellyfin) s.push('jellyfin');
       if (this.authStatus.netease) s.push('netease');
       if (this.authStatus.qq) s.push('qq');
       if (this.authStatus.kugou) s.push('kugou');
+      if (this.authStatus.spotify) s.push('spotify');
       return s;
+    },
+    /** Whether a source is enabled server-side (enabledProviders gate). */
+    sourceEnabled(): (platform: string) => boolean {
+      return (platform: string) => this.enabledProviders.includes(platform);
     },
   },
 
@@ -568,28 +599,67 @@ export const usePlayerStore = defineStore('player', {
       return this.favoritedPlaylists.some((f) => f.playlistId === playlistId && f.platform === platform);
     },
 
+    /** Load global bot settings we care about client-side (currently just the
+     *  saved-queues gate). Guests get a 403 here, which we swallow so the nav
+     *  entry simply stays hidden for them. */
+    async fetchBotSettings() {
+      try {
+        const res = await axios.get('/api/bot/settings');
+        this.savedQueuesEnabled = res.data?.savedQueuesEnabled === true;
+      } catch {
+        // not critical (guests 403; keep previous value otherwise)
+      }
+    },
+
+    /** Load the server-side source gate (enabledProviders + default). */
+    async fetchProviders() {
+      try {
+        const res = await axios.get('/api/music/providers');
+        this.enabledProviders = res.data.enabled ?? [];
+        if (typeof res.data.default === 'string') this.defaultSource = res.data.default;
+      } catch {
+        // keep previous values (backend briefly unavailable)
+      }
+    },
+
     async fetchHomeData() {
+      // The provider gate decides which sources to even ask about — disabled
+      // sources are skipped entirely (their sidecars may not be running).
+      await this.fetchProviders();
+      const has = (p: string) => this.enabledProviders.includes(p);
+      const skip = Promise.reject(new Error('provider disabled'));
+      // Pre-rejected sentinel: mark handled so it never surfaces as unhandled.
+      skip.catch(() => {});
+
       // Always check auth status first — if it changed since the cached
       // fetch (e.g., user logged in/out as a different account), the
       // cached playlists belong to a different user and we MUST refetch.
       const botId = this.activeBotId ?? undefined;
-      const [neAuthRes, qqAuthRes, kugouAuthRes] = await Promise.allSettled([
-        axios.get('/api/auth/status', { params: { platform: 'netease', botId } }),
-        axios.get('/api/auth/status', { params: { platform: 'qq', botId } }),
-        axios.get('/api/auth/status', { params: { platform: 'kugou', botId } }),
+      const [jfAuthRes, neAuthRes, qqAuthRes, kugouAuthRes, spAuthRes] = await Promise.allSettled([
+        has('jellyfin') ? axios.get('/api/auth/status', { params: { platform: 'jellyfin', botId } }) : skip,
+        has('netease') ? axios.get('/api/auth/status', { params: { platform: 'netease', botId } }) : skip,
+        has('qq') ? axios.get('/api/auth/status', { params: { platform: 'qq', botId } }) : skip,
+        has('kugou') ? axios.get('/api/auth/status', { params: { platform: 'kugou', botId } }) : skip,
+        has('spotify') ? axios.get('/api/auth/status', { params: { platform: 'spotify', botId } }) : skip,
       ]);
       const newAuth = {
+        jellyfin: jfAuthRes.status === 'fulfilled' && !!jfAuthRes.value.data?.loggedIn,
         netease: neAuthRes.status === 'fulfilled' && !!neAuthRes.value.data?.loggedIn,
         qq:      qqAuthRes.status === 'fulfilled' && !!qqAuthRes.value.data?.loggedIn,
         kugou:   kugouAuthRes.status === 'fulfilled' && !!kugouAuthRes.value.data?.loggedIn,
+        spotify: spAuthRes.status === 'fulfilled' && !!spAuthRes.value.data?.loggedIn,
       };
       const authChanged =
+        newAuth.jellyfin !== this.authStatus.jellyfin ||
         newAuth.netease !== this.authStatus.netease ||
         newAuth.qq !== this.authStatus.qq ||
-        newAuth.kugou !== this.authStatus.kugou;
+        newAuth.kugou !== this.authStatus.kugou ||
+        newAuth.spotify !== this.authStatus.spotify;
+      this.authStatus.jellyfin = newAuth.jellyfin;
       this.authStatus.netease = newAuth.netease;
       this.authStatus.qq = newAuth.qq;
       this.authStatus.kugou = newAuth.kugou;
+      this.authStatus.spotify = newAuth.spotify;
 
       // Favorites are user-local and cheap; always refresh them, even on a
       // home-data cache hit, so hearts stay correct across tabs/sessions.
@@ -606,17 +676,23 @@ export const usePlayerStore = defineStore('player', {
 
       // 2. NetEase data: recommend playlists work anonymously; daily/user
       // playlists need login but Promise.allSettled isolates failures.
-      const neteasePromises = [
-        axios.get('/api/music/recommend/playlists', { params: { platform: 'netease', botId } }),
-        axios.get('/api/music/recommend/songs',     { params: { platform: 'netease', botId } }),
-        axios.get('/api/music/user/playlists',      { params: { platform: 'netease', botId } }),
-      ];
+      const emptyPlaylists = { data: { playlists: [] } };
+      const emptySongs     = { data: { songs: [] } };
+      const neteasePromises = has('netease')
+        ? [
+            axios.get('/api/music/recommend/playlists', { params: { platform: 'netease', botId } }),
+            axios.get('/api/music/recommend/songs',     { params: { platform: 'netease', botId } }),
+            axios.get('/api/music/user/playlists',      { params: { platform: 'netease', botId } }),
+          ]
+        : [
+            Promise.resolve(emptyPlaylists),
+            Promise.resolve(emptySongs),
+            Promise.resolve(emptyPlaylists),
+          ];
 
       // 3. QQ data: only fetch when QQ is logged in. When not logged in,
       // resolve to empty payloads so the same indexed handling works.
-      const emptyPlaylists = { data: { playlists: [] } };
-      const emptySongs     = { data: { songs: [] } };
-      const qqPromises = this.authStatus.qq
+      const qqPromises = has('qq') && this.authStatus.qq
         ? [
             axios.get('/api/music/recommend/playlists', { params: { platform: 'qq', botId } }),
             axios.get('/api/music/recommend/songs',     { params: { platform: 'qq', botId } }),
@@ -630,7 +706,7 @@ export const usePlayerStore = defineStore('player', {
 
       // 4. Kugou data: every section (incl. recommend playlists) needs login,
       // so gate all three on auth like QQ.
-      const kugouPromises = this.authStatus.kugou
+      const kugouPromises = has('kugou') && this.authStatus.kugou
         ? [
             axios.get('/api/music/recommend/playlists', { params: { platform: 'kugou', botId } }),
             axios.get('/api/music/recommend/songs',     { params: { platform: 'kugou', botId } }),
@@ -642,16 +718,49 @@ export const usePlayerStore = defineStore('player', {
             Promise.resolve(emptyPlaylists),
           ];
 
-      const biliPromise = axios.get('/api/music/bilibili/popular', { params: { limit: 12, botId } });
+      const biliPromise = has('bilibili')
+        ? axios.get('/api/music/bilibili/popular', { params: { limit: 12, botId } })
+        : Promise.resolve(emptySongs);
+
+      // 5. Jellyfin home sections (per-bot connection). Favorites are
+      // guest-blocked server-side; allSettled turns that 403 into an empty section.
+      const jellyfinPromises = has('jellyfin')
+        ? [
+            axios.get('/api/music/jellyfin/latest-albums', { params: { limit: 12, botId } }),
+            axios.get('/api/music/jellyfin/most-played',   { params: { limit: 12, botId } }),
+            axios.get('/api/music/jellyfin/favorites',     { params: { limit: 12, botId } }),
+            axios.get('/api/music/jellyfin/genres',        { params: { botId } }),
+            axios.get('/api/music/user/playlists',         { params: { platform: 'jellyfin', botId } }),
+          ]
+        : [
+            Promise.resolve({ data: { albums: [] } }),
+            Promise.resolve(emptySongs),
+            Promise.resolve(emptySongs),
+            Promise.resolve({ data: { genres: [] } }),
+            Promise.resolve(emptyPlaylists),
+          ];
 
       const results = await Promise.allSettled([
         ...neteasePromises,
         ...qqPromises,
         ...kugouPromises,
         biliPromise,
+        ...jellyfinPromises,
       ]);
 
-      const [neRecPL, neDaily, neUserPL, qqRecPL, qqDaily, qqUserPL, kgRecPL, kgDaily, kgUserPL, bili] = results;
+      const [neRecPL, neDaily, neUserPL, qqRecPL, qqDaily, qqUserPL, kgRecPL, kgDaily, kgUserPL, bili,
+        jfLatest, jfMost, jfFav, jfGenres, jfUserPL] = results;
+
+      this.jellyfinLatestAlbums =
+        jfLatest.status === 'fulfilled' ? (jfLatest.value.data.albums ?? []) : [];
+      this.jellyfinMostPlayed =
+        jfMost.status === 'fulfilled' ? (jfMost.value.data.songs ?? []) : [];
+      this.jellyfinFavorites =
+        jfFav.status === 'fulfilled' ? (jfFav.value.data.songs ?? []) : [];
+      this.jellyfinGenres =
+        jfGenres.status === 'fulfilled' ? (jfGenres.value.data.genres ?? []) : [];
+      this.userPlaylists.jellyfin =
+        jfUserPL.status === 'fulfilled' ? (jfUserPL.value.data.playlists ?? []) : [];
 
       this.recommendPlaylists.netease =
         neRecPL.status === 'fulfilled' ? (neRecPL.value.data.playlists ?? []) : [];
@@ -680,13 +789,42 @@ export const usePlayerStore = defineStore('player', {
       // Only mark as fetched if at least the auth-status calls succeeded —
       // a fully failed fetch (network blip / server down) should NOT be
       // cached for 5 minutes, otherwise the user has to hard-reload to
-      // recover when connectivity returns.
+      // recover when connectivity returns. (Disabled providers' checks are
+      // pre-rejected sentinels, so only enabled ones can vouch here.)
       const authOk =
+        jfAuthRes.status === 'fulfilled' ||
         neAuthRes.status === 'fulfilled' ||
         qqAuthRes.status === 'fulfilled' ||
         kugouAuthRes.status === 'fulfilled';
       if (authOk) {
         this.lastFetchTime = Date.now();
+      }
+    },
+
+    /**
+     * Play a whole Jellyfin genre: fetch its tracks, start the first, queue
+     * the rest. There is no bulk-queue endpoint, so the remainder is appended
+     * sequentially — capped at 30 tracks to keep the request burst small.
+     */
+    async playJellyfinGenre(genreId: string) {
+      if (!this.activeBotId) return;
+      try {
+        const res = await axios.get(`/api/music/jellyfin/genre/${genreId}/songs`, {
+          params: { limit: 30, botId: this.activeBotId },
+        });
+        const songs: Song[] = res.data.songs ?? [];
+        if (songs.length === 0) {
+          this.notify('该流派下没有曲目', 'info');
+          return;
+        }
+        await this.playSong(songs[0]);
+        for (const song of songs.slice(1)) {
+          await this.addSong(song);
+        }
+        this.notify(`已加入 ${songs.length} 首`, 'info');
+        this.fetchQueue();
+      } catch {
+        this.notify('播放流派失败', 'error');
       }
     },
   },
