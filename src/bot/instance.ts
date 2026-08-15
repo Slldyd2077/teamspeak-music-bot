@@ -51,6 +51,7 @@ import type { SpotifyOAuth } from "../music/spotify/spotify-oauth.js";
 import { VoiceDuckingController } from "./voice-ducking.js";
 import {
   ManagedVoiceClientRegistry,
+  type ManagedVoiceClientKind,
   type ManagedVoiceClientOwnerToken,
   type ManagedVoiceClientScope,
 } from "./managed-voice-clients.js";
@@ -179,6 +180,10 @@ export class BotInstance extends EventEmitter {
   private registeredVoiceClientOwner: ManagedVoiceClientOwnerToken | null = null;
   private registeredVoiceClientScope: ManagedVoiceClientScope | null = null;
   private registeredVoiceClientUid: string | null = null;
+  /** True while a browser voice link relays a human microphone through this
+   *  bot (see setWebVoiceActive). Voice-bridge bots trigger ducking on music
+   *  bots and never duck themselves. */
+  private webVoiceBridge = false;
   private spotifyController: SpotifyController;
   private queue: PlayQueue;
   private neteaseProvider: MusicProvider;
@@ -465,12 +470,30 @@ export class BotInstance extends EventEmitter {
 
     this.tsClient.on("voiceActivity", (activity: TS3VoiceActivity) => {
       if (!this.connected) return;
+      // Never react to our own packets — a voice-bridge bot must not duck the
+      // very human it is relaying.
       if (
-        this.managedVoiceClients.hasClientUid(activity.clientUid) ||
-        this.managedVoiceClients.has(this.voiceServerScope, activity.clientId)
+        activity.clientId === this.registeredVoiceClientId ||
+        activity.clientUid === this.registeredVoiceClientUid
       ) {
         return;
       }
+      // Managed "music" bots' packets are local playback and must not duck
+      // other bots. Voice-bridge bots relay a live human microphone (web
+      // voice callers), so their speech ducks music bots exactly like a
+      // native client's would. Unmanaged senders (native humans) pass too.
+      if (
+        this.managedVoiceClients.isManagedMusicClient(
+          this.voiceServerScope,
+          activity.clientId,
+          activity.clientUid,
+        )
+      ) {
+        return;
+      }
+      // While bridging a web caller this bot's output IS that person's voice;
+      // ducking it would attenuate them mid-sentence.
+      if (this.webVoiceBridge) return;
       this.voiceDucking.handleVoiceActivity(activity.clientId);
     });
 
@@ -501,6 +524,14 @@ export class BotInstance extends EventEmitter {
     });
   }
 
+  /** Flip the registry kind for this connection (web voice attach/detach). */
+  private updateManagedVoiceClientKind(kind: ManagedVoiceClientKind): void {
+    const clientId = this.registeredVoiceClientId;
+    const owner = this.registeredVoiceClientOwner;
+    if (clientId <= 0 || owner === null) return;
+    this.managedVoiceClients.setKind(this.voiceServerScope, clientId, owner, kind);
+  }
+
   private registerManagedVoiceClient(): void {
     this.unregisterManagedVoiceClient();
     const clientId = this.tsClient.getClientId();
@@ -509,7 +540,15 @@ export class BotInstance extends EventEmitter {
     const owner = {};
     const scope = { ...this.voiceServerScope };
     const clientUid = this.tsClient.getClientUid();
-    if (this.managedVoiceClients.register(scope, clientId, owner, clientUid)) {
+    if (
+      this.managedVoiceClients.register(
+        scope,
+        clientId,
+        owner,
+        clientUid,
+        this.webVoiceBridge ? "voice-bridge" : "music",
+      )
+    ) {
       this.registeredVoiceClientId = clientId;
       this.registeredVoiceClientOwner = owner;
       this.registeredVoiceClientScope = scope;
@@ -534,6 +573,10 @@ export class BotInstance extends EventEmitter {
       this.managedVoiceClients.unregister(scope, clientId, owner, clientUid);
     };
     if (graceMs > 0) {
+      // During the grace window the connection stays registered so in-flight
+      // packets cannot make other bots duck; keep that guarantee for a
+      // departing voice bridge too by classifying it as music playback.
+      this.managedVoiceClients.setKind(scope, clientId, owner, "music");
       const timer = setTimeout(unregister, graceMs);
       timer.unref?.();
     } else {
@@ -2038,8 +2081,15 @@ export class BotInstance extends EventEmitter {
     await this.tsClient.joinChannelById(cid, password);
   }
 
-  /** Show/hide the `<WEB通讯>` nickname marker while a browser is on the voice link. */
+  /** Show/hide the `<WEB通讯>` nickname marker while a browser is on the voice
+   *  link, and reclassify this connection: while active the bot relays a live
+   *  human microphone (voice-bridge) instead of playing music. */
   async setWebVoiceActive(active: boolean): Promise<void> {
+    this.webVoiceBridge = active;
+    this.updateManagedVoiceClientKind(active ? "voice-bridge" : "music");
+    // Ducking already in progress on this bot's output would now attenuate
+    // the bridged person's voice — clear it immediately.
+    if (active) this.voiceDucking.reset(false);
     await this.profileManager.setWebVoiceActive(active);
   }
 

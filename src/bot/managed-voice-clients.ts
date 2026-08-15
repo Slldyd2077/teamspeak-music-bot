@@ -20,6 +20,14 @@ export interface NormalizedManagedVoiceClientScope {
 export type ManagedVoiceClientOwnerToken = object | string | number | symbol;
 
 /**
+ * What a managed connection is for. "music" bots play local/streamed audio —
+ * their packets must never duck other bots. "voice-bridge" bots relay a live
+ * human microphone (web voice callers), so their packets ARE human speech and
+ * should trigger ducking on music bots exactly like a native client would.
+ */
+export type ManagedVoiceClientKind = "music" | "voice-bridge";
+
+/**
  * Normalize a TeamSpeak host for comparisons.
  *
  * DNS names are case-insensitive and may include a trailing root dot. IPv6
@@ -105,10 +113,13 @@ export class ManagedVoiceClientRegistry {
     string,
     Set<ManagedVoiceClientOwnerToken>
   >();
+  private readonly kindsByOwner = new Map<ManagedVoiceClientOwnerToken, ManagedVoiceClientKind>();
 
   /**
    * Register (or replace) the connection that owns a client id and, when
-   * available, add its stable UID to the managed set.
+   * available, add its stable UID to the managed set. The kind defaults to
+   * "music" and can be flipped later via setKind (e.g. when a web voice
+   * listener attaches to a bot and it starts relaying a human microphone).
    * Returns false when the scope or client id is invalid.
    */
   register(
@@ -116,6 +127,7 @@ export class ManagedVoiceClientRegistry {
     clientId: number,
     ownerToken: ManagedVoiceClientOwnerToken,
     clientUid?: string,
+    kind: ManagedVoiceClientKind = "music",
   ): boolean {
     const key = scopeKey(scope);
     if (!key || !validClientId(clientId)) return false;
@@ -126,6 +138,7 @@ export class ManagedVoiceClientRegistry {
       this.clientsByScope.set(key, clients);
     }
     clients.set(clientId, ownerToken);
+    this.kindsByOwner.set(ownerToken, kind);
 
     const normalizedUid = normalizeClientUid(clientUid);
     if (normalizedUid) {
@@ -136,6 +149,23 @@ export class ManagedVoiceClientRegistry {
       }
       owners.add(ownerToken);
     }
+    return true;
+  }
+
+  /**
+   * Flip the kind of a still-registered connection (ownership-checked, like
+   * unregister). Returns false when this connection no longer owns the id.
+   */
+  setKind(
+    scope: ManagedVoiceClientScope,
+    clientId: number,
+    ownerToken: ManagedVoiceClientOwnerToken,
+    kind: ManagedVoiceClientKind,
+  ): boolean {
+    const key = scopeKey(scope);
+    if (!key || !validClientId(clientId)) return false;
+    if (this.clientsByScope.get(key)?.get(clientId) !== ownerToken) return false;
+    this.kindsByOwner.set(ownerToken, kind);
     return true;
   }
 
@@ -168,6 +198,7 @@ export class ManagedVoiceClientRegistry {
       if (owners?.delete(ownerToken)) removed = true;
       if (owners?.size === 0) this.ownersByClientUid.delete(normalizedUid);
     }
+    if (removed) this.kindsByOwner.delete(ownerToken);
     return removed;
   }
 
@@ -183,5 +214,36 @@ export class ManagedVoiceClientRegistry {
     return normalizedUid
       ? (this.ownersByClientUid.get(normalizedUid)?.size ?? 0) > 0
       : false;
+  }
+
+  /**
+   * True when the sender is a managed connection whose packets are local
+   * playback (a "music" bot) rather than a relayed human microphone. Music
+   * packets must not trigger ducking on other bots; voice-bridge packets are
+   * human speech and duck normally. Unknown/unmanaged senders (native human
+   * clients) return false, so they duck normally too.
+   */
+  isManagedMusicClient(
+    scope: ManagedVoiceClientScope,
+    clientId: number,
+    clientUid: string | undefined,
+  ): boolean {
+    const key = scopeKey(scope);
+    const uidOwners = (() => {
+      const normalizedUid = normalizeClientUid(clientUid);
+      return normalizedUid ? this.ownersByClientUid.get(normalizedUid) : undefined;
+    })();
+
+    if (uidOwners && uidOwners.size > 0) {
+      for (const owner of uidOwners) {
+        if (this.kindsByOwner.get(owner) !== "voice-bridge") return true;
+      }
+      return false;
+    }
+
+    if (!key || !validClientId(clientId)) return false;
+    const owner = this.clientsByScope.get(key)?.get(clientId);
+    if (owner === undefined) return false;
+    return this.kindsByOwner.get(owner) !== "voice-bridge";
   }
 }

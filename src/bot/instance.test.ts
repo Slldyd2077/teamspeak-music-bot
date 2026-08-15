@@ -234,6 +234,157 @@ describe("BotInstance voice-ducking lifecycle integration", () => {
     expect(handleVoiceActivity).toHaveBeenCalledWith(21);
   });
 
+  it("lets a voice-bridge bot's relayed speech duck a music bot", () => {
+    const tsClient = new EventEmitter() as EventEmitter & {
+      getClientId(): number;
+    };
+    tsClient.getClientId = () => 10;
+    const managedVoiceClients = new ManagedVoiceClientRegistry();
+    const voiceServerScope = { host: "voice.example.com", voicePort: 9987 };
+    // A web voice caller's bridge bot: registered locally as a voice bridge.
+    managedVoiceClients.register(
+      voiceServerScope,
+      25,
+      {},
+      "web-caller-bridge-uid=",
+      "voice-bridge",
+    );
+    const handleVoiceActivity = vi.fn();
+    const ctx = {
+      tsClient,
+      connected: true,
+      managedVoiceClients,
+      voiceServerScope,
+      registeredVoiceClientId: 10,
+      registeredVoiceClientUid: "self-uid=",
+      webVoiceBridge: false,
+      voiceDucking: {
+        handleVoiceActivity,
+        removeSpeaker: vi.fn(),
+        reset: vi.fn(),
+      },
+    } as Record<string, any>;
+
+    (BotInstance.prototype as any).setupTsEvents.call(ctx);
+    tsClient.emit("voiceActivity", {
+      clientId: 25,
+      codec: 5,
+      clientUid: "web-caller-bridge-uid=",
+    });
+
+    expect(handleVoiceActivity).toHaveBeenCalledOnce();
+    expect(handleVoiceActivity).toHaveBeenCalledWith(25);
+  });
+
+  it("never ducks a bot that is currently bridging a web caller", () => {
+    const tsClient = new EventEmitter() as EventEmitter & {
+      getClientId(): number;
+    };
+    tsClient.getClientId = () => 10;
+    const managedVoiceClients = new ManagedVoiceClientRegistry();
+    const voiceServerScope = { host: "voice.example.com", voicePort: 9987 };
+    const handleVoiceActivity = vi.fn();
+    const ctx = {
+      tsClient,
+      connected: true,
+      managedVoiceClients,
+      voiceServerScope,
+      registeredVoiceClientId: 10,
+      registeredVoiceClientUid: "self-uid=",
+      webVoiceBridge: true,
+      voiceDucking: {
+        handleVoiceActivity,
+        removeSpeaker: vi.fn(),
+        reset: vi.fn(),
+      },
+    } as Record<string, any>;
+
+    (BotInstance.prototype as any).setupTsEvents.call(ctx);
+    // Even a native human's speech must not duck the bridged person's mic.
+    tsClient.emit("voiceActivity", {
+      clientId: 21,
+      codec: 5,
+      clientUid: "human-uid=",
+    });
+
+    expect(handleVoiceActivity).not.toHaveBeenCalled();
+  });
+
+  it("ignores its own voice packets even while classified as a voice bridge", () => {
+    const tsClient = new EventEmitter() as EventEmitter & {
+      getClientId(): number;
+    };
+    tsClient.getClientId = () => 10;
+    const managedVoiceClients = new ManagedVoiceClientRegistry();
+    const voiceServerScope = { host: "voice.example.com", voicePort: 9987 };
+    const selfOwner = {};
+    managedVoiceClients.register(voiceServerScope, 10, selfOwner, "self-uid=", "voice-bridge");
+    const handleVoiceActivity = vi.fn();
+    const ctx = {
+      tsClient,
+      connected: true,
+      managedVoiceClients,
+      voiceServerScope,
+      registeredVoiceClientId: 10,
+      registeredVoiceClientOwner: selfOwner,
+      registeredVoiceClientUid: "self-uid=",
+      webVoiceBridge: true,
+      voiceDucking: {
+        handleVoiceActivity,
+        removeSpeaker: vi.fn(),
+        reset: vi.fn(),
+      },
+    } as Record<string, any>;
+
+    (BotInstance.prototype as any).setupTsEvents.call(ctx);
+    tsClient.emit("voiceActivity", {
+      clientId: 10,
+      codec: 5,
+      clientUid: "self-uid=",
+    });
+
+    expect(handleVoiceActivity).not.toHaveBeenCalled();
+  });
+
+  it("setWebVoiceActive reclassifies the registry entry and clears active ducking", async () => {
+    const managedVoiceClients = new ManagedVoiceClientRegistry();
+    const voiceServerScope = { host: "voice.example.com", voicePort: 9987 };
+    const owner = {};
+    managedVoiceClients.register(voiceServerScope, 40, owner, "bridge-uid=");
+    expect(
+      managedVoiceClients.isManagedMusicClient(voiceServerScope, 40, "bridge-uid="),
+    ).toBe(true);
+
+    const ctx = {
+      webVoiceBridge: false,
+      managedVoiceClients,
+      voiceServerScope,
+      registeredVoiceClientId: 40,
+      registeredVoiceClientOwner: owner,
+      registeredVoiceClientUid: "bridge-uid=",
+      voiceDucking: { reset: vi.fn() },
+      profileManager: { setWebVoiceActive: vi.fn(async () => {}) },
+    } as Record<string, any>;
+    ctx.updateManagedVoiceClientKind =
+      (BotInstance.prototype as any).updateManagedVoiceClientKind.bind(ctx);
+
+    await (BotInstance.prototype as any).setWebVoiceActive.call(ctx, true);
+
+    expect(ctx.webVoiceBridge).toBe(true);
+    expect(
+      managedVoiceClients.isManagedMusicClient(voiceServerScope, 40, "bridge-uid="),
+    ).toBe(false);
+    expect(ctx.voiceDucking.reset).toHaveBeenCalledWith(false);
+    expect(ctx.profileManager.setWebVoiceActive).toHaveBeenCalledWith(true);
+
+    await (BotInstance.prototype as any).setWebVoiceActive.call(ctx, false);
+
+    expect(ctx.webVoiceBridge).toBe(false);
+    expect(
+      managedVoiceClients.isManagedMusicClient(voiceServerScope, 40, "bridge-uid="),
+    ).toBe(true);
+  });
+
   it("keeps a disconnecting bot registered during the in-flight packet grace", () => {
     vi.useFakeTimers();
     try {

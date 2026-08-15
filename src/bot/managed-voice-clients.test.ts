@@ -178,4 +178,58 @@ describe("ManagedVoiceClientRegistry", () => {
     expect(first.has(scope, 3)).toBe(true);
     expect(second.has(scope, 3)).toBe(false);
   });
+
+  describe("managed client kinds", () => {
+    const scope = { host: "voice.example.com", voicePort: 9987 };
+
+    it("treats a registered bot as a music client until its kind is flipped", () => {
+      const registry = new ManagedVoiceClientRegistry();
+      const owner = Symbol("connection");
+      registry.register(scope, 30, owner, "bot-uid=");
+
+      expect(registry.isManagedMusicClient(scope, 30, "bot-uid=")).toBe(true);
+      expect(registry.isManagedMusicClient(scope, 30, undefined)).toBe(true);
+
+      expect(registry.setKind(scope, 30, owner, "voice-bridge")).toBe(true);
+      expect(registry.isManagedMusicClient(scope, 30, "bot-uid=")).toBe(false);
+      // The UID path and the scoped client-id fallback agree.
+      expect(registry.isManagedMusicClient(scope, 30, undefined)).toBe(false);
+    });
+
+    it("supports registering directly as a voice bridge", () => {
+      const registry = new ManagedVoiceClientRegistry();
+      registry.register(scope, 31, Symbol("connection"), "bridge-uid=", "voice-bridge");
+
+      expect(registry.isManagedMusicClient(scope, 31, "bridge-uid=")).toBe(false);
+    });
+
+    it("leaves unmanaged senders (native humans) unclassified", () => {
+      const registry = new ManagedVoiceClientRegistry();
+
+      expect(registry.isManagedMusicClient(scope, 99, "human-uid=")).toBe(false);
+    });
+
+    it("rejects kind changes from an owner that no longer owns the id", () => {
+      const registry = new ManagedVoiceClientRegistry();
+      const owner = Symbol("old connection");
+      registry.register(scope, 32, owner, "bot-uid=");
+      registry.register(scope, 32, Symbol("new connection"), "bot-uid=");
+
+      expect(registry.setKind(scope, 32, owner, "voice-bridge")).toBe(false);
+      expect(registry.isManagedMusicClient(scope, 32, "bot-uid=")).toBe(true);
+    });
+
+    it("forgets the kind when the owner unregisters", () => {
+      const registry = new ManagedVoiceClientRegistry();
+      const owner = Symbol("connection");
+      registry.register(scope, 33, owner, "bot-uid=");
+      registry.setKind(scope, 33, owner, "voice-bridge");
+      registry.unregister(scope, 33, owner, "bot-uid=");
+
+      // Re-registering the same id fresh starts as music again.
+      const next = Symbol("reconnect");
+      registry.register(scope, 33, next, "bot-uid=");
+      expect(registry.isManagedMusicClient(scope, 33, "bot-uid=")).toBe(true);
+    });
+  });
 });
