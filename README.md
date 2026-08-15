@@ -26,6 +26,8 @@
 
 > v1.10.0 新增**可选**的 [Jellyfin](https://jellyfin.org/) 音源（由 [@ItsEricRao](https://github.com/ItsEricRao) 在 [PR #123](https://github.com/ZHANGTIANYAO1/teamspeak-music-bot/pull/123) 中贡献）：连接自建 Jellyfin 服务器直接播放你自己的音乐库。默认关闭，在 **设置 → Jellyfin 音乐库** 一键开启；原有在线音源保持默认启用，行为不变。
 
+> 🍴 **PowerfulTS 专用分支**：本仓库的 [`merge/upstream-v1.12`](https://github.com/Slldyd2077/teamspeak-music-bot/tree/merge/upstream-v1.12) 分支是为 [PowerfulTS](https://github.com/Slldyd2077/PowerfulTS) 管理面板定制的专属分支——per-bot 多实例架构、网页通话双向 Opus 中继、语音闪避（含网页通话触发）等接口仅存在于该分支，未合入上游原版。**PowerfulTS 部署时必须使用本分支构建的 TSMusicBot**，上游 [ZHANGTIANYAO1/teamspeak-music-bot](https://github.com/ZHANGTIANYAO1/teamspeak-music-bot) 的发布版本不包含这些能力。
+
 ## 功能特性
 
 - **WebUI 鉴权与细粒度权限（必选）** — 用户名 + 密码登录，多用户、两种角色（管理员 / 成员）；成员可进一步配置**细粒度能力**（播放控制 / 队列管理 / 机器人管理 / 平台登录 / 音质）和**按机器人授权白名单**，所有变更操作由后端逐请求强制校验。bcrypt 加密、HttpOnly 会话 Cookie，CSRF 防护，WebSocket 同样鉴权。首次访问引导创建管理员。从无鉴权旧版本升级时请参阅 [更新升级](#更新升级) 章节
@@ -884,7 +886,13 @@ A：本项目内置 `/login` 限流（每 IP 每分钟 5 次），但生产部�
 
 > 完整历史请查看 [git log](https://github.com/ZHANGTIANYAO1/teamspeak-music-bot/commits/main) 或 [Releases](https://github.com/ZHANGTIANYAO1/teamspeak-music-bot/releases)。这里只列出重要变更和面向用户的破坏性改动。
 
-### 最新版本 — v1.12.0：网站图标 / 移动端交互 / 安装脚本按 ABI 自愈
+### 最新版本 — v1.12.1：语音闪避支持网页通话触发（PowerfulTS 专用分支）
+
+- **语音桥 bot 可触发闪避**：本地管理客户端注册表新增 `music` / `voice-bridge` 类型标记。网页通话用户的语音 bot 承载的是真人麦克风，现在其说话会像原生客户端一样触发音乐 bot 的语音闪避——放歌不再盖住人说话，说话结束音乐渐升恢复。
+- **语音桥 bot 自身永不闪避**：修复原生客户端说话时会连带压低网页通话用户麦克风直播音量的问题（闪避增益同样作用于 playLive 路径）；bot 断连宽限期内类型回退为 music，保持原有的防串音保证。
+- 配套：PowerfulTS 面板「机器人行为 → 语音闪避」新增开关与「说话时音乐音量」滑杆（0-100%），需搭配 PowerfulTS v0.12.6+。
+
+### v1.12.0：网站图标 / 移动端交互 / 安装脚本按 ABI 自愈
 
 一次性处理了 6 个社区反馈的 issue。**没有配置变化，升级无需任何操作**；`!play id:<id>` 等旧写法全部继续可用。
 
