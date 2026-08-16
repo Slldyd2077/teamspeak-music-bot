@@ -84,10 +84,19 @@ export function setupVoiceDownlink(
         logger.warn({ err, botId }, "Voice downlink send failed");
       }
     };
+    const onDisconnected = () => {
+      detach();
+      try {
+        ws.close(1012, "bot disconnected");
+      } catch {
+        // Socket may already be closing while the TS connection drops.
+      }
+    };
     const detach = () => {
       // close and error can both fire; only the first one counts down.
       if (!detachBySocket.has(ws)) return;
       bot.removeListener("voiceFrame", onVoiceFrame);
+      bot.removeListener("disconnected", onDisconnected);
       detachBySocket.delete(ws);
       const remaining = (listenersByBot.get(botId) ?? 1) - 1;
       if (remaining > 0) {
@@ -99,6 +108,7 @@ export function setupVoiceDownlink(
     };
     detachBySocket.set(ws, detach);
     bot.on("voiceFrame", onVoiceFrame);
+    bot.once("disconnected", onDisconnected);
     ws.once("close", detach);
     ws.once("error", detach);
     logger.debug({ botId }, "Voice downlink client connected");
