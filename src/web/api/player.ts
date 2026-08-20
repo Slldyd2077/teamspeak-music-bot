@@ -1,17 +1,43 @@
-import { Router } from "express";
+import { Router, type RequestHandler } from "express";
 import type { BotManager } from "../../bot/manager.js";
 import type { BotDatabase } from "../../data/database.js";
 import type { Logger } from "../../logger.js";
 import { parseCommand } from "../../bot/commands.js";
 import { requireBotAccess } from "../middleware/requirePermission.js";
 import { authorize } from "../middleware/authorize.js";
+import {
+  isValidSoundEffectUrl,
+  normalizeSoundEffectTrustedOrigin,
+  SoundEffectReplacedError,
+} from "../../audio/player.js";
+import { createRateLimit } from "../middleware/rateLimit.js";
 
 export function createPlayerRouter(
   botManager: BotManager,
   logger: Logger,
   database?: BotDatabase,
+  soundEffectTrustedOrigin = process.env.POWERFUL_TS_ORIGIN ?? "",
 ): Router {
   const router = Router();
+  const normalizedSoundEffectOrigin = normalizeSoundEffectTrustedOrigin(
+    soundEffectTrustedOrigin,
+  );
+  const requireSoundEffectOrigin: RequestHandler = (_req, res, next) => {
+    if (!normalizedSoundEffectOrigin) {
+      res.status(503).json({ error: "Trusted PowerfulTS origin is not configured" });
+      return;
+    }
+    next();
+  };
+  const soundEffectLimit = createRateLimit({
+    capacity: 3,
+    refillPerSec: 1 / 3,
+    keyFn: (req) => {
+      const userId = req.user?.id ?? req.ip ?? "unknown";
+      const botId = (req.params as Record<string, string | undefined>).botId ?? "unknown";
+      return `${userId}:${botId}`;
+    },
+  });
 
   // Access check runs BEFORE the existence/resolver check so a member who is
   // not allowed a bot always gets a uniform 403 — whether or not the bot
@@ -93,6 +119,40 @@ export function createPlayerRouter(
       res.status(500).json({ error: (err as Error).message });
     }
   });
+
+  // Overlay a short, pre-authorized entrance sound without touching the
+  // primary track/live relay or queue. AudioPlayer owns replacement, decoding,
+  // duration, buffer, and failure isolation for this independent one-shot.
+  router.post(
+    "/:botId/sound-effect",
+    authorize({ capability: "player.control" }),
+    requireSoundEffectOrigin,
+    soundEffectLimit,
+    async (req, res) => {
+      const bot = (req as any).bot;
+      const { url } = req.body ?? {};
+      if (!isValidSoundEffectUrl(url, normalizedSoundEffectOrigin!)) {
+        res.status(400).json({ error: "A valid http(s) sound effect URL is required" });
+        return;
+      }
+      if (!bot.isConnected()) {
+        res.status(409).json({ error: "Bot is not connected" });
+        return;
+      }
+
+      try {
+        await bot.getPlayer().playSoundEffect(url);
+        res.json({ ok: true, soundEffect: true });
+      } catch (err) {
+        if (err instanceof SoundEffectReplacedError) {
+          res.json({ ok: true, soundEffect: false, replaced: true });
+          return;
+        }
+        logger.warn({ err }, "Sound effect start failed");
+        res.status(502).json({ error: "Sound effect could not be started" });
+      }
+    },
+  );
 
   // Pull a short-lived HTTP stream produced by an explicitly authorized
   // browser capture session. FFmpeg already handles the WebM/Opus stream and

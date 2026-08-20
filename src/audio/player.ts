@@ -203,6 +203,115 @@ const MEDIA_BUFFER_HIGH_WATER = 640 * 1024;
 const MEDIA_BUFFER_LOW_WATER = 256 * 1024;
 const REALTIME_MAX_BUFFER_FRAMES = 12;
 const REALTIME_MAX_BUFFER_BYTES = PCM_FRAME_BYTES * REALTIME_MAX_BUFFER_FRAMES;
+const SOUND_EFFECT_MAX_SECONDS = 7;
+const SOUND_EFFECT_DECODER_TIMEOUT_MS = 15_000;
+const SOUND_EFFECT_PATH_PATTERN =
+  /^\/api\/music\/voice\/entry-sound\/stream\/[A-Za-z0-9_-]{40,64}$/;
+export const SOUND_EFFECT_MAX_PCM_BYTES =
+  SOUND_EFFECT_MAX_SECONDS * 48_000 * 2 * 2;
+
+export function normalizeSoundEffectTrustedOrigin(value: unknown): string | null {
+  if (typeof value !== "string" || !value.trim()) return null;
+  try {
+    const parsed = new URL(value.trim());
+    if (
+      (parsed.protocol !== "http:" && parsed.protocol !== "https:") ||
+      !parsed.hostname ||
+      parsed.username ||
+      parsed.password ||
+      (parsed.pathname !== "/" && parsed.pathname !== "") ||
+      parsed.search ||
+      parsed.hash
+    ) {
+      return null;
+    }
+    return parsed.origin;
+  } catch {
+    return null;
+  }
+}
+
+export function isValidSoundEffectUrl(
+  value: unknown,
+  trustedOrigin?: string,
+): value is string {
+  if (typeof value !== "string" || value.length === 0 || value.length > 2_048) {
+    return false;
+  }
+  try {
+    const parsed = new URL(value);
+    const normalizedTrustedOrigin = trustedOrigin === undefined
+      ? undefined
+      : normalizeSoundEffectTrustedOrigin(trustedOrigin);
+    return (
+      (parsed.protocol === "http:" || parsed.protocol === "https:") &&
+      parsed.hostname.length > 0 &&
+      parsed.username.length === 0 &&
+      parsed.password.length === 0 &&
+      parsed.search.length === 0 &&
+      parsed.hash.length === 0 &&
+      (normalizedTrustedOrigin === undefined ||
+        (normalizedTrustedOrigin !== null && parsed.origin === normalizedTrustedOrigin)) &&
+      SOUND_EFFECT_PATH_PATTERN.test(parsed.pathname)
+    );
+  } catch {
+    return false;
+  }
+}
+
+export interface AudioPlayerDependencies {
+  spawnSoundEffect?: (
+    command: string,
+    args: string[],
+    options: { stdio: ["ignore", "pipe", "pipe"] },
+  ) => ChildProcess;
+}
+
+export class SoundEffectReplacedError extends Error {
+  constructor() {
+    super("Sound effect replaced by a newer request");
+    this.name = "SoundEffectReplacedError";
+  }
+}
+
+export function buildSoundEffectFfmpegArgs(url: string): string[] {
+  return [
+    "-nostdin",
+    "-hide_banner",
+    "-loglevel", "error",
+    "-reconnect", "1",
+    "-reconnect_streamed", "1",
+    "-reconnect_delay_max", "2",
+    "-i", url,
+    "-t", String(SOUND_EFFECT_MAX_SECONDS),
+    "-vn",
+    "-sn",
+    "-dn",
+    "-f", "s16le",
+    "-ar", "48000",
+    "-ac", "2",
+    "-acodec", "pcm_s16le",
+    "-",
+  ];
+}
+
+export function mixPcmFrames(primary: Buffer, overlay: Buffer): Buffer {
+  const outputLength = Math.max(primary.length, overlay.length);
+  const output = Buffer.alloc(outputLength);
+  for (let offset = 0; offset + 1 < outputLength; offset += 2) {
+    const primarySample = offset + 1 < primary.length
+      ? primary.readInt16LE(offset)
+      : 0;
+    const overlaySample = offset + 1 < overlay.length
+      ? overlay.readInt16LE(offset)
+      : 0;
+    output.writeInt16LE(
+      Math.max(-32_768, Math.min(32_767, primarySample + overlaySample)),
+      offset,
+    );
+  }
+  return output;
+}
 
 export function isNearPlaybackEnd(
   mode: PlaybackMode,
@@ -358,6 +467,20 @@ export class AudioPlayer extends EventEmitter {
   private static readonly MAX_STALL_ATTEMPTS = 3000;
   private currentSongDuration = 0; // 当前歌曲总时长（秒）
 
+  // Independent one-shot decoder mixed into the outgoing PCM timeline. It is
+  // deliberately separate from ffmpeg/pcmBuffer/sessionId so an entrance
+  // effect cannot stop, seek, clear, or advance the primary player.
+  private soundEffectFfmpeg: ChildProcess | null = null;
+  private soundEffectBuffer = Buffer.alloc(0);
+  private soundEffectSessionId = 0;
+  private soundEffectDecodedBytes = 0;
+  private soundEffectTimeout: ReturnType<typeof setTimeout> | null = null;
+  private soundEffectStartupResolve: (() => void) | null = null;
+  private soundEffectStartupReject: ((error: Error) => void) | null = null;
+  private readonly spawnSoundEffect: NonNullable<
+    AudioPlayerDependencies["spawnSoundEffect"]
+  >;
+
   // --- External PCM mode (Stage 2: go-librespot Spotify sidecar) ---
   // When true, PCM arrives from a long-lived external Readable instead of a
   // per-URL ffmpeg: this.ffmpeg stays null, and the underrun-driven trackEnd
@@ -374,10 +497,11 @@ export class AudioPlayer extends EventEmitter {
   private externalEndHandler: (() => void) | null = null;
   private externalErrorHandler: ((err: Error) => void) | null = null;
 
-  constructor(logger: Logger) {
+  constructor(logger: Logger, dependencies: AudioPlayerDependencies = {}) {
     super();
     this.encoder = createOpusEncoder();
     this.logger = logger;
+    this.spawnSoundEffect = dependencies.spawnSoundEffect ?? spawn;
   }
 
   play(
@@ -474,6 +598,158 @@ export class AudioPlayer extends EventEmitter {
 
   playLive(url: string): void {
     this.play(url, 0, 0, { realtime: true });
+  }
+
+  /**
+   * Decode and overlay a short entrance sound without altering primary playback.
+   * A newer request replaces the previous effect; decoder/runtime failures stay
+   * isolated and never emit the player's track-advancing `error` event.
+   */
+  playSoundEffect(url: string): Promise<void> {
+    if (!isValidSoundEffectUrl(url)) {
+      return Promise.reject(new Error("A valid http(s) sound effect URL is required"));
+    }
+
+    this.cancelSoundEffect(new SoundEffectReplacedError());
+    const effectSessionId = this.soundEffectSessionId;
+    this.soundEffectDecodedBytes = 0;
+
+    let decoder: ChildProcess;
+    try {
+      decoder = this.spawnSoundEffect(getFfmpegCommand(), buildSoundEffectFfmpegArgs(url), {
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+    } catch (error) {
+      const err = error instanceof Error ? error : new Error("Sound effect decoder failed");
+      this.logger.warn({ err }, "Sound effect decoder failed to start");
+      return Promise.reject(err);
+    }
+
+    this.soundEffectFfmpeg = decoder;
+    const decoderPid = decoder.pid;
+    if (decoderPid) globalActivePids.add(decoderPid);
+
+    decoder.stdout?.on("data", (chunk: Buffer) => {
+      if (effectSessionId !== this.soundEffectSessionId) return;
+      const remainingBytes = SOUND_EFFECT_MAX_PCM_BYTES - this.soundEffectDecodedBytes;
+      if (remainingBytes <= 0) return;
+      const accepted = chunk.subarray(0, remainingBytes);
+      this.soundEffectDecodedBytes += accepted.length;
+      this.soundEffectBuffer = Buffer.concat([this.soundEffectBuffer, accepted]);
+      if (accepted.length > 0 && this.soundEffectStartupResolve) {
+        const resolve = this.soundEffectStartupResolve;
+        this.soundEffectStartupResolve = null;
+        this.soundEffectStartupReject = null;
+        resolve();
+      }
+    });
+
+    // Drain diagnostics so a noisy decoder cannot block on a full stderr pipe.
+    // Do not log it: ffmpeg commonly repeats the signed capability URL there.
+    decoder.stderr?.resume();
+
+    decoder.on("exit", (code, signal) => {
+      if (decoderPid) globalActivePids.delete(decoderPid);
+      if (effectSessionId !== this.soundEffectSessionId) return;
+      if (this.soundEffectFfmpeg === decoder) this.soundEffectFfmpeg = null;
+      this.clearSoundEffectTimeout();
+      if (this.soundEffectStartupReject) {
+        const reject = this.soundEffectStartupReject;
+        this.soundEffectStartupResolve = null;
+        this.soundEffectStartupReject = null;
+        reject(new Error(
+          code === 0
+            ? "Sound effect produced no decodable audio"
+            : "Sound effect decoder failed",
+        ));
+      }
+      if (code !== 0 && code !== null) {
+        this.logger.warn(
+          { code, signal },
+          "Sound effect decoder exited unsuccessfully",
+        );
+      }
+    });
+
+    this.soundEffectTimeout = setTimeout(() => {
+      if (effectSessionId !== this.soundEffectSessionId) return;
+      this.logger.warn("Sound effect decoder timed out");
+      if (this.soundEffectStartupReject) {
+        const reject = this.soundEffectStartupReject;
+        this.soundEffectStartupResolve = null;
+        this.soundEffectStartupReject = null;
+        reject(new Error("Sound effect decoder timed out"));
+      }
+      this.finishSoundEffectDecoder(decoder);
+    }, SOUND_EFFECT_DECODER_TIMEOUT_MS);
+    this.soundEffectTimeout.unref?.();
+
+    this.startFrameLoop();
+    return new Promise<void>((resolve, reject) => {
+      this.soundEffectStartupResolve = resolve;
+      this.soundEffectStartupReject = reject;
+      decoder.once("error", (error) => {
+        if (effectSessionId !== this.soundEffectSessionId) return;
+        this.soundEffectStartupResolve = null;
+        this.soundEffectStartupReject = null;
+        if (this.soundEffectFfmpeg === decoder) this.soundEffectFfmpeg = null;
+        this.clearSoundEffectTimeout();
+        this.logger.warn({ err: error }, "Sound effect decoder failed");
+        reject(error);
+      });
+    });
+  }
+
+  private clearSoundEffectTimeout(): void {
+    if (!this.soundEffectTimeout) return;
+    clearTimeout(this.soundEffectTimeout);
+    this.soundEffectTimeout = null;
+  }
+
+  private finishSoundEffectDecoder(decoder: ChildProcess): void {
+    if (this.soundEffectFfmpeg !== decoder) return;
+    this.soundEffectFfmpeg = null;
+    const pid = decoder.pid;
+    if (pid) this.forceCleanup(decoder, pid);
+    else {
+      try { decoder.kill("SIGTERM"); } catch { /* already exited */ }
+    }
+    this.clearSoundEffectTimeout();
+  }
+
+  private cancelSoundEffect(reason?: Error): void {
+    this.soundEffectSessionId++;
+    this.soundEffectStartupReject?.(reason ?? new Error("Sound effect cancelled"));
+    this.soundEffectStartupResolve = null;
+    this.soundEffectStartupReject = null;
+    this.soundEffectBuffer = Buffer.alloc(0);
+    this.soundEffectDecodedBytes = 0;
+    this.clearSoundEffectTimeout();
+    const decoder = this.soundEffectFfmpeg;
+    this.soundEffectFfmpeg = null;
+    if (!decoder) return;
+    const pid = decoder.pid;
+    if (pid) this.forceCleanup(decoder, pid);
+    else {
+      try { decoder.kill("SIGTERM"); } catch { /* already exited */ }
+    }
+  }
+
+  private hasSoundEffectOutput(): boolean {
+    return this.soundEffectFfmpeg !== null || this.soundEffectBuffer.length > 0;
+  }
+
+  private takeSoundEffectFrame(): Buffer | null {
+    if (this.soundEffectBuffer.length >= PCM_FRAME_BYTES) {
+      const frame = Buffer.from(this.soundEffectBuffer.subarray(0, PCM_FRAME_BYTES));
+      this.soundEffectBuffer = this.soundEffectBuffer.subarray(PCM_FRAME_BYTES);
+      return frame;
+    }
+    if (this.soundEffectFfmpeg || this.soundEffectBuffer.length === 0) return null;
+    const finalFrame = Buffer.alloc(PCM_FRAME_BYTES);
+    this.soundEffectBuffer.copy(finalFrame);
+    this.soundEffectBuffer = Buffer.alloc(0);
+    return finalFrame;
   }
 
   private playViaPowerShellDownload(url: string, seekSeconds: number, sessionId: number): void {
@@ -745,6 +1021,7 @@ export class AudioPlayer extends EventEmitter {
     // pause) — never destroy the shared, long-lived sidecar stream. The
     // sessionId++ above already fences the external data/end/error handlers.
     this.detachExternalStream();
+    this.cancelSoundEffect();
 
     this.ffmpegPaused = false;
     this.spawnFailed = false;
@@ -800,7 +1077,7 @@ export class AudioPlayer extends EventEmitter {
       // 这里的校验能防止旧的定时器回调处理新 Session 的逻辑 （
       if (loopSessionId !== this.sessionId || !this.frameLoopRunning) return;
 
-      if (this.state === "playing") this.sendNextFrame();
+      if (this.state === "playing" || this.hasSoundEffectOutput()) this.sendNextFrame();
       else if (this.state === "paused") this.nextFrameTime = performance.now();
 
       // 检测pcmBuffer不足PCM_FRAME_BYTES导致连续循环卡死：
@@ -881,20 +1158,34 @@ export class AudioPlayer extends EventEmitter {
         }
         return;
       }
+      if (this.state === "idle" && !this.hasSoundEffectOutput()) {
+        this.frameLoopRunning = false;
+        return;
+      }
       this.scheduleNextFrame();
     }, delay);
   }
 
   private sendNextFrame(): void {
-    if (this.pcmBuffer.length < PCM_FRAME_BYTES) {
+    const canConsumePrimary =
+      this.state === "playing" && this.pcmBuffer.length >= PCM_FRAME_BYTES;
+    if (!canConsumePrimary && !this.hasSoundEffectOutput()) {
       // External mode: the sidecar PCM stream is long-lived and must NOT end on
       // a transient underrun. Emit an encoded silence frame so the 20ms voice
       // timeline stays continuous instead of returning (which would desync TS).
       if (this.externalMode) this.emitSilenceFrame();
       return;
     }
-    const pcmFrame = this.pcmBuffer.subarray(0, PCM_FRAME_BYTES);
-    this.pcmBuffer = this.pcmBuffer.subarray(PCM_FRAME_BYTES);
+
+    const primaryFrame = canConsumePrimary
+      ? Buffer.from(this.pcmBuffer.subarray(0, PCM_FRAME_BYTES))
+      : null;
+    if (canConsumePrimary) this.pcmBuffer = this.pcmBuffer.subarray(PCM_FRAME_BYTES);
+    const effectFrame = this.takeSoundEffectFrame();
+    if (!primaryFrame && !effectFrame) {
+      if (this.externalMode && this.state === "playing") this.emitSilenceFrame();
+      return;
+    }
 
     if (this.ffmpegPaused && this.pcmBuffer.length < MEDIA_BUFFER_LOW_WATER) {
       if (this.externalMode && this.externalStream) {
@@ -907,19 +1198,36 @@ export class AudioPlayer extends EventEmitter {
     }
 
     try {
-      const adjusted = this.applyVolume(pcmFrame);
+      const volumeAt = performance.now();
+      const adjustedPrimary = this.applyVolume(
+        primaryFrame ?? Buffer.alloc(PCM_FRAME_BYTES),
+        volumeAt,
+      );
+      const adjustedEffect = effectFrame
+        ? this.applyVolume(effectFrame, volumeAt)
+        : null;
+      const adjusted = adjustedEffect
+        ? mixPcmFrames(adjustedPrimary, adjustedEffect)
+        : adjustedPrimary;
       const opusFrame = this.encoder.encode(adjusted);
       const diagnostics = this.getPlaybackDiagnostics();
       this.emit("frame", opusFrame, {
         mode: this.playbackMode,
-        voiced: this.playbackMode === "realtime" && isPcmFrameVoiced(adjusted),
+        voiced:
+          this.playbackMode === "realtime" &&
+          primaryFrame !== null &&
+          isPcmFrameVoiced(adjustedPrimary),
         diagnostics,
       } satisfies PlayerFrameMetadata);
-      this.framesPlayed++;
-      this.healthyFrames++;
-      if (this.healthyFrames >= AudioPlayer.HEALTHY_FRAME_RESET) {
-        this.consecutiveFailures = 0;
-        this.healthyFrames = 0;
+      if (primaryFrame || (this.externalMode && this.state === "playing")) {
+        this.framesPlayed++;
+      }
+      if (primaryFrame) {
+        this.healthyFrames++;
+        if (this.healthyFrames >= AudioPlayer.HEALTHY_FRAME_RESET) {
+          this.consecutiveFailures = 0;
+          this.healthyFrames = 0;
+        }
       }
     } catch (err) {
       this.emit("error", err as Error);
@@ -962,9 +1270,8 @@ export class AudioPlayer extends EventEmitter {
     }
   }
 
-  private applyVolume(pcm: Buffer): Buffer {
+  private applyVolume(pcm: Buffer, now = performance.now()): Buffer {
     const baseFactor = volumeToFactor(this.volume);
-    const now = performance.now();
     const startDuckingGain = this.duckingGainAt(now);
     const endDuckingGain = this.duckingGainAt(now + FRAME_DURATION_MS);
     const startFactor = baseFactor * startDuckingGain;

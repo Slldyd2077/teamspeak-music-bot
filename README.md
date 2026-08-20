@@ -782,6 +782,16 @@ OAuth 相关端点：`/api/spotify/login`、`/api/spotify/callback`、`/api/spot
 }
 ```
 
+PowerfulTS 的自定义入场音效会让本进程主动拉取短期音频链接。启用该功能时，必须为
+TSMusicBot 进程设置 `POWERFUL_TS_ORIGIN`，并与 PowerfulTS 的
+`LIVE_AUDIO_PUBLIC_URL` 保持完全一致（只填 `scheme://host[:port]`，不带路径），例如：
+
+```bash
+POWERFUL_TS_ORIGIN=http://host.docker.internal:8001
+```
+
+未配置时，短音效接口会返回 503；来源不匹配时会拒绝请求，以避免服务端请求伪造。
+
 > **配置文件位置变更**：旧版本把 `config.json` 写在项目根目录（不在 Docker 挂载卷内，导致重启丢失、手动编辑不生效）。现在统一放在 `data/config.json`。升级时若检测到根目录存在旧的 `config.json`，会在首次启动时自动迁移到 `data/` 并保留你的设置，无需手动操作。
 
 > **关于 `adminPassword` 和 `adminGroups`**：`adminGroups` 现已启用，用于限制管理类聊天命令只能由指定 TeamSpeak 服务器组运行（为空 = 不限制），详见 [TeamSpeak 命令权限](#teamspeak-命令权限管理类命令限制)。`adminPassword` 仍为旧版预留字段、当前版本未使用——WebUI 鉴权改为基于数据库的用户账号系统（见 [首次配置](#首次配置)），无需在 `config.json` 中设置密码。

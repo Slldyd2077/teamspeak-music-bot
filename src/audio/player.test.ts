@@ -4,18 +4,25 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   buildFfmpegArgs,
+  buildSoundEffectFfmpegArgs,
   buildPlaybackDiagnostics,
   cleanupTempDir,
   getPlaybackBufferPolicy,
   isNearPlaybackEnd,
   isPcmFrameVoiced,
+  isValidSoundEffectUrl,
   shouldEndOnStall,
   shouldUsePowerShellDownload,
+  SOUND_EFFECT_MAX_PCM_BYTES,
+  SoundEffectReplacedError,
+  mixPcmFrames,
   trimRealtimePcmBuffer,
   volumeToFactor,
   AudioPlayer,
 } from "./player.js";
-import { Readable } from "node:stream";
+import { EventEmitter } from "node:events";
+import { PassThrough, Readable } from "node:stream";
+import type { ChildProcess } from "node:child_process";
 import { PCM_FRAME_BYTES } from "./encoder.js";
 import {
   createRealtimePcmIngressTelemetry,
@@ -125,6 +132,108 @@ describe("buildFfmpegArgs", () => {
     const args = buildFfmpegArgs("https://example.com/song.mp3", 0);
     expect(args).not.toContain("-analyzeduration");
     expect(args).not.toContain("-fflags");
+  });
+});
+
+describe("sound-effect PCM overlay", () => {
+  const capabilityUrl =
+    `https://uploads.example/api/music/voice/entry-sound/stream/${"a".repeat(48)}`;
+
+  it("accepts only the signed entrance-sound capability path contract", () => {
+    expect(isValidSoundEffectUrl(capabilityUrl, "https://uploads.example")).toBe(true);
+    expect(isValidSoundEffectUrl(
+      capabilityUrl,
+      "https://other.example",
+    )).toBe(false);
+    expect(isValidSoundEffectUrl(
+      `${capabilityUrl}?token=extra`,
+      "https://uploads.example",
+    )).toBe(false);
+    expect(isValidSoundEffectUrl(
+      `https://uploads.example/api/music/voice/entry-sound/stream/${"a".repeat(39)}`,
+    )).toBe(false);
+    expect(isValidSoundEffectUrl("http://169.254.169.254/latest/meta-data"))
+      .toBe(false);
+  });
+
+  it("limits ffmpeg decoding to seven seconds of 48 kHz stereo PCM", () => {
+    const args = buildSoundEffectFfmpegArgs(capabilityUrl);
+
+    expect(args.slice(args.indexOf("-i"), args.indexOf("-i") + 2)).toEqual([
+      "-i",
+      capabilityUrl,
+    ]);
+    expect(args[args.indexOf("-t") + 1]).toBe("7");
+    expect(args).toContain("48000");
+    expect(args).toContain("pcm_s16le");
+    expect(SOUND_EFFECT_MAX_PCM_BYTES).toBe(7 * 48_000 * 2 * 2);
+  });
+
+  it("mixes signed 16-bit PCM with saturation and does not mutate either input", () => {
+    const primary = stereoPcm(30_000);
+    const overlay = stereoPcm(10_000);
+    overlay.writeInt16LE(-10_000, 4);
+    primary.writeInt16LE(-30_000, 4);
+    const primaryBefore = Buffer.from(primary);
+    const overlayBefore = Buffer.from(overlay);
+
+    const mixed = mixPcmFrames(primary, overlay);
+
+    expect(mixed.readInt16LE(0)).toBe(32_767);
+    expect(mixed.readInt16LE(4)).toBe(-32_768);
+    expect(primary).toEqual(primaryBefore);
+    expect(overlay).toEqual(overlayBefore);
+  });
+
+  it("mixes an overlay into a playing primary frame without changing player state", () => {
+    const player = new AudioPlayer(silentLogger);
+    player.setVolume(100);
+    const encode = vi.fn((pcm: Buffer) => Buffer.from(pcm));
+    const internal = player as unknown as {
+      encoder: { encode: typeof encode };
+      state: "playing";
+      pcmBuffer: Buffer;
+      soundEffectBuffer: Buffer;
+      soundEffectFfmpeg: null;
+      sendNextFrame(): void;
+    };
+    internal.encoder = { encode };
+    internal.state = "playing";
+    internal.pcmBuffer = Buffer.alloc(PCM_FRAME_BYTES);
+    internal.soundEffectBuffer = Buffer.alloc(PCM_FRAME_BYTES);
+    internal.soundEffectFfmpeg = null;
+    internal.pcmBuffer.writeInt16LE(20_000, 0);
+    internal.soundEffectBuffer.writeInt16LE(20_000, 0);
+
+    internal.sendNextFrame();
+
+    expect(encode).toHaveBeenCalledOnce();
+    expect(encode.mock.calls[0][0].readInt16LE(0)).toBe(32_767);
+    expect(player.getState()).toBe("playing");
+  });
+
+  it("emits an effect over silence while idle without changing state or elapsed time", () => {
+    const player = new AudioPlayer(silentLogger);
+    player.setVolume(100);
+    const encode = vi.fn((pcm: Buffer) => Buffer.from(pcm));
+    const internal = player as unknown as {
+      encoder: { encode: typeof encode };
+      pcmBuffer: Buffer;
+      soundEffectBuffer: Buffer;
+      soundEffectFfmpeg: null;
+      sendNextFrame(): void;
+    };
+    internal.encoder = { encode };
+    internal.pcmBuffer = Buffer.alloc(0);
+    internal.soundEffectBuffer = Buffer.alloc(PCM_FRAME_BYTES);
+    internal.soundEffectBuffer.writeInt16LE(12_345, 0);
+    internal.soundEffectFfmpeg = null;
+
+    internal.sendNextFrame();
+
+    expect(encode.mock.calls[0][0].readInt16LE(0)).toBe(12_345);
+    expect(player.getState()).toBe("idle");
+    expect(player.getElapsed()).toBe(0);
   });
 });
 
@@ -327,6 +436,31 @@ const silentLogger = {
   },
 } as unknown as Logger;
 
+function createFakeDecoder(): ChildProcess & { kill: ReturnType<typeof vi.fn> } {
+  const decoder = new EventEmitter() as ChildProcess & {
+    kill: ReturnType<typeof vi.fn>;
+  };
+  Object.assign(decoder, {
+    stdout: new PassThrough(),
+    stderr: new PassThrough(),
+    stdin: null,
+    stdio: [null, null, null, null, null],
+    pid: undefined,
+    connected: false,
+    killed: false,
+    exitCode: null,
+    signalCode: null,
+    spawnargs: [],
+    spawnfile: "ffmpeg",
+    kill: vi.fn(() => true),
+    send: vi.fn(() => false),
+    disconnect: vi.fn(),
+    unref: vi.fn(),
+    ref: vi.fn(),
+  });
+  return decoder;
+}
+
 function applyPlayerVolume(player: AudioPlayer, pcm: Buffer): Buffer {
   return (
     player as unknown as { applyVolume(input: Buffer): Buffer }
@@ -396,6 +530,164 @@ describe("AudioPlayer transient ducking gain", () => {
     expect(player.getDuckingGain()).toBe(1);
     player.setDuckingGain(Number.NaN);
     expect(player.getDuckingGain()).toBe(1);
+  });
+});
+
+describe("AudioPlayer sound-effect decoder lifecycle", () => {
+  const effectUrl = (tokenCharacter = "a") =>
+    `https://uploads.example/api/music/voice/entry-sound/stream/${tokenCharacter.repeat(48)}`;
+
+  it("does not report startup success until ffmpeg produces decodable PCM", async () => {
+    vi.useFakeTimers();
+    try {
+      const decoder = createFakeDecoder();
+      const player = new AudioPlayer(silentLogger, {
+        spawnSoundEffect: vi.fn(() => decoder),
+      });
+      let started = false;
+      const startPromise = player
+        .playSoundEffect(effectUrl())
+        .then(() => { started = true; });
+
+      decoder.emit("spawn");
+      await Promise.resolve();
+      expect(started).toBe(false);
+
+      decoder.stdout!.emit("data", Buffer.alloc(PCM_FRAME_BYTES));
+      await startPromise;
+      expect(started).toBe(true);
+      player.stop();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("replaces a prior decoder without stopping or changing primary playback", async () => {
+    vi.useFakeTimers();
+    try {
+      const first = createFakeDecoder();
+      const second = createFakeDecoder();
+      const spawnSoundEffect = vi
+        .fn()
+        .mockReturnValueOnce(first)
+        .mockReturnValueOnce(second);
+      const player = new AudioPlayer(silentLogger, { spawnSoundEffect });
+      const internal = player as unknown as { state: "playing" };
+      internal.state = "playing";
+
+      const firstStarted = player.playSoundEffect(effectUrl("a"));
+      first.emit("spawn");
+      first.stdout!.emit("data", Buffer.alloc(PCM_FRAME_BYTES));
+      await firstStarted;
+      const secondStarted = player.playSoundEffect(effectUrl("b"));
+      second.emit("spawn");
+      second.stdout!.emit("data", Buffer.alloc(PCM_FRAME_BYTES));
+      await secondStarted;
+
+      expect(first.kill).toHaveBeenCalledWith("SIGTERM");
+      expect(second.kill).not.toHaveBeenCalled();
+      expect(player.getState()).toBe("playing");
+      player.stop();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("identifies a pending startup superseded by a newer effect as replacement", async () => {
+    vi.useFakeTimers();
+    try {
+      const first = createFakeDecoder();
+      const second = createFakeDecoder();
+      const player = new AudioPlayer(silentLogger, {
+        spawnSoundEffect: vi.fn()
+          .mockReturnValueOnce(first)
+          .mockReturnValueOnce(second),
+      });
+
+      const firstStarted = player.playSoundEffect(effectUrl("a"));
+      const firstResult = expect(firstStarted).rejects.toBeInstanceOf(
+        SoundEffectReplacedError,
+      );
+      const secondStarted = player.playSoundEffect(effectUrl("b"));
+      second.stdout!.emit("data", Buffer.alloc(PCM_FRAME_BYTES));
+
+      await firstResult;
+      await secondStarted;
+      expect(first.kill).toHaveBeenCalledWith("SIGTERM");
+      player.stop();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("keeps decoded PCM inside the hard seven-second buffer budget", async () => {
+    vi.useFakeTimers();
+    try {
+      const decoder = createFakeDecoder();
+      const player = new AudioPlayer(silentLogger, {
+        spawnSoundEffect: vi.fn(() => decoder),
+      });
+      const started = player.playSoundEffect(effectUrl());
+      decoder.emit("spawn");
+      decoder.stdout!.emit(
+        "data",
+        Buffer.alloc(SOUND_EFFECT_MAX_PCM_BYTES + PCM_FRAME_BYTES * 10),
+      );
+      await started;
+
+      const internal = player as unknown as { soundEffectBuffer: Buffer };
+      expect(internal.soundEffectBuffer.length).toBe(SOUND_EFFECT_MAX_PCM_BYTES);
+      player.stop();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("isolates an asynchronous decoder failure from the primary player error path", async () => {
+    vi.useFakeTimers();
+    try {
+      const decoder = createFakeDecoder();
+      const player = new AudioPlayer(silentLogger, {
+        spawnSoundEffect: vi.fn(() => decoder),
+      });
+      const primaryErrors = vi.fn();
+      player.on("error", primaryErrors);
+      const internal = player as unknown as { state: "playing" };
+      internal.state = "playing";
+      const started = player.playSoundEffect(effectUrl());
+      decoder.emit("spawn");
+      decoder.stdout!.emit("data", Buffer.alloc(PCM_FRAME_BYTES));
+      await started;
+
+      decoder.emit("error", new Error("decode failed"));
+
+      expect(primaryErrors).not.toHaveBeenCalled();
+      expect(player.getState()).toBe("playing");
+      player.stop();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("rejects a clean decoder exit that produced no audio without emitting primary error", async () => {
+    vi.useFakeTimers();
+    try {
+      const decoder = createFakeDecoder();
+      const player = new AudioPlayer(silentLogger, {
+        spawnSoundEffect: vi.fn(() => decoder),
+      });
+      const primaryErrors = vi.fn();
+      player.on("error", primaryErrors);
+      const started = player.playSoundEffect(effectUrl());
+      decoder.emit("spawn");
+      decoder.emit("exit", 0, null);
+
+      await expect(started).rejects.toThrow("no decodable audio");
+      expect(primaryErrors).not.toHaveBeenCalled();
+      player.stop();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
 
