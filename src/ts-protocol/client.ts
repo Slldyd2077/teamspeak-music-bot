@@ -150,6 +150,12 @@ export class TS3Client extends EventEmitter {
   }
 
   async connect(): Promise<void> {
+    // Reject invalid login names before discovery/UDP: TS requires 3–30
+    // Unicode characters for non-SDK clients, not UTF-8 bytes or UTF-16 units.
+    const nicknameLength = Array.from(this.options.nickname).length;
+    if (!this.options.nickname.trim() || nicknameLength < 3 || nicknameLength > 30) {
+      throw new Error("TeamSpeak nickname must contain 3–30 characters");
+    }
     this.voiceEndpointResolver.reset();
     this.clearVisibleClientUids();
     // Clean up any existing connection before creating a new one

@@ -294,6 +294,8 @@ export class BotManager extends EventEmitter {
       serverProtocol: params.serverProtocol ?? "",
       ts6ApiKey: params.ts6ApiKey ?? "",
       serverPassword: params.serverPassword ?? "",
+      // Persist the generated key and security offset before the first start.
+      identity: bot.getIdentityExport(),
     });
 
     this.logger.info({ botId: id, name: params.name }, "Bot instance created");
@@ -417,10 +419,18 @@ export class BotManager extends EventEmitter {
       });
       this.bots.set(id, bot);
       this.emit("botInstance", bot);
-      await connectWithTimeout(bot, 15_000, this.logger);
-      // Mark as autoStart so it reconnects on Docker restart, and persist identity
-      this.database.saveBotInstance({ ...saved, autoStart: true });
+      // A failed handshake must not cause the next start to generate a new UID.
       this.persistBotIdentity(saved, bot);
+      await connectWithTimeout(bot, 15_000, this.logger);
+      // Save both fields together so an identity write cannot undo autoStart.
+      const connected = this.getBotConfig(id);
+      if (connected) {
+        this.database.saveBotInstance({
+          ...connected,
+          identity: bot.getIdentityExport(),
+          autoStart: true,
+        });
+      }
     } else {
       await connectWithTimeout(oldBot, 15_000, this.logger);
     }
@@ -470,6 +480,8 @@ export class BotManager extends EventEmitter {
 
       this.bots.set(saved.id, bot);
       this.emit("botInstance", bot);
+      // Repair legacy NULL identities even when autoStart is disabled.
+      this.persistBotIdentity(saved, bot);
 
       // Only auto-connect bots that have autoStart enabled
       if (saved.autoStart) {
@@ -505,8 +517,9 @@ export class BotManager extends EventEmitter {
 
   private persistBotIdentity(saved: import("../data/database.js").BotInstance, bot: BotInstance): void {
     const identity = bot.getIdentityExport();
-    if (identity && identity !== saved.identity) {
-      this.database.saveBotInstance({ ...saved, identity });
+    const current = this.getBotConfig(saved.id);
+    if (current && identity && identity !== current.identity) {
+      this.database.saveBotInstance({ ...current, identity });
     }
   }
 
