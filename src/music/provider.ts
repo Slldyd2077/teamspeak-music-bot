@@ -59,6 +59,34 @@ export interface Album {
   platform: Platform;
 }
 
+/** An artist / singer entity. Only sources with a real artist concept expose
+ *  these (NetEase, QQ); the others simply never return `SearchResult.artists`
+ *  and leave the optional provider methods unimplemented. */
+export interface Artist {
+  id: string;
+  name: string;
+  avatarUrl: string;
+  platform: Platform;
+  /** Alternate names / romanizations (NetEase alias, QQ other_name). */
+  aliases?: string[];
+  songCount?: number;
+  albumCount?: number;
+}
+
+export interface ArtistDetail extends Artist {
+  /** Short biography, when the source provides one. */
+  description?: string;
+}
+
+/** One page of an artist's COMPLETE catalogue (the "全部歌曲" list), as opposed
+ *  to `getArtistSongs`, which only ever returns the hot top-N. */
+export interface ArtistSongPage {
+  songs: Song[];
+  /** Total tracks the source reports for this artist (best effort). */
+  total: number;
+  hasMore: boolean;
+}
+
 export interface LyricLine {
   time: number; // seconds
   text: string;
@@ -69,6 +97,8 @@ export interface SearchResult {
   songs: Song[];
   playlists: Playlist[];
   albums: Album[];
+  /** Present only for sources with an artist entity (NetEase, QQ). */
+  artists?: Artist[];
 }
 
 export interface QrCodeResult {
@@ -112,4 +142,16 @@ export interface MusicProvider {
   getDailyRecommendSongs?(): Promise<Song[]>;
   getUserPlaylists?(): Promise<Playlist[]>;
   getPlaylistDetail?(playlistId: string): Promise<PlaylistDetail | null>;
+  getArtistDetail?(artistId: string): Promise<ArtistDetail | null>;
+  /** The artist's most popular tracks, best-first. */
+  getArtistSongs?(artistId: string, limit?: number): Promise<Song[]>;
+  /** One page of the artist's full catalogue, best-first. Sources that can only
+   *  expose a fixed top-N list leave this unimplemented (the route then 501s and
+   *  the web hides the "全部歌曲" section). */
+  getArtistAllSongs?(
+    artistId: string,
+    offset?: number,
+    limit?: number
+  ): Promise<ArtistSongPage>;
+  getArtistAlbums?(artistId: string, limit?: number): Promise<Album[]>;
 }

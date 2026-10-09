@@ -8,7 +8,7 @@ vi.mock("axios", () => ({
   default: { create: () => ({ get: mockGet, post: mockPost }) },
 }));
 
-import { mapQqAlbums, mapQqSongs, parseQqTrial, parseQqVipInfo, QQMusicProvider } from "./qq.js";
+import { mapQqAlbums, mapQqArtists, mapQqSongs, parseQqTrial, parseQqVipInfo, QQMusicProvider } from "./qq.js";
 
 describe("QQ adapter", () => {
   it("mapQqSongs maps QQMusicApi-style song entries", () => {
@@ -179,5 +179,470 @@ describe("QQMusicProvider.search pagination", () => {
     );
     expect(songCall, "expected a client_search_cp song call").toBeTruthy();
     expect(songCall![1].params.p).toBe(2);
+  });
+
+  it("adds the singer sub-request (search_type 1) to the same musicu batch", async () => {
+    musicuOk();
+    const p = new QQMusicProvider("http://x");
+    await p.search("周杰伦", 20, 0);
+
+    const d = musicuReqData();
+    expect(d.req_artist.param.search_type).toBe(1);
+    expect(d.req_artist.param.num_per_page).toBe(20);
+    expect(d.req_artist.param.page_num).toBe(1);
+  });
+
+  it("returns singers even when the song list is empty (no client_search_cp fallback)", async () => {
+    mockGet.mockImplementation(async (url: string) => {
+      if (url === "/cgi-bin/musicu.fcg") {
+        return {
+          data: {
+            req_0: { data: { body: { song: { list: [] } } } },
+            req_album: { data: { body: { album: { list: [] } } } },
+            req_playlist: { data: { body: { songlist: { list: [] } } } },
+            req_artist: {
+              data: { body: { singer: { list: [{ singerMID: "m1", singerName: "Adele", songNum: 88 }] } } },
+            },
+          },
+        };
+      }
+      return { data: {} };
+    });
+    const p = new QQMusicProvider("http://x");
+    const res = await p.search("Adele", 20, 0);
+
+    expect(res.songs).toEqual([]);
+    expect(res.artists).toEqual([
+      {
+        id: "m1",
+        name: "Adele",
+        avatarUrl: "https://y.gtimg.cn/music/photo_new/T001R500x500M000m1.jpg",
+        songCount: 88,
+        albumCount: undefined,
+        platform: "qq",
+      },
+    ]);
+    expect(mockGet.mock.calls.some((c: any[]) => c[0] === "/soso/fcgi-bin/client_search_cp")).toBe(false);
+  });
+});
+
+describe("mapQqArtists (singer search + detail)", () => {
+  it("maps singer list entries and builds the 500px portrait from the MID", () => {
+    const out = mapQqArtists([
+      {
+        singerMID: "abc",
+        singerName: "周杰伦",
+        singerPic: "http://y.gtimg.cn/music/photo_new/T001R150x150M000abc_11.jpg",
+        songNum: 500,
+        albumNum: 30,
+      },
+    ]);
+    expect(out).toEqual([
+      {
+        id: "abc",
+        name: "周杰伦",
+        avatarUrl: "https://y.gtimg.cn/music/photo_new/T001R500x500M000abc.jpg",
+        songCount: 500,
+        albumCount: 30,
+        platform: "qq",
+      },
+    ]);
+  });
+
+  it("falls back to the given picture when no MID is present", () => {
+    const out = mapQqArtists([
+      { singerID: 42, singerName: "Y", singerPic: "https://y.gtimg.cn/music/photo_new/x.jpg" },
+    ]);
+    expect(out).toEqual([
+      {
+        id: "42",
+        name: "Y",
+        avatarUrl: "https://y.gtimg.cn/music/photo_new/x.jpg",
+        songCount: undefined,
+        albumCount: undefined,
+        platform: "qq",
+      },
+    ]);
+  });
+
+  it("drops entries without an id or name and tolerates empty input", () => {
+    expect(mapQqArtists([{ singerName: "no id" }, { singerMID: "x" }])).toEqual([]);
+    expect(mapQqArtists([])).toEqual([]);
+    expect(mapQqArtists(null as any)).toEqual([]);
+    expect(mapQqArtists(undefined as any)).toEqual([]);
+  });
+});
+
+describe("QQMusicProvider.getArtistAllSongs (album aggregation)", () => {
+  beforeEach(() => {
+    mockGet.mockReset();
+  });
+
+  function songRaw(mid: string, title: string) {
+    return { mid, title, singer: [{ name: "Adele" }], album: { mid: "al1", name: "Album" }, interval: 200 };
+  }
+
+  it("does not cache a hot-only catalogue when the singer lookup for the album scan fails", async () => {
+    let singerCalls = 0;
+    mockGet.mockImplementation(async (url: string, cfg: any) => {
+      if (url === "/getAlbumInfo") {
+        return { data: { response: { data: { list: [songRaw("album-track", "Album track")] } } } };
+      }
+      if (url !== "/cgi-bin/musicu.fcg") return { data: {} };
+      const data = JSON.parse(cfg.params.data);
+      if (data.req_0) {
+        if (++singerCalls === 2) throw new Error("temporary singer lookup failure");
+        return { data: { req_0: { data: { singer_info: { mid: "m1", name: "Adele" }, songlist: [songRaw("hot", "Hot")] } } } };
+      }
+      const list = data.req_album.param.page_num === 1 ? [{ albumMID: "al1", singerMID: "m1" }] : [];
+      return { data: { req_album: { data: { body: { album: { list } } } } } };
+    });
+    const provider = new QQMusicProvider("http://x");
+    expect((await provider.getArtistAllSongs("m1")).songs.map((s) => s.id)).toEqual(["hot"]);
+    expect((await provider.getArtistAllSongs("m1")).songs.map((s) => s.id)).toEqual(["hot", "album-track"]);
+  });
+
+  it.each([
+    { code: 0, req_album: { code: 2000 } },
+    { code: 500, req_album: { data: { body: { album: { list: [] } } } } },
+    { req_album: { data: { body: {} } } },
+    { req_album: { data: { body: { album: { list: {} } } } } },
+  ])("does not cache logical or malformed album-search failure %#", async (failedResponse) => {
+    let failed = true;
+    mockGet.mockImplementation(async (url: string, cfg: any) => {
+      if (url === "/getAlbumInfo") return { data: { response: { data: { list: [songRaw("album-track", "Album track")] } } } };
+      if (url !== "/cgi-bin/musicu.fcg") return { data: {} };
+      const data = JSON.parse(cfg.params.data);
+      if (data.req_0) return { data: { req_0: { data: { singer_info: { mid: "m1", name: "Adele" }, songlist: [songRaw("hot", "Hot")] } } } };
+      if (failed) return { data: failedResponse };
+      const list = data.req_album.param.page_num === 1 ? [{ albumMID: "al1", singerMID: "m1" }] : [];
+      return { data: { code: 0, req_album: { code: 0, data: { body: { album: { list } } } } } };
+    });
+    const provider = new QQMusicProvider("http://x");
+    const degraded = await provider.getArtistAllSongs("m1");
+    expect(degraded.songs.map((s) => s.id)).toEqual(["hot"]);
+    failed = false;
+    expect((await provider.getArtistAllSongs("m1")).songs.map((s) => s.id)).toEqual(["hot", "album-track"]);
+  });
+
+  it("includes more than 50 short albums when the catalogue is below the 500-song ceiling", async () => {
+    mockCatalogue({
+      hot: [songRaw("hot", "Hot")],
+      albumSearch: (page) => Array.from({ length: page === 1 ? 50 : page === 2 ? 10 : 0 }, (_, i) => ({ albumMID: `al${(page - 1) * 50 + i}`, singerMID: "m1" })),
+      albumSongs: Object.fromEntries(Array.from({ length: 60 }, (_, i) => [`al${i}`, [songRaw(`s${i}`, `${i}`)]])),
+    });
+    const result = await new QQMusicProvider("http://x").getArtistAllSongs("m1", 0, 100);
+    expect(result.songs).toHaveLength(61);
+    expect(result.total).toBe(61);
+    expect(result.hasMore).toBe(false);
+  });
+
+  it.each([
+    { response: { code: 2000, data: { list: [] } } },
+    { response: { data: {} } },
+    { response: { data: { list: [{}] } } },
+    { response: { data: { list: [{ mid: "" }] } } },
+    { response: { data: { list: [{ mid: "   " }] } } },
+    { response: { data: { list: [{ mid: {} }] } } },
+  ])("does not cache a catalogue after a logical or malformed album-song failure %#", async (failedResponse) => {
+    let failed = true;
+    mockGet.mockImplementation(async (url: string, cfg: any) => {
+      if (url === "/getAlbumInfo") return { data: failed ? failedResponse : { response: { data: { list: [songRaw("album-track", "Album track")] } } } };
+      if (url !== "/cgi-bin/musicu.fcg") return { data: {} };
+      const data = JSON.parse(cfg.params.data);
+      if (data.req_0) return { data: { req_0: { data: { singer_info: { mid: "m1", name: "Adele" }, songlist: [songRaw("hot", "Hot")] } } } };
+      const list = data.req_album.param.page_num === 1 ? [{ albumMID: "al1", singerMID: "m1" }] : [];
+      return { data: { req_album: { data: { body: { album: { list } } } } } };
+    });
+    const provider = new QQMusicProvider("http://x");
+    expect((await provider.getArtistAllSongs("m1")).songs.map((s) => s.id)).toEqual(["hot"]);
+    failed = false;
+    expect((await provider.getArtistAllSongs("m1")).songs.map((s) => s.id)).toEqual(["hot", "album-track"]);
+  });
+
+  it("does not cache a catalogue whose hot-song rows contain no song identifier", async () => {
+    let failed = true;
+    mockGet.mockImplementation(async (url: string, cfg: any) => {
+      if (url === "/getAlbumInfo") return { data: { response: { data: { list: [songRaw("album-track", "Album track")] } } } };
+      if (url !== "/cgi-bin/musicu.fcg") return { data: {} };
+      const data = JSON.parse(cfg.params.data);
+      if (data.req_0) return { data: { req_0: { data: { singer_info: { mid: "m1", name: "Adele" }, songlist: failed ? [{}] : [songRaw("hot", "Hot")] } } } };
+      const list = data.req_album.param.page_num === 1 ? [{ albumMID: "al1", singerMID: "m1" }] : [];
+      return { data: { req_album: { data: { body: { album: { list } } } } } };
+    });
+    const provider = new QQMusicProvider("http://x");
+    await provider.getArtistAllSongs("m1");
+    failed = false;
+    const recovered = await provider.getArtistAllSongs("m1");
+    expect(recovered.songs.map((s) => s.id)).toEqual(["hot", "album-track"]);
+    expect(recovered.hasMore).toBe(false);
+  });
+
+  it("bounds a large catalogue at 500 unique songs while reporting remaining tracks", async () => {
+    mockCatalogue({
+      hot: [songRaw("hot", "Hot")],
+      albumSearch: () => [{ albumMID: "al1", singerMID: "m1" }],
+      albumSongs: { al1: Array.from({ length: 600 }, (_, i) => songRaw(`s${i}`, `${i}`)) },
+    });
+    const provider = new QQMusicProvider("http://x");
+    const last = await provider.getArtistAllSongs("m1", 400, 100);
+    expect(last.songs).toHaveLength(100);
+    expect(last.hasMore).toBe(true);
+    expect(last.total).toBeGreaterThan(500);
+    expect((await provider.getArtistAllSongs("m1", 500, 100)).songs).toEqual([]);
+  });
+
+  it("reports a complete catalogue of exactly 500 songs without an extra page", async () => {
+    mockCatalogue({
+      hot: [songRaw("hot", "Hot")],
+      albumSearch: () => [{ albumMID: "al1", singerMID: "m1" }],
+      albumSongs: { al1: Array.from({ length: 499 }, (_, i) => songRaw(`s${i}`, `${i}`)) },
+    });
+    const last = await new QQMusicProvider("http://x").getArtistAllSongs("m1", 400, 100);
+    expect(last.total).toBe(500);
+    expect(last.hasMore).toBe(false);
+  });
+
+  it("does not treat a page without matching singers as the end of the search", async () => {
+    mockCatalogue({
+      hot: [songRaw("hot", "Hot")],
+      albumSearch: (page) => page === 1
+        ? Array.from({ length: 50 }, (_, i) => ({ albumMID: `other${i}`, singerMID: "other" }))
+        : page === 2 ? [{ albumMID: "al1", singerMID: "m1" }] : [],
+      albumSongs: { al1: [songRaw("album-track", "Album track")] },
+    });
+    expect((await new QQMusicProvider("http://x").getArtistAllSongs("m1")).songs.map((s) => s.id)).toEqual(["hot", "album-track"]);
+  });
+
+  it("leaves repeated search pages incomplete and retryable", async () => {
+    mockCatalogue({
+      hot: [songRaw("hot", "Hot")],
+      albumSearch: () => Array.from({ length: 50 }, (_, i) => ({ albumMID: `al${i}`, singerMID: "m1" })),
+    });
+    const provider = new QQMusicProvider("http://x");
+    expect((await provider.getArtistAllSongs("m1")).hasMore).toBe(true);
+    mockCatalogue({ hot: [songRaw("hot", "Hot")], albumSearch: () => [] });
+    const recovered = await provider.getArtistAllSongs("m1");
+    expect(recovered.total).toBe(1);
+    expect(recovered.hasMore).toBe(false);
+  });
+
+  it("bounds endless search pages of empty albums and leaves the partial result uncached", async () => {
+    let searchCalls = 0;
+    mockCatalogue({
+      hot: [songRaw("hot", "Hot")],
+      albumSearch: (page) => {
+        if (++searchCalls > 110) throw new Error("unbounded upstream scan");
+        return Array.from({ length: 50 }, (_, i) => ({ albumMID: `al${page}-${i}`, singerMID: "m1" }));
+      },
+    });
+    const provider = new QQMusicProvider("http://x");
+    const partial = await provider.getArtistAllSongs("m1");
+    expect(searchCalls).toBeLessThanOrEqual(100);
+    expect(partial.hasMore).toBe(true);
+    mockCatalogue({ hot: [songRaw("hot", "Hot")], albumSearch: () => [] });
+    expect((await provider.getArtistAllSongs("m1")).hasMore).toBe(false);
+  });
+
+  /** singer detail (top 50) + album search pages + per-album song lists. */
+  function mockCatalogue(opts: {
+    hot?: any[];
+    albumSearch?: (page: number) => any[];
+    albumSongs?: Record<string, any[]>;
+    albumInfoFails?: boolean;
+  }) {
+    mockGet.mockImplementation(async (url: string, cfg: any) => {
+      if (url === "/cgi-bin/musicu.fcg") {
+        const data = JSON.parse(cfg.params.data);
+        if (data.req_0) {
+          return {
+            data: {
+              req_0: {
+                data: {
+                  singer_info: { mid: "m1", name: "Adele" },
+                  total_song: 250,
+                  songlist: opts.hot ?? [],
+                },
+              },
+            },
+          };
+        }
+        const page = data.req_album?.param?.page_num ?? 1;
+        return {
+          data: {
+            req_album: { data: { body: { album: { list: (opts.albumSearch ?? (() => []))(page) } } } },
+          },
+        };
+      }
+      if (url === "/getAlbumInfo") {
+        if (opts.albumInfoFails) throw new Error("album down");
+        return { data: { response: { data: { list: opts.albumSongs?.[cfg.params.albummid] ?? [] } } } };
+      }
+      return { data: {} };
+    });
+  }
+
+  it("merges the hot tracks with every album track, de-duplicated and paged", async () => {
+    mockCatalogue({
+      hot: [songRaw("s1", "Hot 1"), songRaw("s2", "Hot 2")],
+      albumSearch: () => [
+        { albumMID: "al1", albumName: "A", singerMID: "m1" },
+        { albumMID: "al2", albumName: "B", singerMID: "m1" },
+        { albumMID: "other", albumName: "C", singerMID: "m9" },
+      ],
+      albumSongs: {
+        al1: [songRaw("s1", "Hot 1"), songRaw("s3", "Album 1")],
+        al2: [songRaw("s4", "Album 2")],
+      },
+    });
+    const p = new QQMusicProvider("http://x");
+
+    const page = await p.getArtistAllSongs("m1", 0, 10);
+
+    expect(page.songs.map((s) => s.id)).toEqual(["s1", "s2", "s3", "s4"]);
+    expect(page.total).toBe(4);
+    expect(page.hasMore).toBe(false);
+
+    // The unrelated album (singerMID m9) is never fetched.
+    const albumCalls = mockGet.mock.calls.filter((c: any[]) => c[0] === "/getAlbumInfo");
+    expect(albumCalls.map((c: any[]) => c[1].params.albummid).sort()).toEqual(["al1", "al2"]);
+    // A short page exhausts the search without another upstream request.
+    const searchPages = mockGet.mock.calls
+      .filter((c: any[]) => c[0] === "/cgi-bin/musicu.fcg")
+      .map((c: any[]) => JSON.parse(c[1].params.data).req_album?.param?.page_num)
+      .filter(Boolean);
+    expect(searchPages).toEqual([1]);
+  });
+
+  it("slices pages with offset/limit and reports hasMore", async () => {
+    mockCatalogue({
+      hot: [songRaw("s1", "1"), songRaw("s2", "2"), songRaw("s3", "3")],
+      albumSearch: () => [],
+    });
+    const p = new QQMusicProvider("http://x");
+
+    const first = await p.getArtistAllSongs("m1", 0, 2);
+    expect(first.songs.map((s) => s.id)).toEqual(["s1", "s2"]);
+    expect(first.total).toBe(3);
+    expect(first.hasMore).toBe(true);
+
+    const second = await p.getArtistAllSongs("m1", 2, 2);
+    expect(second.songs.map((s) => s.id)).toEqual(["s3"]);
+    expect(second.hasMore).toBe(false);
+  });
+
+  it("caches the assembled catalogue (one upstream sweep per singer)", async () => {
+    mockCatalogue({
+      hot: [songRaw("s1", "1")],
+      albumSearch: () => [{ albumMID: "al1", albumName: "A", singerMID: "m1" }],
+      albumSongs: { al1: [songRaw("s9", "9")] },
+    });
+    const p = new QQMusicProvider("http://x");
+
+    await p.getArtistAllSongs("m1", 0, 50);
+    const callsAfterFirst = mockGet.mock.calls.length;
+    const page = await p.getArtistAllSongs("m1", 0, 50);
+
+    expect(mockGet.mock.calls.length).toBe(callsAfterFirst);
+    expect(page.songs.map((s) => s.id)).toEqual(["s1", "s9"]);
+  });
+
+  it("degrades to the hot list when album lookups fail", async () => {
+    mockCatalogue({
+      hot: [songRaw("s1", "1")],
+      albumSearch: () => [{ albumMID: "al1", albumName: "A", singerMID: "m1" }],
+      albumInfoFails: true,
+    });
+    const p = new QQMusicProvider("http://x");
+
+    const page = await p.getArtistAllSongs("m1", 0, 50);
+
+    expect(page.songs.map((s) => s.id)).toEqual(["s1"]);
+    expect(page.total).toBe(250);
+    expect(page.hasMore).toBe(true);
+  });
+
+  it("retries a failed album search once before giving up", async () => {
+    let albumSearchCalls = 0;
+    mockGet.mockImplementation(async (url: string, cfg: any) => {
+      if (url === "/cgi-bin/musicu.fcg") {
+        const data = JSON.parse(cfg.params.data);
+        if (data.req_0) {
+          return {
+            data: {
+              req_0: {
+                data: { singer_info: { mid: "m1", name: "Adele" }, songlist: [songRaw("s1", "1")] },
+              },
+            },
+          };
+        }
+        albumSearchCalls++;
+        if (albumSearchCalls === 1) throw new Error("blip");
+        const list =
+          data.req_album.param.page_num === 1
+            ? [{ albumMID: "al1", albumName: "A", singerMID: "m1" }]
+            : [];
+        return { data: { req_album: { data: { body: { album: { list } } } } } };
+      }
+      if (url === "/getAlbumInfo") {
+        return { data: { response: { data: { list: [songRaw("s9", "9")] } } } };
+      }
+      return { data: {} };
+    });
+    const p = new QQMusicProvider("http://x");
+
+    const page = await p.getArtistAllSongs("m1", 0, 50);
+
+    const page1Calls = mockGet.mock.calls.filter((c: any[]) => {
+      if (c[0] !== "/cgi-bin/musicu.fcg") return false;
+      return JSON.parse(c[1].params.data).req_album?.param?.page_num === 1;
+    }).length;
+    expect(page1Calls).toBe(2);
+    expect(page.songs.map((s) => s.id)).toEqual(["s1", "s9"]);
+  });
+
+  it("does not cache a catalogue degraded by a failed album search", async () => {
+    let albumSearchFails = true;
+    mockGet.mockImplementation(async (url: string, cfg: any) => {
+      if (url === "/cgi-bin/musicu.fcg") {
+        const data = JSON.parse(cfg.params.data);
+        if (data.req_0) {
+          return {
+            data: {
+              req_0: {
+                data: {
+                  singer_info: { mid: "m1", name: "Adele" },
+                  songlist: [songRaw("s1", "1")],
+                },
+              },
+            },
+          };
+        }
+        if (albumSearchFails) throw new Error("upstream hiccup");
+        return {
+          data: {
+            req_album: {
+              data: { body: { album: { list: [{ albumMID: "al1", albumName: "A", singerMID: "m1" }] } } },
+            },
+          },
+        };
+      }
+      if (url === "/getAlbumInfo") {
+        return { data: { response: { data: { list: [songRaw("s9", "9")] } } } };
+      }
+      return { data: {} };
+    });
+    const p = new QQMusicProvider("http://x");
+
+    // The album search fails twice (call + retry) → hot list only, and the
+    // degraded result must not be cached.
+    const degraded = await p.getArtistAllSongs("m1", 0, 50);
+    expect(degraded.songs.map((s) => s.id)).toEqual(["s1"]);
+    expect(degraded.total).toBe(1);
+
+    albumSearchFails = false;
+    const full = await p.getArtistAllSongs("m1", 0, 50);
+    expect(full.songs.map((s) => s.id)).toEqual(["s1", "s9"]);
+    expect(full.total).toBe(2);
   });
 });

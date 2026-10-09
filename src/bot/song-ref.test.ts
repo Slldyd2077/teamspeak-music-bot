@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { parseSongRef, parseSelectionIndex } from "./song-ref.js";
+import { parseSongRef, parseSelectionIndex, parsePlaylistRef, findShareShortLink, resolveShareLink } from "./song-ref.js";
 
 describe("parseSongRef (#90 exact-song selection)", () => {
   it("returns null for a plain search term", () => {
@@ -118,5 +118,67 @@ describe("parseSelectionIndex (#90 pick from last search)", () => {
     expect(parseSelectionIndex("Die For You")).toBeNull();
     expect(parseSelectionIndex("#2 extra")).toBeNull();
     expect(parseSelectionIndex("")).toBeNull();
+  });
+});
+
+describe("parsePlaylistRef (#160 play a playlist from its link)", () => {
+  it("returns null for a playlist name or a bare id (caller keeps its old logic)", () => {
+    expect(parsePlaylistRef("华语经典")).toBeNull();
+    expect(parsePlaylistRef("2829883282")).toBeNull();
+    expect(parsePlaylistRef("")).toBeNull();
+  });
+
+  it("parses NetEase playlist URLs (web, hash route, mobile share)", () => {
+    expect(parsePlaylistRef("https://music.163.com/playlist?id=2829883282")).toEqual({ id: "2829883282", platform: "netease" });
+    expect(parsePlaylistRef("https://music.163.com/#/playlist?id=2829883282")).toEqual({ id: "2829883282", platform: "netease" });
+    expect(parsePlaylistRef("https://y.music.163.com/m/playlist?id=2829883282&userid=77&creatorId=77")).toEqual({ id: "2829883282", platform: "netease" });
+    expect(parsePlaylistRef("https://music.163.com/playlist/2829883282")).toEqual({ id: "2829883282", platform: "netease" });
+  });
+
+  it("does not mistake a NetEase userid= for the playlist id", () => {
+    expect(parsePlaylistRef("https://music.163.com/playlist?userid=77&id=123")).toEqual({ id: "123", platform: "netease" });
+  });
+
+  it("parses QQ Music playlist URLs", () => {
+    expect(parsePlaylistRef("https://y.qq.com/n/ryqq/playlist/8052190267")).toEqual({ id: "8052190267", platform: "qq" });
+    expect(parsePlaylistRef("https://i.y.qq.com/n2/m/share/details/taoge.html?platform=11&appshare=android_qq&hosteuin=abc&id=8052190267&appversion=13")).toEqual({ id: "8052190267", platform: "qq" });
+  });
+
+  it("parses YouTube playlist URLs by their list= id", () => {
+    expect(parsePlaylistRef("https://www.youtube.com/playlist?list=PLx0sYbCqOb8TBPRdmBHs5Iftvv9TPboYG")).toEqual({ id: "PLx0sYbCqOb8TBPRdmBHs5Iftvv9TPboYG", platform: "youtube" });
+    expect(parsePlaylistRef("https://youtu.be/abc?list=PLabc-_1")).toEqual({ id: "PLabc-_1", platform: "youtube" });
+  });
+
+  it("unwraps the [URL] BBCode the TeamSpeak client adds to pasted links", () => {
+    expect(parsePlaylistRef("[URL]https://y.qq.com/n/ryqq/playlist/8052190267[/URL]")).toEqual({ id: "8052190267", platform: "qq" });
+  });
+
+  it("finds the link inside an app's share text", () => {
+    expect(parsePlaylistRef("分享某人创建的歌单「深夜」: https://y.music.163.com/m/playlist?id=123&userid=77 (来自@网易云音乐)")).toEqual({ id: "123", platform: "netease" });
+  });
+});
+
+describe("findShareShortLink (#160)", () => {
+  it("finds NetEase and QQ app short links, even inside share text or BBCode", () => {
+    expect(findShareShortLink("歌单「深夜」: https://163cn.tv/Abc123 (来自@网易云音乐)")).toBe("https://163cn.tv/Abc123");
+    expect(findShareShortLink("[URL]https://c6.y.qq.com/base/fcgi-bin/u?__=AbCd12[/URL]")).toBe("https://c6.y.qq.com/base/fcgi-bin/u?__=AbCd12");
+  });
+
+  it("ignores every other host, so we never fetch arbitrary user-supplied URLs", () => {
+    expect(findShareShortLink("https://evil.example/163cn.tv/Abc")).toBeNull();
+    expect(findShareShortLink("http://127.0.0.1:8080/x")).toBeNull();
+    expect(findShareShortLink("华语经典")).toBeNull();
+  });
+});
+
+describe("resolveShareLink (#160)", () => {
+  it("returns the redirect target", async () => {
+    const get = async () => ({ status: 302, location: "https://music.163.com/playlist?id=123" });
+    expect(await resolveShareLink("https://163cn.tv/Abc", get)).toBe("https://music.163.com/playlist?id=123");
+  });
+
+  it("returns null when there is no redirect or the request fails", async () => {
+    expect(await resolveShareLink("https://163cn.tv/Abc", async () => ({ status: 200, location: undefined }))).toBeNull();
+    expect(await resolveShareLink("https://163cn.tv/Abc", async () => { throw new Error("boom"); })).toBeNull();
   });
 });

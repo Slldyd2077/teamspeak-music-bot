@@ -1,6 +1,7 @@
 import { Router, type RequestHandler } from "express";
 import type { BotManager } from "../../bot/manager.js";
 import type { BotDatabase } from "../../data/database.js";
+import type { MusicProvider, Song, ArtistSongPage } from "../../music/provider.js";
 import type { Logger } from "../../logger.js";
 import { parseCommand } from "../../bot/commands.js";
 import { requireBotAccess } from "../middleware/requirePermission.js";
@@ -11,6 +12,33 @@ import {
   SoundEffectReplacedError,
 } from "../../audio/player.js";
 import { createRateLimit } from "../middleware/rateLimit.js";
+import { supportsPersonalLogin } from "./personal-music.js";
+
+/** Hard cap on how many tracks one "播放全部" request may queue — a safety net
+ *  against a pathological catalogue (and against an upstream paging bug). */
+const MAX_ARTIST_QUEUE = 500;
+const ARTIST_QUEUE_PAGE = 100;
+
+/** Walks every page of an artist's catalogue (best-first, de-duplicated). */
+export async function collectArtistSongs(
+  fetchPage: (artistId: string, offset?: number, limit?: number) => Promise<ArtistSongPage>,
+  artistId: string
+): Promise<Song[]> {
+  const songs: Song[] = [];
+  const seen = new Set<string>();
+  for (let offset = 0; offset < MAX_ARTIST_QUEUE; offset += ARTIST_QUEUE_PAGE) {
+    const page = await fetchPage(artistId, offset, ARTIST_QUEUE_PAGE);
+    for (const song of page.songs) {
+      if (!seen.has(song.id)) {
+        seen.add(song.id);
+        songs.push(song);
+        if (songs.length === MAX_ARTIST_QUEUE) return songs;
+      }
+    }
+    if (!page.hasMore || page.songs.length === 0) break;
+  }
+  return songs;
+}
 
 export function createPlayerRouter(
   botManager: BotManager,
@@ -211,11 +239,19 @@ export function createPlayerRouter(
         rejectDisabledLocalAudio(res);
         return;
       }
-      const provider = bot.getProviderFor(
+      let provider = bot.getProviderFor(
         platform === "bilibili" || platform === "qq" || platform === "youtube" || platform === "local" || platform === "kugou" || platform === "jellyfin"
           ? platform
           : "netease"
       );
+      // A signed-in user who linked their own NetEase account gets FM from
+      // THEIR taste, not the bot's shared login (#164). Songs still resolve
+      // through the shared provider when played.
+      const user = (req as any).user;
+      if (provider.platform === "netease" && user && user.role !== "guest" && database) {
+        const cookie = database.getUserMusicCookie(user.id, "netease");
+        if (cookie && supportsPersonalLogin(provider)) provider = provider.withCookie(cookie);
+      }
       const message = await bot.startFm(provider, requesterName(req));
       res.json({
         ok:
@@ -566,6 +602,99 @@ export function createPlayerRouter(
       }
     } catch (err) {
       logger.error({ err }, "play-album failed");
+      res.status(500).json({ error: (err as Error).message });
+    }
+  });
+
+  // Play an artist's songs. An artist page queues the singer's FULL catalogue —
+  // never just the hot 50 — so this pages through getArtistAllSongs when the
+  // source can page a catalogue, and falls back to getArtistSongs (hot songs)
+  // when it cannot.
+  router.post("/:botId/play-artist", authorize({ capability: "player.control", guestFlag: "playCollection" }), async (req, res) => {
+    try {
+      const bot = (req as any).bot;
+      const { artistId, platform } = req.body;
+      if (!artistId) {
+        res.status(400).json({ error: "artistId is required" });
+        return;
+      }
+      if (isLocalAudioDisabled(bot, platform)) {
+        rejectDisabledLocalAudio(res);
+        return;
+      }
+      const provider = bot.getProviderFor(
+        platform === "bilibili" || platform === "qq" || platform === "youtube" || platform === "local" || platform === "kugou" || platform === "jellyfin"
+          ? platform
+          : "netease"
+      );
+      if (typeof provider.getArtistSongs !== "function") {
+        res.status(501).json({ error: "Not supported by this provider" });
+        return;
+      }
+      // Whole catalogue when the source can page it (bounded by the collector's
+      // safety cap); otherwise the hot songs are the best it can offer.
+      const fetchPage = provider.getArtistAllSongs?.bind(provider);
+
+      const songs = fetchPage
+        ? await collectArtistSongs(fetchPage, artistId)
+        : await provider.getArtistSongs(artistId, 50);
+      if (songs.length === 0) {
+        res.json({ ok: false, message: "该歌手暂无可用歌曲" });
+        return;
+      }
+
+      // Same QQ batch-resolve optimization as play-album: drop tracks that are
+      // region/copyright blocked instead of burning retries on them.
+      let queueable: { id: string }[] = songs;
+      const totalCount = songs.length;
+      const qqLike = provider as { getPlayableSongIds?: (ids: string[]) => Promise<Set<string> | null> };
+      if (typeof qqLike.getPlayableSongIds === "function") {
+        const playable = await qqLike.getPlayableSongIds(songs.map((s: { id: string }) => s.id));
+        if (playable !== null) {
+          queueable = songs.filter((s: { id: string }) => playable.has(s.id));
+        }
+      }
+      if (queueable.length === 0) {
+        res.json({ ok: false, message: `歌手 ${totalCount} 首歌曲均无版权可播放（区域/版权限制）` });
+        return;
+      }
+
+      // Catalogue and copyright lookups leave current playback running. Only
+      // the queue replacement and playback itself occupy the shared play gate.
+      const body = await bot.runExclusive(async () => {
+        bot.getPlayer().stop();
+        bot.getPlayer().resetFailures();
+        const queue = bot.getQueueManager();
+        queue.clear();
+        for (const song of queueable) {
+          queue.add({ ...song, platform: provider.platform, requestedBy: requesterName(req) });
+        }
+        // Sweep AFTER the queue is rebuilt (see play-playlist).
+        bot.cleanupQueuedLocalSongs?.("queue_replaced");
+
+        const mode = queue.getMode();
+        let first;
+        if (mode === "random" || mode === "rloop") {
+          const idx = Math.floor(Math.random() * queue.size());
+          first = queue.playAt(idx);
+        } else {
+          first = queue.play();
+        }
+
+        let started = first ? await bot.resolveAndPlay(first) : false;
+        if (first && !started) started = await bot.playNext(20);
+
+        const playing = queue.current();
+        const loadedMsg = queueable.length < totalCount
+          ? `已加载 ${queueable.length}/${totalCount} 首（其余区域/版权限制）`
+          : `已加载 ${queueable.length} 首`;
+        return started && playing
+          ? { ok: true, message: `${loadedMsg}，正在播放：${playing.name}` }
+          : { ok: false, message: `${loadedMsg}，但无法开始播放。` };
+      });
+      res.json(body);
+    } catch (err) {
+      logger.error({ err }, "play-artist failed");
       res.status(500).json({ error: (err as Error).message });
     }
   });

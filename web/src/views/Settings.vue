@@ -48,6 +48,7 @@
       </form>
       <p v-if="ownPwError" class="user-error">{{ ownPwError }}</p>
       <p v-if="ownPwSuccess" class="user-success">{{ ownPwSuccess }}</p>
+      <PersonalNeteaseAccount v-if="providerOn('netease') && !session.isGuest.value" />
     </section>
 
     <!-- Bot Management (create/edit/delete/start-stop) requires bot.manage -->
@@ -1126,6 +1127,60 @@
       </div>
     </section>
 
+    <!-- API Keys -->
+    <section class="settings-section">
+      <h2 class="section-title">API 密钥</h2>
+      <p class="apikey-hint">
+        通过 API Key 调用本机的 REST API（请求头 <code>Authorization: Bearer</code> 或 <code>X-API-Key</code>）。
+        权限与你的账户一致；明文只在生成时显示一次，之后仅能看到前缀。
+      </p>
+      <div class="user-list">
+        <div v-for="k in apiKeyList" :key="k.id" class="user-item">
+          <div class="user-info">
+            <div class="user-name">{{ k.name }}</div>
+            <div class="apikey-meta">
+              <code class="apikey-prefix">{{ k.keyPrefix }}…</code>
+              <span>创建于 {{ formatDate(k.createdAt) }}</span>
+              <span>{{ k.lastUsedAt ? `最后使用 ${formatDate(k.lastUsedAt)}` : '从未使用' }}</span>
+            </div>
+          </div>
+          <div class="user-actions">
+            <button class="btn-sm btn-delete" title="吊销此密钥" @click="onRevokeApiKey(k)">
+              <Icon icon="mdi:delete" />
+            </button>
+          </div>
+        </div>
+        <div v-if="apiKeyList.length === 0 && !apiKeyLoadError" class="user-empty">还没有 API Key。</div>
+        <div v-if="apiKeyLoadError" class="user-error">{{ apiKeyLoadError }}</div>
+      </div>
+
+      <form class="user-add-form" @submit.prevent="onCreateApiKey">
+        <input v-model="newApiKeyName" class="input" placeholder="密钥名称（如：home-assistant）" maxlength="64" required />
+        <button class="btn-sm btn-primary" type="submit" :disabled="creatingApiKey">
+          {{ creatingApiKey ? '生成中…' : '生成密钥' }}
+        </button>
+      </form>
+      <p v-if="apiKeyMutationError" class="user-error">{{ apiKeyMutationError }}</p>
+
+      <!-- Created key modal: plaintext shown exactly once -->
+      <div v-if="createdKey" class="edit-modal-overlay" @click.self="createdKey = null">
+        <div class="edit-modal">
+          <h3 class="modal-title">密钥「{{ createdKey.key.name }}」已生成</h3>
+          <p class="modal-hint">请立即复制保存——这串明文只显示这一次，关闭后只能看到前缀。</p>
+          <div class="apikey-raw-row">
+            <code class="apikey-raw">{{ createdKey.rawKey }}</code>
+            <button class="btn-sm" @click="copyCreatedKey">
+              <Icon icon="mdi:content-copy" /> 复制
+            </button>
+          </div>
+          <p v-if="keyCopied" class="apikey-copied">已复制到剪贴板</p>
+          <div class="form-actions">
+            <button class="btn-sm btn-primary" @click="createdKey = null">完成</button>
+          </div>
+        </div>
+      </div>
+    </section>
+
     <!-- Audit Log -->
     <section v-if="session.isAdmin.value" class="settings-section">
       <h2 class="section-title">
@@ -1153,6 +1208,7 @@ import { Icon } from '@iconify/vue';
 import axios from 'axios';
 import AvatarUpload from '../components/AvatarUpload.vue';
 import CustomAvatarRow from '../components/CustomAvatarRow.vue';
+import PersonalNeteaseAccount from '../components/PersonalNeteaseAccount.vue';
 import QRCode from 'qrcode';
 import { usePlayerStore } from '../stores/player.js';
 import { useSession } from '../composables/useSession.js';
@@ -2217,6 +2273,90 @@ async function onConfirmReset() {
   }
 }
 
+// --- API Keys management ---
+interface ApiKeyEntry { id: string; name: string; keyPrefix: string; createdAt: number; lastUsedAt: number | null }
+const apiKeyList = ref<ApiKeyEntry[]>([]);
+const apiKeyLoadError = ref('');
+const apiKeyMutationError = ref('');
+const newApiKeyName = ref('');
+const creatingApiKey = ref(false);
+const createdKey = ref<{ key: ApiKeyEntry; rawKey: string } | null>(null);
+const keyCopied = ref(false);
+
+async function loadApiKeys() {
+  apiKeyLoadError.value = '';
+  try {
+    const res = await fetch('/api/keys');
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const body = await res.json();
+    apiKeyList.value = body.keys ?? [];
+  } catch (e) {
+    apiKeyLoadError.value = (e as Error).message;
+  }
+}
+
+async function onCreateApiKey() {
+  const name = newApiKeyName.value.trim();
+  if (!name) return;
+  apiKeyMutationError.value = '';
+  creatingApiKey.value = true;
+  try {
+    const res = await fetch('/api/keys', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name }),
+    });
+    const body = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(body.error ?? `HTTP ${res.status}`);
+    createdKey.value = body;
+    keyCopied.value = false;
+    newApiKeyName.value = '';
+    await loadApiKeys();
+  } catch (e) {
+    apiKeyMutationError.value = (e as Error).message;
+  } finally {
+    creatingApiKey.value = false;
+  }
+}
+
+async function onRevokeApiKey(k: ApiKeyEntry) {
+  if (!confirm(`确认吊销 API Key「${k.name}」？使用它的集成将立即失效。`)) return;
+  apiKeyMutationError.value = '';
+  try {
+    const res = await fetch(`/api/keys/${k.id}`, { method: 'DELETE' });
+    if (!res.ok) {
+      const b = await res.json().catch(() => ({}));
+      throw new Error(b.error ?? `HTTP ${res.status}`);
+    }
+    await loadApiKeys();
+  } catch (e) {
+    apiKeyMutationError.value = (e as Error).message;
+  }
+}
+
+async function copyCreatedKey() {
+  if (!createdKey.value) return;
+  const text = createdKey.value.rawKey;
+  try {
+    await navigator.clipboard.writeText(text);
+    keyCopied.value = true;
+  } catch {
+    // Clipboard API is unavailable on non-secure origins — fall back to a
+    // temporary textarea + execCommand.
+    const ta = document.createElement('textarea');
+    ta.value = text;
+    ta.style.position = 'fixed';
+    ta.style.opacity = '0';
+    document.body.appendChild(ta);
+    ta.select();
+    try {
+      keyCopied.value = document.execCommand('copy');
+    } finally {
+      document.body.removeChild(ta);
+    }
+  }
+}
+
 // --- Per-user permission editor (members only) ---
 const CAPABILITIES: { token: string; label: string }[] = [
   { token: 'player.control', label: '播放控制' },
@@ -2353,13 +2493,15 @@ function describeAction(e: AuditEntry): string {
     case 'user.password_changed':   return `修改自己的密码`;
     case 'user.role_changed':       return `变更 ${target} 的角色`;
     case 'user.permissions_changed': return `权限变更 → ${target}`;
+    case 'api_key.created':          return `${target} 生成 API Key`;
+    case 'api_key.deleted':          return `${target} 吊销 API Key`;
     default:                        return `${e.action} → ${target}`;
   }
 }
 
 function auditActionClass(action: string): string {
   if (action === 'user.deleted') return 'audit-action-danger';
-  if (action === 'user.password_reset' || action === 'user.password_changed') return 'audit-action-warn';
+  if (action === 'user.password_reset' || action === 'user.password_changed' || action === 'api_key.deleted') return 'audit-action-warn';
   return 'audit-action-ok';
 }
 
@@ -2370,6 +2512,7 @@ onMounted(() => {
   loadIdleTimeout(); // also populates the Spotify config form (same endpoint)
   loadSpotifyStatus();
   handleSpotifyRedirect();
+  loadApiKeys();
   if (session.isAdmin.value) {
     loadUsers();
     loadAudit();
@@ -3165,6 +3308,18 @@ onUnmounted(() => {
 .user-add-form .input { flex: 1; min-width: 140px; }
 .user-empty, .user-error { font-size: 12px; color: var(--text-secondary); padding: 8px 0; }
 .user-error { color: #e26a6a; }
+.apikey-hint { font-size: 12px; color: var(--text-secondary); margin: 0 0 10px; line-height: 1.6; }
+.apikey-hint code { background: var(--bg-card); border: 1px solid var(--border-color); border-radius: 4px; padding: 1px 4px; }
+.apikey-meta { display: flex; gap: 12px; flex-wrap: wrap; font-size: 12px; color: var(--text-secondary); margin-top: 2px; }
+.apikey-prefix { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px; }
+.apikey-raw-row { display: flex; gap: 8px; align-items: center; }
+.apikey-raw {
+  flex: 1; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12px; word-break: break-all; padding: 8px;
+  background: var(--bg-card); border: 1px solid var(--border-color); border-radius: 6px;
+  user-select: all;
+}
+.apikey-copied { font-size: 12px; color: var(--color-primary); margin: 6px 0 0; }
 .modal-hint { color: var(--text-secondary); font-size: 12px; margin: 0 0 8px; }
 .form-actions { display: flex; gap: 8px; justify-content: flex-end; margin-top: 8px; }
 

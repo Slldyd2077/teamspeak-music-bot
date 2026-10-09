@@ -3,6 +3,7 @@ import type { Logger } from "../../logger.js";
 import type { UserStore } from "../../data/users.js";
 import { UsernameTakenError, GUEST_USER_ID } from "../../data/users.js";
 import type { SessionStore } from "../../data/sessions.js";
+import type { ApiKeyStore } from "../../data/api-keys.js";
 import type { AuditStore } from "../../data/audit.js";
 import { isCapability, BASIC_TIER_CAPABILITIES, type PermissionStore } from "../../data/permissions.js";
 import { extractSessionToken } from "../auth/validateSession.js";
@@ -20,7 +21,8 @@ export function createUsersRouter(
   sessions: SessionStore,
   audit: AuditStore,
   logger: Logger,
-  permissions: PermissionStore
+  permissions: PermissionStore,
+  apiKeys?: ApiKeyStore
 ): Router {
   const router = Router();
 
@@ -85,6 +87,7 @@ export function createUsersRouter(
     }
     // FK CASCADE removes sessions; explicit call is belt-and-suspenders
     sessions.deleteAllForUser(targetId);
+    apiKeys?.deleteAllForUser(targetId);
     try {
       audit.record({
         actorId: req.user!.id, actorUsername: req.user!.username,
@@ -117,6 +120,9 @@ export function createUsersRouter(
       ? (extractSessionToken(req.headers.cookie) ?? undefined)
       : undefined;
     sessions.deleteAllForUser(targetId, exceptToken);
+    // A password reset must also kill the target's API keys — they are
+    // long-lived credentials that otherwise survive credential rotation.
+    apiKeys?.deleteAllForUser(targetId);
     try {
       audit.record({
         actorId: req.user!.id, actorUsername: req.user!.username,

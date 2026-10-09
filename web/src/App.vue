@@ -7,6 +7,7 @@
     <Player />
     <Toast />
     <Queue class="mobile-queue" :open="mobileQueueOpen" @close="mobileQueueOpen = false" />
+    <BilibiliPartModal />
 
     <!-- Mobile mini player -->
     <div v-if="currentSong" class="m-player" @click="onPlayerRowClick">
@@ -102,6 +103,7 @@ import Player from './components/Player.vue';
 import CoverArt from './components/CoverArt.vue';
 import Toast from './components/Toast.vue';
 import Queue from './components/Queue.vue';
+import BilibiliPartModal from './components/BilibiliPartModal.vue';
 
 const playerStore = usePlayerStore();
 const session = useSession();

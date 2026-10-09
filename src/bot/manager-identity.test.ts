@@ -58,6 +58,13 @@ const legacy: SavedBot = {
 beforeEach(() => { probe.connect.mockReset(); probe.disconnect.mockReset(); });
 
 describe("voice identity persistence", () => {
+  it("creates independent personal login providers without borrowing a bot cookie", () => {
+    const { manager } = fixture();
+    const first = manager.createPersonalNeteaseProvider();
+    const second = manager.createPersonalNeteaseProvider();
+    expect(first).not.toBe(second);
+    expect(manager.getAllBots()).toEqual([]);
+  });
   it("stores a new identity before any connection attempt", async () => {
     const { manager, rows } = fixture();
     const bot = await manager.createBot(params);

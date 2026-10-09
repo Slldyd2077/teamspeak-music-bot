@@ -20,6 +20,7 @@ const router = createRouter({
       component: () => import('../views/Playlist.vue'),
       meta: { kind: 'album' },
     },
+    { path: '/artist/:id', name: 'artist', component: () => import('../views/Artist.vue') },
     { path: '/lyrics', name: 'lyrics', component: () => import('../views/Lyrics.vue') },
     { path: '/history', name: 'history', component: () => import('../views/History.vue') },
     { path: '/saved-queues', name: 'saved-queues', component: () => import('../views/SavedQueues.vue') },

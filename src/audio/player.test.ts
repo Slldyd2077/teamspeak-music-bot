@@ -22,13 +22,21 @@ import {
 } from "./player.js";
 import { EventEmitter } from "node:events";
 import { PassThrough, Readable } from "node:stream";
-import type { ChildProcess } from "node:child_process";
+import { spawn, type ChildProcess } from "node:child_process";
 import { PCM_FRAME_BYTES } from "./encoder.js";
 import {
   createRealtimePcmIngressTelemetry,
   updateRealtimePcmIngressTelemetry,
 } from "./realtime-voice-telemetry.js";
+import pino from "pino";
 import type { Logger } from "../logger.js";
+
+// Only replace process creation in the regression cases below. Their pipes,
+// write callbacks and backpressure are real OS resources, rather than mocks.
+vi.mock("node:child_process", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:child_process")>();
+  return { ...actual, spawn: vi.fn(actual.spawn) };
+});
 
 function getHeadersArg(args: string[]): string {
   const idx = args.indexOf("-headers");
@@ -54,10 +62,54 @@ describe("buildFfmpegArgs", () => {
     expect(headers).toContain("User-Agent: Mozilla/5.0");
   });
 
+  it.each([
+    "https://bilivideo.com/audio.m4s",
+    "https://upos-sz-mirrorcos.bilivideo.com/audio.m4s",
+    "https://bilivideo.cn/audio.m4s",
+    "https://cn-example-live-01.bilivideo.cn/audio.m4s",
+    "https://bilibili.com/audio.m4s",
+    "https://www.bilibili.com/audio.m4s",
+    "https://szbdyd.com/audio.m4s",
+    "https://stream.mcdn.szbdyd.com/audio.m4s",
+    "https://xy219x131x72x38xy.mcdn.bilivideo.cn.szbdyd.com/audio.m4s",
+    "HTTPS://UPOS-SZ-MIRRORCOS.BILIVIDEO.COM:443/audio.m4s",
+    "https://upos-sz-mirrorcos.bilivideo.com./audio.m4s",
+  ])("uses Bilibili headers and input-side seeking for the actual CDN host in %s", (url) => {
+    const args = buildFfmpegArgs(url, 2220);
+    const headers = getHeadersArg(args);
+    expect(headers).toContain("Referer: https://www.bilibili.com");
+    expect(headers).toContain("User-Agent: Mozilla/5.0");
+    expect(args[args.indexOf("-ss") + 1]).toBe("2220");
+    expect(args.indexOf("-ss")).toBeLessThan(args.indexOf("-i"));
+    expect(args.lastIndexOf("-ss")).toBe(args.indexOf("-ss"));
+    expect(args).toContain("-reconnect_at_eof");
+  });
+
+  it.each([
+    "https://bilivideo.com.evil.example/audio.m4s",
+    "https://evilbilivideo.com/audio.m4s",
+    "https://bilivideo.cn.evil.example/audio.m4s",
+    "https://bilibili.com.evil.example/audio.m4s",
+    "https://evilbilibili.com/audio.m4s",
+    "https://szbdyd.com.evil.example/audio.m4s",
+    "https://evil.example/audio.m4s?redirect=https://upos-sz-mirrorcos.bilivideo.com/x",
+    "https://bilibili.com@evil.example/audio.m4s",
+  ])("does not trust Bilibili text outside an allowed hostname in %s", (url) => {
+    const args = buildFfmpegArgs(url, 2220);
+    expect(args).not.toContain("-headers");
+    expect(args.indexOf("-ss")).toBeGreaterThan(args.indexOf("-i"));
+  });
+
   it("does not set custom headers for unknown URLs", () => {
     const url = "https://example.com/song.mp3";
     const args = buildFfmpegArgs(url, 0);
     expect(args).not.toContain("-headers");
+  });
+
+  it("disables periodic progress stats for both network and file inputs", () => {
+    for (const input of ["https://example.com/song.mp3", "C:/temp/song.audio"]) {
+      expect(buildFfmpegArgs(input, 0)).toContain("-nostats");
+    }
   });
 
   it("includes resilient reconnect flags for all URLs", () => {
@@ -79,13 +131,21 @@ describe("buildFfmpegArgs", () => {
     expect(idx).toBeLessThan(args.indexOf("-i")); // input options must precede -i
   });
 
-  it("inserts -ss before -i when seekSeconds > 0", () => {
+  it("inserts -ss after -i when seekSeconds > 0", () => {
     const args = buildFfmpegArgs("https://example.com/song.mp3", 42);
     const ssIdx = args.indexOf("-ss");
     const iIdx = args.indexOf("-i");
     expect(ssIdx).toBeGreaterThan(-1);
     expect(args[ssIdx + 1]).toBe("42");
-    expect(ssIdx).toBeLessThan(iIdx);
+    expect(ssIdx).toBeGreaterThan(iIdx);
+  });
+
+  it("seeks B站 streams input-side (before -i) so a resume jumps via Range instead of re-downloading (#161)", () => {
+    const args = buildFfmpegArgs("https://upos-sz-mirrorcos.bilivideo.com/audio.m4s", 3600);
+    const ssIdx = args.indexOf("-ss");
+    expect(args[ssIdx + 1]).toBe("3600");
+    expect(ssIdx).toBeLessThan(args.indexOf("-i"));
+    expect(args.lastIndexOf("-ss")).toBe(ssIdx); // only one -ss
   });
 
   it("does not insert -ss when seekSeconds is 0", () => {
@@ -460,6 +520,248 @@ function createFakeDecoder(): ChildProcess & { kill: ReturnType<typeof vi.fn> } 
   });
   return decoder;
 }
+describe("AudioPlayer FFmpeg stderr handling", () => {
+  const producer = `
+    const pressure = 'decoder diagnostic\\n'.repeat(180000);
+    process.stderr.write(pressure, () => {
+      process.stderr.write('HTTP error 403 for https://user:password@cdn.example/audio?token=signed-secret#fragment-secret\\n');
+      process.stderr.write('Cookie: cookie-secret\\nAuthorization: Bearer bearer-secret\\n');
+      process.stderr.write('final decoder failure', () => {
+        process.stdout.write(Buffer.alloc(7680), () => process.exit(1));
+      });
+    });
+  `;
+
+  function recordedLogger() {
+    const records: Array<{ level: string; fields: Record<string, unknown>; message: string }> = [];
+    const capture = (level: string) => (fields: Record<string, unknown>, message: string) => {
+      records.push({ level, fields, message });
+    };
+    return {
+      records,
+      logger: { ...silentLogger, info: capture("info"), warn: capture("warn") } as unknown as Logger,
+    };
+  }
+
+  async function pipeProducer(script: string) {
+    const actual = await vi.importActual<typeof import("node:child_process")>("node:child_process");
+    let child!: ChildProcess;
+    let requestedArgs: readonly string[] = [];
+    let closed!: Promise<number | null>;
+    vi.mocked(spawn).mockImplementationOnce((_command, args, options) => {
+      requestedArgs = args ?? [];
+      child = actual.spawn(process.execPath, ["-e", script], options);
+      closed = new Promise((resolve) => child.once("close", resolve));
+      return child;
+    });
+    return {
+      get child() { return child; },
+      get args() { return requestedArgs; },
+      get closed() { return closed; },
+    };
+  }
+
+  for (const path of ["URL", "temp file"] as const) {
+    it(`drains the ${path} child stderr so a large diagnostic write cannot block PCM output`, async () => {
+      const { records, logger } = recordedLogger();
+      const producerProcess = await pipeProducer(producer);
+      const player = new AudioPlayer(logger);
+      let frameCount = 0;
+      player.on("frame", () => frameCount++);
+      let deadline: ReturnType<typeof setTimeout> | undefined;
+      try {
+        if (path === "URL") {
+          player.play("https://cdn.example/audio?token=input-secret");
+        } else {
+          // The real downloader marks playing before calling this file path.
+          const internal = player as unknown as {
+            state: string;
+            spawnFfmpegFromFile(file: string, seek: number, session: number): void;
+          };
+          internal.state = "playing";
+          internal.spawnFfmpegFromFile("downloaded.audio", 0, player.getPlaybackSessionId());
+        }
+        const outcome = await Promise.race([
+          producerProcess.closed,
+          new Promise<string>((resolve) => {
+            deadline = setTimeout(() => resolve("stderr blocked audio output"), 1500);
+          }),
+        ]);
+        expect(outcome).toBe(1);
+        expect(producerProcess.args).toContain("-nostats");
+        await vi.waitFor(() => expect(frameCount).toBeGreaterThan(0));
+        const exit = records.find((record) => record.message === "FFmpeg exited");
+        expect(exit?.fields.stderr).toContain("final decoder failure");
+        expect(exit?.fields.stderr).toContain("HTTP error 403");
+        const logged = JSON.stringify(records);
+        for (const secret of ["password", "signed-secret", "fragment-secret", "cookie-secret", "bearer-secret", "input-secret"]) {
+          expect(logged).not.toContain(secret);
+        }
+        expect(String(exit?.fields.stderr).length).toBeLessThanOrEqual(4096);
+      } finally {
+        if (deadline) clearTimeout(deadline);
+        player.stop();
+        if (producerProcess.child.exitCode === null) producerProcess.child.kill("SIGKILL");
+        await producerProcess.closed;
+      }
+    });
+
+    it(`does not expose the ${path} input credentials through serialized spawn errors`, async () => {
+      const actual = await vi.importActual<typeof import("node:child_process")>("node:child_process");
+      let child!: ChildProcess;
+      let closed!: Promise<void>;
+      vi.mocked(spawn).mockImplementationOnce((_command, args, options) => {
+        child = actual.spawn(join(tmpdir(), "tsbot-ffmpeg-does-not-exist"), args, options);
+        closed = new Promise((resolve) => child.once("close", () => resolve()));
+        return child;
+      });
+      const player = new AudioPlayer(silentLogger);
+      const emitted = new Promise<Error>((resolve) => player.once("error", resolve));
+      try {
+        const input = "https://user:spawn-password@cdn.example/audio?token=spawn-secret";
+        if (path === "URL") {
+          player.play(input);
+        } else {
+          (player as unknown as { spawnFfmpegFromFile(file: string, seek: number, session: number): void })
+            .spawnFfmpegFromFile(input, 0, player.getPlaybackSessionId());
+        }
+        const error = await emitted;
+        expect(error).toBeInstanceOf(Error);
+        expect(error.message).toContain("ENOENT");
+        const serialized = JSON.stringify(pino.stdSerializers.err(error));
+        expect(serialized).not.toContain("spawn-secret");
+        expect(serialized).not.toContain("spawn-password");
+        await closed;
+      } finally {
+        player.stop();
+      }
+    });
+  }
+
+  it("logs intentional stop signals at info level", async () => {
+    const { records, logger } = recordedLogger();
+    const producerProcess = await pipeProducer("process.stdout.write(Buffer.from([0])); setInterval(() => {}, 1000);");
+    const player = new AudioPlayer(logger);
+    try {
+      player.play("https://cdn.example/audio");
+      await new Promise<void>((resolve) => producerProcess.child.stdout!.once("data", () => resolve()));
+      player.stop();
+      await producerProcess.closed;
+      const exit = records.find((record) => record.message === "FFmpeg exited");
+      expect(exit?.level).toBe("info");
+    } finally {
+      player.stop();
+      if (producerProcess.child.exitCode === null) producerProcess.child.kill("SIGKILL");
+      await producerProcess.closed;
+    }
+  });
+
+  it("reports a sanitized diagnostic tail when a child exits from an unexpected signal", async () => {
+    const { records, logger } = recordedLogger();
+    const child = Object.assign(new EventEmitter(), {
+      pid: undefined,
+      stdout: new PassThrough(),
+      stderr: new PassThrough(),
+    });
+    vi.mocked(spawn).mockReturnValueOnce(child as unknown as ChildProcess);
+    const player = new AudioPlayer(logger);
+    try {
+      player.play("https://cdn.example/audio");
+      child.stderr.write("decoder crashed for https://cdn.example/audio?token=signal-secret");
+      const ended = new Promise<void>((resolve) => child.stderr.once("end", resolve));
+      child.stderr.end();
+      await ended;
+      child.emit("exit", null, "SIGSEGV");
+      child.emit("close", null, "SIGSEGV");
+      const exit = records.find((record) => record.message === "FFmpeg exited");
+      expect(exit?.level).toBe("warn");
+      expect(exit?.fields.signal).toBe("SIGSEGV");
+      expect(exit?.fields.stderr).toContain("decoder crashed");
+      expect(JSON.stringify(records)).not.toContain("signal-secret");
+    } finally {
+      player.stop();
+      child.stdout.destroy();
+      child.stderr.destroy();
+    }
+  });
+
+  it("keeps draining an old child's stderr without mixing its late diagnostics or exit into a new session", async () => {
+    const { records, logger } = recordedLogger();
+    const makeChild = () => Object.assign(new EventEmitter(), {
+      pid: undefined,
+      stdout: new PassThrough(),
+      stderr: new PassThrough(),
+    });
+    const oldChild = makeChild();
+    const newChild = makeChild();
+    vi.mocked(spawn)
+      .mockReturnValueOnce(oldChild as unknown as ChildProcess)
+      .mockReturnValueOnce(newChild as unknown as ChildProcess);
+    const player = new AudioPlayer(logger);
+    try {
+      player.play("https://cdn.example/old");
+      const oldSession = player.getPlaybackSessionId();
+      player.play("https://cdn.example/new");
+      const newSession = player.getPlaybackSessionId();
+      oldChild.stderr.write("old late decoder failure https://cdn.example/old?token=old-secret\n".repeat(1000));
+      newChild.stderr.write("new decoder failure\n");
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      expect(oldChild.stderr.readableLength).toBe(0);
+      oldChild.emit("exit", 1, null);
+      oldChild.stderr.end();
+      oldChild.emit("close", 1, null);
+      expect(player.getState()).toBe("playing");
+      vi.useFakeTimers();
+      const internal = player as unknown as { frameLoopRunning: boolean; startFrameLoop(): void };
+      internal.frameLoopRunning = false;
+      internal.startFrameLoop();
+      vi.advanceTimersByTime(6000);
+      const stall = records.find((record) => record.message === "FFmpeg stopped outputting data, ending track");
+      expect(stall?.fields.sessionId).toBe(newSession);
+      expect(stall?.fields.stderr).toContain("new decoder failure");
+      expect(stall?.fields.stderr).not.toContain("old late decoder failure");
+      const oldExit = records.find((record) => record.message === "FFmpeg exited");
+      expect(oldExit?.fields.sessionId).toBe(oldSession);
+      expect(JSON.stringify(records)).not.toContain("old-secret");
+    } finally {
+      vi.useRealTimers();
+      player.stop();
+      oldChild.stdout.destroy();
+      oldChild.stderr.destroy();
+      newChild.stdout.destroy();
+      newChild.stderr.destroy();
+    }
+  });
+
+  it("includes the current child's sanitized diagnostic tail when the stall watchdog ends playback", async () => {
+    const { records, logger } = recordedLogger();
+    const producerProcess = await pipeProducer(`
+      process.stderr.write('HTTP error 403: https://cdn.example/audio?token=stall-secret\\n');
+      process.stdout.write(Buffer.from([0]));
+      setInterval(() => {}, 1000);
+    `);
+    const player = new AudioPlayer(logger);
+    try {
+      player.play("https://cdn.example/audio");
+      await new Promise<void>((resolve) => producerProcess.child.stdout!.once("data", () => resolve()));
+      vi.useFakeTimers();
+      // Restart scheduling under the test clock, without changing EOF state.
+      const internal = player as unknown as { frameLoopRunning: boolean; startFrameLoop(): void };
+      internal.frameLoopRunning = false;
+      internal.startFrameLoop();
+      vi.advanceTimersByTime(6000);
+      const stall = records.find((record) => record.message === "FFmpeg stopped outputting data, ending track");
+      expect(stall?.fields.stderr).toContain("HTTP error 403");
+      expect(JSON.stringify(records)).not.toContain("stall-secret");
+      expect(player.getState()).toBe("idle");
+    } finally {
+      vi.useRealTimers();
+      player.stop();
+      if (producerProcess.child.exitCode === null) producerProcess.child.kill("SIGKILL");
+      await producerProcess.closed;
+    }
+  });
+});
 
 function applyPlayerVolume(player: AudioPlayer, pcm: Buffer): Buffer {
   return (
@@ -961,7 +1263,7 @@ describe("AudioPlayer stall/EOF end-detection is gated on playing state (R3-4)",
   // PCM frame (unknown duration -> isNearEnd forced true). startFrameLoop() runs
   // the genuine loop; no real process is spawned (fake ffmpeg has no pid, so the
   // end path never touches forceCleanup/process.kill).
-  function makeStalledPlaying(): AudioPlayer {
+  function makeStalledPlaying(duration = 0): AudioPlayer {
     const player = new AudioPlayer(silentLogger);
     const p = player as unknown as {
       ffmpeg: unknown;
@@ -973,7 +1275,7 @@ describe("AudioPlayer stall/EOF end-detection is gated on playing state (R3-4)",
       startFrameLoop(): void;
     };
     p.ffmpeg = { pid: undefined }; // live ffmpeg, but delivers no PCM
-    p.currentSongDuration = 0; // unknown duration -> isNearEnd === true
+    p.currentSongDuration = duration;
     p.pcmBuffer = Buffer.alloc(0); // always < one PCM frame
     p.emptyFrameAttempts = 0;
     p.framesPlayed = 0;
@@ -981,6 +1283,113 @@ describe("AudioPlayer stall/EOF end-detection is gated on playing state (R3-4)",
     p.startFrameLoop();
     return player;
   }
+
+  it.each([0, 4020])("keeps emitting one full PCM frame per tick beyond 60 seconds with duration %s", (duration) => {
+    vi.useFakeTimers(FAKE_TIMER_OPTS);
+    const player = makeStalledPlaying(duration);
+    let ended = 0;
+    let frames = 0;
+    player.on("trackEnd", () => ended++);
+    player.on("frame", () => frames++);
+    try {
+      const internal = player as unknown as { pcmBuffer: Buffer };
+      const frame = Buffer.alloc(FRAME_BYTES);
+      for (let tick = 0; tick < 3100; tick++) {
+        internal.pcmBuffer = frame;
+        vi.advanceTimersByTime(20);
+      }
+      expect(frames).toBe(3100);
+      expect(player.getElapsed()).toBe(62);
+      expect(ended).toBe(0);
+      expect(player.getState()).toBe("playing");
+    } finally {
+      player.stop();
+      vi.useRealTimers();
+    }
+  });
+
+  it("resets the true-underrun budget after a successful frame even when no PCM reserve remains", () => {
+    vi.useFakeTimers(FAKE_TIMER_OPTS);
+    const player = makeStalledPlaying();
+    let ended = 0;
+    player.on("trackEnd", () => ended++);
+    try {
+      vi.advanceTimersByTime(20 * 249);
+      (player as unknown as { pcmBuffer: Buffer }).pcmBuffer = Buffer.alloc(FRAME_BYTES);
+      vi.advanceTimersByTime(20);
+      expect(ended).toBe(0);
+      expect(player.getElapsed()).toBe(0.02);
+      vi.advanceTimersByTime(20 * 249);
+      expect(ended).toBe(0);
+      vi.advanceTimersByTime(20);
+      expect(ended).toBe(1);
+      expect(player.getState()).toBe("idle");
+    } finally {
+      player.stop();
+      vi.useRealTimers();
+    }
+  });
+
+  it("still ends a genuine far-from-end stall after 60 seconds without a frame", () => {
+    vi.useFakeTimers(FAKE_TIMER_OPTS);
+    const player = makeStalledPlaying(4020);
+    let ended = 0;
+    player.on("trackEnd", () => ended++);
+    try {
+      vi.advanceTimersByTime(59980);
+      expect(ended).toBe(0);
+      expect(player.getState()).toBe("playing");
+      vi.advanceTimersByTime(20);
+      expect(ended).toBe(1);
+      expect(player.getState()).toBe("idle");
+    } finally {
+      player.stop();
+      vi.useRealTimers();
+    }
+  });
+
+  it("still emits natural EOF after delivering the final buffered frame", () => {
+    vi.useFakeTimers(FAKE_TIMER_OPTS);
+    const player = makeStalledPlaying(4020);
+    let ended = 0;
+    let frames = 0;
+    player.on("trackEnd", () => ended++);
+    player.on("frame", () => frames++);
+    try {
+      Object.assign(player, { ffmpeg: null, pcmBuffer: Buffer.alloc(FRAME_BYTES) });
+      vi.advanceTimersByTime(20);
+      expect(frames).toBe(1);
+      expect(ended).toBe(1);
+      expect(player.getState()).toBe("idle");
+    } finally {
+      player.stop();
+      vi.useRealTimers();
+    }
+  });
+
+  it("does not count a consumed frame as successful when the encoder throws", () => {
+    vi.useFakeTimers(FAKE_TIMER_OPTS);
+    const player = makeStalledPlaying(4020);
+    const failure = new Error("offline encoder failure");
+    const errors: Error[] = [];
+    let frames = 0;
+    player.on("error", error => errors.push(error));
+    player.on("frame", () => frames++);
+    try {
+      Object.assign(player, {
+        pcmBuffer: Buffer.alloc(FRAME_BYTES),
+        encoder: { encode() { throw failure; } },
+      });
+      vi.advanceTimersByTime(20);
+      expect(errors).toEqual([failure]);
+      expect(frames).toBe(0);
+      expect(player.getElapsed()).toBe(0);
+      expect((player as unknown as { emptyFrameAttempts: number }).emptyFrameAttempts).toBe(1);
+    } finally {
+      player.stop();
+      vi.useRealTimers();
+    }
+  });
 
   it("does NOT emit trackEnd (and stays paused) when a stalled unknown-duration stream is paused past the stall threshold", () => {
     vi.useFakeTimers(FAKE_TIMER_OPTS);

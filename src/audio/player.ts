@@ -12,6 +12,7 @@ import {
 } from "./realtime-voice-telemetry.js";
 import type { Readable } from "node:stream";
 import type { Logger } from "../logger.js";
+import { collectFfmpegDiagnostics, type FfmpegDiagnostics } from "./ffmpeg-diagnostics.js";
 
 const require = createRequire(import.meta.url);
 const ffmpegPath: string | null = require("ffmpeg-static");
@@ -55,6 +56,17 @@ const resolvedFfmpeg: string = (() => {
 
 export function getFfmpegCommand(): string {
   return resolvedFfmpeg;
+}
+
+function safeFfmpegSpawnError(err: Error): Error {
+  // Node spawn errors include spawnargs; Pino's Error serializer copies them,
+  // including the signed input URL. Preserve a known OS category only.
+  const allowedCodes = new Set(["ENOENT", "EACCES", "EPERM", "ENOEXEC", "EMFILE", "ENFILE", "ENOMEM", "EAGAIN", "EINVAL"]);
+  const code = (err as NodeJS.ErrnoException).code;
+  const safeCode = typeof code === "string" && allowedCodes.has(code) ? code : undefined;
+  const safeError = new Error(`FFmpeg failed to start${safeCode ? ` (${safeCode})` : ""}`);
+  if (safeCode) Object.assign(safeError, { code: safeCode });
+  return safeError;
 }
 
 const BROWSER_UA =
@@ -109,10 +121,23 @@ export function buildFfmpegArgs(
   seekSeconds: number,
   options: FfmpegInputOptions = {},
 ): string[] {
-  const args: string[] = [];
-  const isHttp = /^https?:\/\//i.test(url);
+  const args: string[] = ["-nostats"];
+  let httpHostname: string | null = null;
+  try {
+    const parsed = new URL(url);
+    if (parsed.protocol === "http:" || parsed.protocol === "https:") {
+      httpHostname = parsed.hostname.toLowerCase().replace(/\.$/, "");
+    }
+  } catch {
+    // Local paths and malformed URLs must not inherit CDN-specific options.
+  }
+  const isHttp = httpHostname !== null;
+  const isBilibili = httpHostname !== null &&
+    ["bilivideo.com", "bilivideo.cn", "bilibili.com", "szbdyd.com"].some(
+      domain => httpHostname === domain || httpHostname.endsWith(`.${domain}`),
+    );
 
-  if (isHttp && (url.includes("bilivideo") || url.includes("bilibili"))) {
+  if (isBilibili) {
     args.push(
       "-headers",
       `Referer: https://www.bilibili.com\r\nUser-Agent: ${BROWSER_UA}\r\n`,
@@ -146,8 +171,16 @@ export function buildFfmpegArgs(
       "-flags", "low_delay",
     );
   }
-  if (seekSeconds > 0) args.push("-ss", String(seekSeconds));
-  args.push("-i", url, "-f", "s16le", "-ar", "48000", "-ac", "2", "-acodec", "pcm_s16le", "-");
+  // B站's CDN serves Range requests, so seek input-side: FFmpeg jumps straight
+  // to the byte offset. Output-side seek would download and decode everything
+  // before the target first — minutes for a resume deep into a 3-hour video
+  // (#161), long enough to trip the stall watchdog.
+  const inputSideSeek = isBilibili;
+  if (seekSeconds > 0 && inputSideSeek) args.push("-ss", String(seekSeconds));
+  args.push("-i", url);
+  // Output-side seek (after -i): works on CDNs that reject Range/keyframe seeks (NetEase music.126.net).
+  if (seekSeconds > 0 && !inputSideSeek) args.push("-ss", String(seekSeconds));
+  args.push("-f", "s16le", "-ar", "48000", "-ac", "2", "-acodec", "pcm_s16le", "-");
 
   return args;
 }
@@ -421,6 +454,8 @@ export function isPcmFrameVoiced(frame: Buffer, peakThreshold = 256): boolean {
 
 export class AudioPlayer extends EventEmitter {
   private ffmpeg: ChildProcess | null = null;
+  private ffmpegDiagnostics: FfmpegDiagnostics | null = null;
+  private readonly intentionalCleanup = new WeakSet<ChildProcess>();
   private encoder: Encoder;
   private state: PlayerState = "idle";
   private volume = 75;
@@ -543,6 +578,9 @@ export class AudioPlayer extends EventEmitter {
 
     const ffmpegBin = getFfmpegCommand();
     this.ffmpeg = spawn(ffmpegBin, args, { stdio: ["ignore", "pipe", "pipe"] });
+    const child = this.ffmpeg;
+    const diagnostics = collectFfmpegDiagnostics(child.stderr);
+    this.ffmpegDiagnostics = diagnostics;
     
     const currentPid = this.ffmpeg.pid;
     if (currentPid) {
@@ -576,7 +614,6 @@ export class AudioPlayer extends EventEmitter {
 
     this.ffmpeg.on("exit", (code, signal) => {
       if (currentPid) globalActivePids.delete(currentPid);
-      this.logger.info({ pid: currentPid, code, signal }, "FFmpeg exited");
       
       // 只有当前会话的进程结束才置空变量
       if (this.sessionId === currentSessionId) {
@@ -584,11 +621,21 @@ export class AudioPlayer extends EventEmitter {
       }
     });
 
+    // close follows stderr's end, so final unterminated diagnostics are ready.
+    this.ffmpeg.on("close", (code, signal) => {
+      const context = { pid: currentPid, sessionId: currentSessionId, code, signal };
+      if (!this.intentionalCleanup.has(child) && ((typeof code === "number" && code !== 0) || signal !== null)) {
+        this.logger.warn({ ...context, stderr: diagnostics.getTail() }, "FFmpeg exited");
+      } else {
+        this.logger.info(context, "FFmpeg exited");
+      }
+    });
+
     this.ffmpeg.on("error", (err) => {
       if (this.sessionId === currentSessionId) {
         this.spawnFailed = true;
         this.consecutiveFailures++;
-        this.emit("error", err);
+        this.emit("error", safeFfmpegSpawnError(err));
       }
     });
 
@@ -784,10 +831,7 @@ export class AudioPlayer extends EventEmitter {
     );
     this.downloader = ps;
 
-    let stderrTail = "";
-    ps.stderr!.on("data", (chunk: Buffer) => {
-      stderrTail = (stderrTail + chunk.toString()).slice(-500);
-    });
+    const diagnostics = collectFfmpegDiagnostics(ps.stderr);
 
     ps.on("exit", (code, signal) => {
       if (this.sessionId !== sessionId) {
@@ -796,7 +840,6 @@ export class AudioPlayer extends EventEmitter {
       }
       this.downloader = null;
       if (code !== 0) {
-        this.logger.warn({ code, signal, stderr: stderrTail }, "PowerShell download failed");
         this.spawnFailed = true;
         this.consecutiveFailures++;
         this.state = "idle";
@@ -806,6 +849,12 @@ export class AudioPlayer extends EventEmitter {
         return;
       }
       this.spawnFfmpegFromFile(tempFile, seekSeconds, sessionId);
+    });
+
+    ps.on("close", (code, signal) => {
+      if (!this.intentionalCleanup.has(ps) && ((typeof code === "number" && code !== 0) || signal !== null)) {
+        this.logger.warn({ pid: ps.pid, sessionId, code, signal, stderr: diagnostics.getTail() }, "PowerShell download failed");
+      }
     });
 
     ps.on("error", (err) => {
@@ -838,6 +887,9 @@ export class AudioPlayer extends EventEmitter {
     const args = buildFfmpegArgs(tempFile, seekSeconds);
     const ffmpegBin = getFfmpegCommand();
     this.ffmpeg = spawn(ffmpegBin, args, { stdio: ["ignore", "pipe", "pipe"] });
+    const child = this.ffmpeg;
+    const diagnostics = collectFfmpegDiagnostics(child.stderr);
+    this.ffmpegDiagnostics = diagnostics;
 
     const currentPid = this.ffmpeg.pid;
     if (currentPid) {
@@ -857,7 +909,6 @@ export class AudioPlayer extends EventEmitter {
 
     this.ffmpeg.on("exit", (code, signal) => {
       if (currentPid) globalActivePids.delete(currentPid);
-      this.logger.info({ pid: currentPid, code, signal }, "FFmpeg exited");
       if (this.sessionId === sessionId) {
         this.ffmpeg = null;
         if (this.currentTempDir === tempDirToCleanup) this.currentTempDir = null;
@@ -865,11 +916,20 @@ export class AudioPlayer extends EventEmitter {
       if (tempDirToCleanup) cleanupTempDir(tempDirToCleanup);
     });
 
+    this.ffmpeg.on("close", (code, signal) => {
+      const context = { pid: currentPid, sessionId, code, signal };
+      if (!this.intentionalCleanup.has(child) && ((typeof code === "number" && code !== 0) || signal !== null)) {
+        this.logger.warn({ ...context, stderr: diagnostics.getTail() }, "FFmpeg exited");
+      } else {
+        this.logger.info(context, "FFmpeg exited");
+      }
+    });
+
     this.ffmpeg.on("error", (err) => {
       if (this.sessionId === sessionId) {
         this.spawnFailed = true;
         this.consecutiveFailures++;
-        this.emit("error", err);
+        this.emit("error", safeFfmpegSpawnError(err));
       }
     });
 
@@ -995,6 +1055,7 @@ export class AudioPlayer extends EventEmitter {
     
     // 立即清空缓冲区，确保切歌瞬间静音 （
     this.pcmBuffer = Buffer.alloc(0);
+    this.ffmpegDiagnostics = null;
 
     if (this.ffmpeg) {
       const procToKill = this.ffmpeg;
@@ -1009,6 +1070,7 @@ export class AudioPlayer extends EventEmitter {
     if (this.downloader) {
       const ps = this.downloader;
       this.downloader = null;
+      this.intentionalCleanup.add(ps);
       try { ps.kill("SIGTERM"); } catch { /* already gone */ }
     }
 
@@ -1037,6 +1099,7 @@ export class AudioPlayer extends EventEmitter {
   }
 
   private forceCleanup(proc: ChildProcess, pid: number): void {
+    this.intentionalCleanup.add(proc);
     if (!globalActivePids.has(pid)) return;
 
     try {
@@ -1077,8 +1140,10 @@ export class AudioPlayer extends EventEmitter {
       // 这里的校验能防止旧的定时器回调处理新 Session 的逻辑 （
       if (loopSessionId !== this.sessionId || !this.frameLoopRunning) return;
 
+      const framesBeforeTick = this.framesPlayed;
       if (this.state === "playing" || this.hasSoundEffectOutput()) this.sendNextFrame();
       else if (this.state === "paused") this.nextFrameTime = performance.now();
+      const frameSent = this.framesPlayed > framesBeforeTick;
 
       // 检测pcmBuffer不足PCM_FRAME_BYTES导致连续循环卡死：
       // 条件1: FFmpeg仍在运行但缓冲区不足一帧，且连续多次无法获取数据
@@ -1100,7 +1165,9 @@ export class AudioPlayer extends EventEmitter {
       // unknown-duration stream would auto-advance ~5s later. Because the if is
       // now false while paused, the else resets emptyFrameAttempts to 0, so a
       // resumed healthy stream starts fresh and never ends instantly.
-      if (this.state === "playing" && !this.externalMode && this.ffmpeg !== null && this.pcmBuffer.length < PCM_FRAME_BYTES) {
+      // A healthy paced source can supply exactly one frame per tick, leaving
+      // no reserve after sendNextFrame. Count only ticks without emitted audio.
+      if (this.state === "playing" && !this.externalMode && !frameSent && this.ffmpeg !== null && this.pcmBuffer.length < PCM_FRAME_BYTES) {
         this.emptyFrameAttempts++;
         
         // End the track when FFmpeg has gone silent: quickly if we're near the
@@ -1123,6 +1190,7 @@ export class AudioPlayer extends EventEmitter {
             duration: this.currentSongDuration,
             remaining: Math.round(this.currentSongDuration - elapsed),
             nearEnd: isNearEnd,
+            stderr: this.ffmpegDiagnostics?.getTail() ?? "",
           }, "FFmpeg stopped outputting data, ending track");
           this.frameLoopRunning = false;
           // The outer gate guarantees state==="playing" here, so no !=="idle"
@@ -1363,6 +1431,8 @@ export class AudioPlayer extends EventEmitter {
   }
   getDuckingGain(): number { return this.duckingGainAt(performance.now()); }
   getState(): PlayerState { return this.state; }
+  /** Changes on stop or a new play/seek, so asynchronous recovery can be fenced. */
+  getPlaybackSessionId(): number { return this.sessionId; }
   // True only while attached to an external (Spotify sidecar) PCM stream. Used
   // by the orchestrator to decide whether to re-attach: stop() detaches (sets
   // externalMode=false) so this is false after any player.stop().

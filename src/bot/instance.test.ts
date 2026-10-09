@@ -1,8 +1,9 @@
-import { describe, it, expect, vi } from "vitest";
+import { afterEach, beforeEach, describe, it, expect, vi } from "vitest";
 import { EventEmitter } from "node:events";
 import { BotInstance, COMMAND_DENIED_MESSAGE, spotifyPortsForBotId } from "./instance.js";
 import type { BotInstanceOptions } from "./instance.js";
 import { PlayQueue, PlayMode } from "../audio/queue.js";
+import { AudioPlayer } from "../audio/player.js";
 import { createDatabase, SHARED_QUEUE_OWNER } from "../data/database.js";
 import { parseCommand } from "./commands.js";
 import type { TS3TextMessage } from "../ts-protocol/client.js";
@@ -133,6 +134,9 @@ describe("BotInstance voice-ducking lifecycle integration", () => {
     return {
       disconnectEmitted: false,
       connected: false,
+      lifecycleGeneration: 0,
+      idleTimer: null,
+      _cancelIdleTimer: (BotInstance.prototype as any)._cancelIdleTimer,
       tsClient: {
         connect: vi.fn(() => connectPromise),
         getResolvedVoiceEndpoint: vi.fn(() => ({ host: "203.0.113.20", port: 12000 })),
@@ -1687,5 +1691,411 @@ describe("BotInstance live-queue persistence (#119)", () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+});
+
+describe("BotInstance Bilibili multi-P resolution", () => {
+  it("resolves multi-P search result to P1 with accurate duration and name", async () => {
+    const multiPSongDetail = {
+      id: "BV1multiP?p=1",
+      name: "测试视频 - P1 分P1",
+      artist: "UP主",
+      album: "",
+      duration: 100, // P1 duration
+      coverUrl: "",
+      platform: "bilibili" as const,
+    };
+    const mockBili = {
+      platform: "bilibili" as const,
+      search: vi.fn().mockResolvedValue({
+        songs: [{
+          id: "BV1multiP",
+          name: "测试视频",
+          artist: "UP主",
+          album: "",
+          duration: 300, // total duration in search
+          coverUrl: "",
+          platform: "bilibili",
+        }],
+        albums: [],
+        playlists: [],
+      }),
+      getSongDetail: vi.fn().mockResolvedValue(multiPSongDetail),
+      getSongUrl: vi.fn().mockResolvedValue({ url: "http://audio.test" }),
+    };
+
+    const ctx = {
+      config: { commandPrefix: "!" },
+      lastSearchResults: [] as any[],
+      getProvider: () => mockBili,
+      getProviderFor: () => mockBili,
+    };
+
+    const res = await (BotInstance.prototype as any).resolvePlayQuery.call(ctx, {
+      name: "play",
+      args: "测试视频",
+      rawArgs: ["测试视频"],
+      flags: new Set(),
+    });
+
+    expect(res.song).toBeDefined();
+    expect(res.song.id).toBe("BV1multiP?p=1");
+    expect(res.song.name).toBe("测试视频 - P1 分P1");
+    expect(res.song.duration).toBe(100);
+  });
+});
+
+
+describe("cmdPlaylist with a playlist link (#160)", () => {
+  const cmdPlaylist = (BotInstance.prototype as any).cmdPlaylist as (
+    this: unknown, cmd: { name: string; args: string; rawArgs: string[]; flags: Set<string> },
+  ) => Promise<string>;
+
+  function makeCtx() {
+    const song = { id: "s1", name: "Song", artist: "A", album: "B", duration: 1, coverUrl: "" };
+    const makeProvider = (platform: string) => ({
+      platform,
+      search: vi.fn().mockResolvedValue({ songs: [], playlists: [] }),
+      getPlaylistSongs: vi.fn().mockResolvedValue([song]),
+    });
+    const providers: Record<string, any> = {
+      netease: makeProvider("netease"),
+      qq: makeProvider("qq"),
+      youtube: makeProvider("youtube"),
+    };
+    const queued: any[] = [];
+    return {
+      providers,
+      queued,
+      getProvider: vi.fn(() => providers.netease),
+      getProviderFor: vi.fn((p: string) => providers[p]),
+      assertProviderEnabled: vi.fn(),
+      extractId: (BotInstance.prototype as any).extractId,
+      looksLikeCollectionId: (BotInstance.prototype as any).looksLikeCollectionId,
+      player: { stop: vi.fn() },
+      queue: { clear: vi.fn(), add: (s: any) => queued.push(s), play: () => queued[0] },
+      disableFmMode: vi.fn(),
+      withRequester: (s: any) => s,
+      resolveAndPlay: vi.fn(async () => true),
+      sweepLocalAudio: vi.fn(),
+      emit: vi.fn(),
+    };
+  }
+  const cmd = (args: string, flags: string[] = []) =>
+    ({ name: "playlist", args, rawArgs: args.split(" "), flags: new Set(flags) });
+
+  it("routes a QQ playlist link to QQ even without -q (default is NetEase)", async () => {
+    const ctx = makeCtx();
+    const reply = await cmdPlaylist.call(ctx, cmd("[URL]https://y.qq.com/n/ryqq/playlist/8052190267[/URL]"));
+    expect(ctx.providers.qq.getPlaylistSongs).toHaveBeenCalledWith("8052190267");
+    expect(ctx.providers.netease.getPlaylistSongs).not.toHaveBeenCalled();
+    expect(ctx.queued[0].platform).toBe("qq");
+    expect(reply).toMatch(/^Loaded 1 songs/);
+  });
+
+  it("loads a YouTube playlist link by its list id instead of name-searching the URL", async () => {
+    const ctx = makeCtx();
+    await cmdPlaylist.call(ctx, cmd("https://www.youtube.com/playlist?list=PLabc123"));
+    expect(ctx.providers.youtube.getPlaylistSongs).toHaveBeenCalledWith("PLabc123");
+    expect(ctx.providers.netease.search).not.toHaveBeenCalled();
+  });
+
+  it("checks the link's platform is enabled", async () => {
+    const ctx = makeCtx();
+    ctx.assertProviderEnabled.mockImplementation(() => { throw new Error("音源未启用：qq"); });
+    await expect(cmdPlaylist.call(ctx, cmd("https://y.qq.com/n/ryqq/playlist/1"))).rejects.toThrow("音源未启用");
+  });
+
+  it("keeps the old behavior for a bare id", async () => {
+    const ctx = makeCtx();
+    await cmdPlaylist.call(ctx, cmd("2829883282"));
+    expect(ctx.providers.netease.getPlaylistSongs).toHaveBeenCalledWith("2829883282");
+  });
+});
+
+describe("resumeInterruptedStream — long B站 streams dying mid-play (#161)", () => {
+  beforeEach(() => vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] }));
+  afterEach(() => { vi.clearAllTimers(); vi.useRealTimers(); });
+  const resumeInterruptedStream = (BotInstance.prototype as any).resumeInterruptedStream as (
+    this: unknown,
+  ) => Promise<boolean>;
+
+  function makeCtx(opts: { platform?: string; elapsed?: number; duration?: number; url?: string | null } = {}) {
+    const song: any = {
+      id: "BV1abc", name: "Long", artist: "A", album: "", coverUrl: "",
+      platform: opts.platform ?? "bilibili", duration: opts.duration ?? 10_000, url: "old",
+    };
+    let elapsed = opts.elapsed ?? 1000;
+    let state: "idle" | "playing" = "idle";
+    const provider = {
+      getSongUrl: vi.fn(async () => (opts.url === null ? null : { url: opts.url ?? "https://fresh.test/a.m4s" })),
+    };
+    const ctx: any = {
+      song,
+      provider,
+      connected: true,
+      lifecycleGeneration: 0,
+      effectiveDuration: song.duration,
+      streamRecovery: null,
+      queue: { current: vi.fn(() => song) },
+      player: {
+        getElapsed: vi.fn(() => elapsed),
+        getState: vi.fn(() => state),
+        getPlaybackSessionId: vi.fn(() => 1),
+        play: vi.fn(() => { state = "playing"; }),
+      },
+      getProviderFor: vi.fn(() => provider),
+      logger: { warn: vi.fn(), info: vi.fn() },
+      emit: vi.fn(),
+      setElapsed: (v: number) => { elapsed = v; state = "idle"; },
+    };
+    return ctx;
+  }
+
+  it("re-resolves the URL and resumes at the current position when a B站 stream ends early", async () => {
+    const ctx = makeCtx({ elapsed: 1000, duration: 10_000 });
+    expect(await resumeInterruptedStream.call(ctx)).toBe(true);
+    expect(ctx.provider.getSongUrl).toHaveBeenCalledWith("BV1abc");
+    expect(ctx.player.play).toHaveBeenCalledWith("https://fresh.test/a.m4s", 1000, 10_000);
+    expect(ctx.song.url).toBe("https://fresh.test/a.m4s");
+  });
+
+  it("does nothing near the real end of the track (normal EOF)", async () => {
+    const ctx = makeCtx({ elapsed: 9_990, duration: 10_000 });
+    expect(await resumeInterruptedStream.call(ctx)).toBe(false);
+    expect(ctx.provider.getSongUrl).not.toHaveBeenCalled();
+  });
+
+  it("does nothing for other platforms or an unknown duration", async () => {
+    expect(await resumeInterruptedStream.call(makeCtx({ platform: "netease" }))).toBe(false);
+    const unknown = makeCtx({ duration: 0 });
+    unknown.effectiveDuration = 0;
+    expect(await resumeInterruptedStream.call(unknown)).toBe(false);
+  });
+
+  it("gives up after 3 attempts that make no progress, then lets the queue advance", async () => {
+    const ctx = makeCtx({ elapsed: 1000 });
+    for (let i = 0; i < 3; i++) {
+      ctx.setElapsed(1000);
+      expect(await resumeInterruptedStream.call(ctx)).toBe(true);
+    }
+    ctx.setElapsed(1000);
+    expect(await resumeInterruptedStream.call(ctx)).toBe(false);
+    expect(ctx.player.play).toHaveBeenCalledTimes(3);
+  });
+
+  it("resets the attempt budget once a resume actually plays on for a while", async () => {
+    const ctx = makeCtx({ elapsed: 1000 });
+    for (let i = 0; i < 3; i++) {
+      ctx.setElapsed(1000);
+      await resumeInterruptedStream.call(ctx);
+    }
+    ctx.setElapsed(2000); // the last resume played ~16 more minutes
+    expect(await resumeInterruptedStream.call(ctx)).toBe(true);
+  });
+
+  it("falls through to advancing when no fresh URL can be fetched", async () => {
+    const ctx = makeCtx({ url: null });
+    const recovery = resumeInterruptedStream.call(ctx);
+    await vi.advanceTimersByTimeAsync(3000);
+    expect(await recovery).toBe(false);
+    expect(ctx.provider.getSongUrl).toHaveBeenCalledTimes(3);
+    expect(ctx.player.play).not.toHaveBeenCalled();
+  });
+
+  it("does not clobber a different track the user started while the URL was resolving", async () => {
+    const ctx = makeCtx();
+    ctx.provider.getSongUrl.mockImplementation(async () => {
+      ctx.queue.current.mockReturnValue({ id: "other" }); // user ran !next meanwhile
+      return { url: "https://fresh.test/a.m4s" };
+    });
+    expect(await resumeInterruptedStream.call(ctx)).toBe(true); // handled: don't advance again
+    expect(ctx.player.play).not.toHaveBeenCalled();
+  });
+});
+
+describe("BotInstance trackEnd — stale playback sessions", () => {
+  beforeEach(() => vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] }));
+  afterEach(() => { vi.clearAllTimers(); vi.useRealTimers(); });
+  function makeEndedCtx(platform = "bilibili", duration = 10_000) {
+    const song = {
+      id: "ended", name: "Ended", artist: "A", album: "", coverUrl: "",
+      platform, duration, url: "old",
+    };
+    let current: any = song;
+    const player = new EventEmitter() as any;
+    player.state = "idle";
+    player.sessionId = 1;
+    player.getState = AudioPlayer.prototype.getState;
+    player.getElapsed = () => 1000;
+    player.getPlaybackSessionId = AudioPlayer.prototype.getPlaybackSessionId;
+    player.pause = AudioPlayer.prototype.pause;
+    player.resume = AudioPlayer.prototype.resume;
+    player.play = vi.fn(() => { player.sessionId++; player.state = "playing"; });
+    const provider = { getSongUrl: vi.fn(async () => ({ url: "fresh" })) };
+    const advances: string[] = [];
+    const ctx: any = {
+      song, provider, player, connected: true, effectiveDuration: duration,
+      lifecycleGeneration: 0,
+      streamRecovery: null, queue: { current: () => current },
+      spotifyController: new EventEmitter(), tsClient: { sendVoiceData: vi.fn() },
+      logger: { warn: vi.fn(), debug: vi.fn(), error: vi.fn() }, emit: vi.fn(),
+      getProviderFor: () => provider,
+      playNext: vi.fn(async () => { advances.push(current?.id ?? "empty"); return true; }),
+      replace: () => { current = { ...song, id: "replacement" }; player.sessionId++; player.state = "playing"; },
+      stop: () => { current = null; player.sessionId++; player.state = "idle"; },
+      restartSameSong: () => { player.sessionId++; player.state = "idle"; },
+      pause: () => cmdPause.call(ctx),
+      resume: () => cmdResume.call(ctx),
+      advances,
+    };
+    ctx.resumeInterruptedStream = (BotInstance.prototype as any).resumeInterruptedStream.bind(ctx);
+    setupPlayerEvents.call(ctx);
+    return ctx;
+  }
+
+  async function flushEvents() {
+    await new Promise<void>(resolve => setImmediate(resolve));
+  }
+
+  it.each(["netease", "bilibili"])("an old normal %s EOF never skips a pending replacement", async platform => {
+    const ctx = makeEndedCtx(platform, 1000);
+    const replacement = Promise.resolve().then(() => ctx.replace());
+    ctx.player.emit("trackEnd");
+    await replacement;
+    await flushEvents();
+    expect(ctx.advances).not.toContain("replacement");
+  });
+
+  it("normal EOF still advances the ending track when no replacement arrives", async () => {
+    const ctx = makeEndedCtx("netease", 1000);
+    ctx.player.emit("trackEnd");
+    await flushEvents();
+    expect(ctx.advances).toEqual(["ended"]);
+  });
+
+  it("a failed recovery never advances a replacement", async () => {
+    const ctx = makeEndedCtx();
+    const lookup = deferred<{ url: string }>();
+    ctx.provider.getSongUrl.mockReturnValue(lookup.promise);
+    ctx.player.emit("trackEnd");
+    ctx.replace();
+    lookup.reject(new Error("temporary lookup failure"));
+    await flushEvents();
+    expect(ctx.advances).toEqual([]);
+  });
+
+  it.each(["stop", "restartSameSong"])("recovery does not overwrite playback after %s", async action => {
+    const ctx = makeEndedCtx();
+    const lookup = deferred<{ url: string }>();
+    ctx.provider.getSongUrl.mockReturnValue(lookup.promise);
+    ctx.player.emit("trackEnd");
+    ctx[action]();
+    lookup.resolve({ url: "fresh" });
+    await flushEvents();
+    expect(ctx.player.play).not.toHaveBeenCalled();
+    expect(ctx.advances).toEqual([]);
+  });
+
+  it("pause during an idle URL lookup is honored by recovered playback, then resume continues", async () => {
+    const ctx = makeEndedCtx();
+    const lookup = deferred<{ url: string }>();
+    ctx.provider.getSongUrl.mockReturnValue(lookup.promise);
+    ctx.player.emit("trackEnd");
+    ctx.pause();
+    expect(ctx.player.getState()).toBe("idle"); // actual AudioPlayer.pause cannot pause idle
+    lookup.resolve({ url: "fresh" });
+    await flushEvents();
+    expect(ctx.player.play).toHaveBeenCalledWith("fresh", 1000, 10_000);
+    expect(ctx.player.getState()).toBe("paused");
+    expect(ctx.advances).toEqual([]);
+    ctx.resume();
+    expect(ctx.player.getState()).toBe("playing");
+    expect(ctx.player.play).toHaveBeenCalledTimes(1);
+  });
+
+  it("resume before a paused recovery lookup completes lets the fresh stream play", async () => {
+    const ctx = makeEndedCtx();
+    const lookup = deferred<{ url: string }>();
+    ctx.provider.getSongUrl.mockReturnValue(lookup.promise);
+    ctx.player.emit("trackEnd");
+    ctx.pause();
+    ctx.resume();
+    lookup.resolve({ url: "fresh" });
+    await flushEvents();
+    expect(ctx.player.getState()).toBe("playing");
+    expect(ctx.advances).toEqual([]);
+    expect(ctx.provider.getSongUrl).toHaveBeenCalledTimes(1);
+    expect(ctx.streamRecovery?.attempts).toBe(1);
+  });
+
+  it("resume during a pending lookup cannot start a failing duplicate and skip the song", async () => {
+    const ctx = makeEndedCtx();
+    const lookup = deferred<{ url: string }>();
+    ctx.provider.getSongUrl.mockReturnValueOnce(lookup.promise).mockResolvedValue(null);
+    ctx.player.emit("trackEnd");
+    ctx.pause();
+    ctx.resume();
+    await flushEvents();
+    expect(ctx.advances).toEqual([]);
+    expect(ctx.provider.getSongUrl).toHaveBeenCalledTimes(1);
+    lookup.resolve({ url: "fresh" });
+    await flushEvents();
+    expect(ctx.player.getState()).toBe("playing");
+    expect(ctx.streamRecovery?.attempts).toBe(1);
+  });
+
+  it("pause while a recovery lookup fails prevents automatic queue advancement", async () => {
+    const ctx = makeEndedCtx();
+    const lookup = deferred<{ url: string }>();
+    ctx.provider.getSongUrl.mockReturnValue(lookup.promise);
+    ctx.player.emit("trackEnd");
+    ctx.pause();
+    lookup.reject(new Error("temporary lookup failure"));
+    await flushEvents();
+    expect(ctx.advances).toEqual([]);
+  });
+
+  it("resume while a paused failed lookup waits for retry continues after its backoff", async () => {
+    const ctx = makeEndedCtx();
+    const lookup = deferred<{ url: string }>();
+    ctx.provider.getSongUrl.mockReturnValue(lookup.promise);
+    ctx.player.emit("trackEnd");
+    ctx.pause();
+    lookup.reject(new Error("temporary lookup failure"));
+    await flushEvents();
+    ctx.provider.getSongUrl.mockResolvedValue({ url: "recovered" });
+    ctx.resume();
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(ctx.player.getState()).toBe("playing");
+    expect(ctx.player.play).toHaveBeenCalledWith("recovered", 1000, 10_000);
+    expect(ctx.advances).toEqual([]);
+  });
+
+  it("a same-song restart cannot inherit pause intent from an older rejected lookup", async () => {
+    const ctx = makeEndedCtx();
+    const lookup = deferred<{ url: string }>();
+    ctx.provider.getSongUrl.mockReturnValue(lookup.promise);
+    ctx.player.emit("trackEnd");
+    ctx.pause();
+    ctx.restartSameSong();
+    lookup.reject(new Error("temporary lookup failure"));
+    await flushEvents();
+    ctx.provider.getSongUrl.mockResolvedValue({ url: "new-recovery" });
+    ctx.player.emit("trackEnd");
+    await flushEvents();
+    expect(ctx.player.getState()).toBe("playing");
+    expect(ctx.advances).toEqual([]);
+  });
+
+  it("a failed recovery cannot advance a newer session of the same queue song", async () => {
+    const ctx = makeEndedCtx();
+    const lookup = deferred<{ url: string }>();
+    ctx.provider.getSongUrl.mockReturnValue(lookup.promise);
+    ctx.player.emit("trackEnd");
+    ctx.restartSameSong();
+    lookup.reject(new Error("temporary lookup failure"));
+    await flushEvents();
+    expect(ctx.advances).toEqual([]);
   });
 });

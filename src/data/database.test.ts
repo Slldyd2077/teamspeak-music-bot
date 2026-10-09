@@ -371,3 +371,36 @@ describe("guest principal migration", () => {
     rmSync(dir, { recursive: true, force: true });
   });
 });
+
+describe("user music cookies (#164)", () => {
+  let botDb: BotDatabase;
+  const addUser = (id: string) =>
+    botDb.db
+      .prepare("INSERT INTO users (id, username, passwordHash, createdAt, updatedAt, role) VALUES (?,?,?,?,?,?)")
+      .run(id, id, "x", 0, 0, "member");
+
+  beforeEach(() => {
+    botDb = createDatabase(":memory:");
+    addUser("u1");
+    addUser("u2");
+  });
+  afterEach(() => botDb.close());
+
+  it("stores, overwrites and deletes a cookie per user and platform", () => {
+    expect(botDb.getUserMusicCookie("u1", "netease")).toBeNull();
+    botDb.setUserMusicCookie("u1", "netease", "MUSIC_U=a");
+    botDb.setUserMusicCookie("u1", "netease", "MUSIC_U=b");
+    expect(botDb.getUserMusicCookie("u1", "netease")).toBe("MUSIC_U=b");
+    expect(botDb.getUserMusicCookie("u2", "netease")).toBeNull();
+    expect(botDb.getUserMusicCookie("u1", "qq")).toBeNull();
+    expect(botDb.deleteUserMusicCookie("u1", "netease")).toBe(true);
+    expect(botDb.deleteUserMusicCookie("u1", "netease")).toBe(false);
+    expect(botDb.getUserMusicCookie("u1", "netease")).toBeNull();
+  });
+
+  it("drops a user's cookies when the user is deleted", () => {
+    botDb.setUserMusicCookie("u1", "netease", "MUSIC_U=a");
+    botDb.db.prepare("DELETE FROM users WHERE id = ?").run("u1");
+    expect(botDb.getUserMusicCookie("u1", "netease")).toBeNull();
+  });
+});

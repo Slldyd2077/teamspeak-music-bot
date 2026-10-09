@@ -1,3 +1,5 @@
+import axios from "axios";
+
 /**
  * Parsing helpers for picking an EXACT song in a !play / !add / !playnext query,
  * so same-name songs can be disambiguated instead of always getting the single
@@ -97,4 +99,83 @@ export function parseSelectionIndex(raw: string): number | null {
   if (!m) return null;
   const n = parseInt(m[1], 10);
   return Number.isFinite(n) && n > 0 ? n : null;
+}
+
+export interface PlaylistRef {
+  id: string;
+  platform: "netease" | "qq" | "youtube";
+}
+
+/** Drop the [URL]…[/URL] BBCode the TeamSpeak client wraps around pasted links. */
+function stripUrlBBCode(text: string): string {
+  return text.replace(/\[\/?url(?:=[^\]]*)?\]/gi, " ");
+}
+
+/**
+ * Detect a playlist URL (#160) — a web link, or the full link inside an app's
+ * share text. The platform comes from the URL, so a QQ link works without
+ * `-q`. Returns `null` for anything else (a playlist name or bare id), which
+ * the caller handles as before.
+ */
+export function parsePlaylistRef(raw: string): PlaylistRef | null {
+  const q = stripUrlBBCode(raw ?? "").trim();
+  if (!q) return null;
+
+  if (/music\.163\.com/i.test(q)) {
+    const m = /[?&#/]id=(\d+)/.exec(q) ?? /\/playlist\/(\d+)/.exec(q);
+    if (m) return { id: m[1], platform: "netease" };
+  }
+
+  if (/y\.qq\.com/i.test(q)) {
+    const m = /\/playlist\/(\d+)/.exec(q) ?? /[?&](?:id|disstid)=(\d+)/.exec(q);
+    if (m) return { id: m[1], platform: "qq" };
+  }
+
+  if (/youtube\.com|youtu\.be/i.test(q)) {
+    const m = /[?&]list=([\w-]+)/.exec(q);
+    if (m) return { id: m[1], platform: "youtube" };
+  }
+
+  return null;
+}
+
+/**
+ * Find a NetEase (163cn.tv) or QQ Music (c6.y.qq.com/base/fcgi-bin/u) share
+ * short link — what the phone apps copy. Only these hosts are recognized so
+ * the bot never fetches an arbitrary user-supplied URL.
+ */
+export function findShareShortLink(raw: string): string | null {
+  const q = stripUrlBBCode(raw ?? "");
+  const m =
+    /https?:\/\/163cn\.(?:tv|link)\/[0-9A-Za-z]+/i.exec(q) ??
+    /https?:\/\/c\d*\.y\.qq\.com\/base\/fcgi-bin\/u\?__=[0-9A-Za-z]+/i.exec(q);
+  return m ? m[0] : null;
+}
+
+type RedirectGet = (url: string) => Promise<{ status: number; location: string | undefined }>;
+
+const redirectGet: RedirectGet = async (url) => {
+  const res = await axios.get(url, {
+    maxRedirects: 0,
+    timeout: 5000,
+    validateStatus: () => true,
+    responseType: "stream",
+  });
+  res.data?.destroy?.();
+  const location = res.headers.location;
+  return { status: res.status, location: typeof location === "string" ? location : undefined };
+};
+
+/** Follow a share short link one hop. Returns the target URL, or null. */
+export async function resolveShareLink(
+  url: string,
+  get: RedirectGet = redirectGet,
+): Promise<string | null> {
+  try {
+    const { status, location } = await get(url);
+    if (status < 300 || status >= 400 || !location) return null;
+    return new URL(location, url).toString();
+  } catch {
+    return null;
+  }
 }

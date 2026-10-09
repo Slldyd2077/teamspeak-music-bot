@@ -250,6 +250,11 @@ export class BotManager extends EventEmitter {
     return this.factory.spotifyProvider;
   }
 
+  /** Personal web logins must never read or replace a bot's platform cookie. */
+  createPersonalNeteaseProvider(): MusicProvider {
+    return this.factory.createNetease();
+  }
+
   async createBot(params: CreateBotParams): Promise<BotInstance> {
     const id = crypto.randomUUID();
 

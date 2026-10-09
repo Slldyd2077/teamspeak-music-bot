@@ -87,6 +87,35 @@ export interface TS3VoiceActivity {
   clientUid?: string;
 }
 
+/** Send acceptance only: an accepted UDP call does not confirm delivery. */
+export interface TS3VoiceSendFailure {
+  code?: string;
+  consecutiveFailures: number;
+  durationMs: number;
+}
+
+/** Sticky failure status lets playback stay paused when the terminal event
+ * already fired during another track or an idle URL lookup. */
+export type TS3VoiceSendResult = "accepted" | "retrying" | "failed" | "unavailable";
+
+const VOICE_SEND_FAILURE_TIMEOUT_MS = 2_000;
+const SAFE_SOCKET_ERROR_CODES = new Set([
+  "ERR_SOCKET_DGRAM_NOT_RUNNING", "ERR_SOCKET_DGRAM_NOT_CONNECTED",
+  "EPIPE", "ENOBUFS", "ECONNREFUSED", "ECONNRESET", "EHOSTUNREACH",
+  "ENETUNREACH", "ENETDOWN", "EACCES", "EPERM", "EINVAL", "EMSGSIZE",
+  "EAGAIN", "ENOTCONN", "EBADF",
+]);
+
+function safeSocketErrorCode(error: unknown): string | undefined {
+  try {
+    if (!error || typeof error !== "object") return undefined;
+    const code = (error as { code?: unknown }).code;
+    return typeof code === "string" && SAFE_SOCKET_ERROR_CODES.has(code) ? code : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 // Command notifications and UDP voice packets can be reordered in flight.
 // Retain a leaving client's UID briefly so its final packet is still
 // attributable; a new clientEnter for the same id cancels and overwrites it.
@@ -125,7 +154,10 @@ export class TS3Client extends EventEmitter {
   private detectedProtocol: ServerProtocol = "unknown";
   private httpQuery: TS6HttpQuery | null = null;
   private udpErrorTimer: ReturnType<typeof setTimeout> | null = null;
-  private readonly voiceEndpointResolver = new TrackingVoiceEndpointResolver();
+  private connectionGeneration = 0;
+  private voiceFailureTimer: ReturnType<typeof setTimeout> | null = null;
+  private voiceFailure: { code?: string; consecutiveFailures: number; startedAt: number } | null = null;
+  private voiceEndpointResolver = new TrackingVoiceEndpointResolver();
 
   constructor(private options: TS3ClientOptions, logger: Logger) {
     super();
@@ -156,18 +188,25 @@ export class TS3Client extends EventEmitter {
     if (!this.options.nickname.trim() || nicknameLength < 3 || nicknameLength > 30) {
       throw new Error("TeamSpeak nickname must contain 3–30 characters");
     }
-    this.voiceEndpointResolver.reset();
+    const generation = ++this.connectionGeneration;
+    this.resetVoiceSendState();
+    this.disconnecting = false;
+    const voiceEndpointResolver = new TrackingVoiceEndpointResolver();
+    this.voiceEndpointResolver = voiceEndpointResolver;
     this.clearVisibleClientUids();
+    this.httpQuery = null;
     // Clean up any existing connection before creating a new one
-    if (this.client) {
+    const previousClient = this.client;
+    this.client = null;
+    this.clientId = 0;
+    if (previousClient) {
       this.logger.info("Cleaning up previous connection before reconnecting");
       try {
-        await this.client.disconnect();
+        await previousClient.disconnect();
       } catch {
         // Ignore errors during cleanup
       }
-      this.client = null;
-      this.clientId = 0;
+      if (generation !== this.connectionGeneration) return;
     }
 
     const addr = `${this.options.host}:${this.options.port}`;
@@ -187,6 +226,7 @@ export class TS3Client extends EventEmitter {
         3000,
         { ts3QueryPort: 10011, ts6HttpPort: 10080 },
       );
+      if (generation !== this.connectionGeneration) return;
       this.detectedProtocol = detection.protocol;
       if (this.detectedProtocol === "unknown") {
         this.logger.warn(
@@ -212,66 +252,65 @@ export class TS3Client extends EventEmitter {
       });
     }
 
-    // Guard against calling connect() while already connected.
-    // Save detectedProtocol first because disconnect() resets it.
-    if (this.client) {
-      this.logger.warn("connect() called while already connected, disconnecting first");
-      const savedProtocol = this.detectedProtocol;
-      const savedHttpQuery = this.httpQuery;
-      this.disconnect();
-      this.detectedProtocol = savedProtocol;
-      this.httpQuery = savedHttpQuery;
-      // Give the old client a moment to tear down
-      await new Promise((r) => setTimeout(r, 100));
-    }
-
     this.logger.info(
       { addr, protocol: this.detectedProtocol },
       "Connecting to TeamSpeak server (full client protocol)",
     );
 
     // Throttle repeated "udp send error" warnings (fires every 20ms during playback if UDP breaks)
+    let sdkClient: TS3FullClient | null = null;
+    const isCurrent = () => sdkClient !== null && this.client === sdkClient &&
+      this.connectionGeneration === generation && !this.disconnecting;
     let udpErrorCount = 0;
+    let udpErrorCode: string | undefined;
     const throttledWarn = (msg: string, ...args: unknown[]) => {
+      if (!isCurrent()) return;
       if (typeof msg === "string" && msg.includes("udp send error")) {
         udpErrorCount++;
+        udpErrorCode = args.map(safeSocketErrorCode).find(code => code !== undefined) ?? udpErrorCode;
         if (udpErrorCount === 1) {
-          this.logger.warn(msg);
+          this.logger.warn({ ...(udpErrorCode ? { code: udpErrorCode } : {}), count: 1 }, "udp send error");
           // After 2 seconds, log a summary and reset.
           // Clear any previous timer to avoid leaking it.
           if (this.udpErrorTimer) clearTimeout(this.udpErrorTimer);
           this.udpErrorTimer = setTimeout(() => {
+            if (!isCurrent()) return;
             if (udpErrorCount > 1) {
-              this.logger.warn(`udp send error (repeated ${udpErrorCount} times, connection may be lost)`);
+              this.logger.warn({ ...(udpErrorCode ? { code: udpErrorCode } : {}), count: udpErrorCount }, "Repeated udp send error; connection may be lost");
             }
             udpErrorCount = 0;
+            udpErrorCode = undefined;
             this.udpErrorTimer = null;
           }, 2000);
+          this.udpErrorTimer.unref?.();
         }
         return;
       }
       this.logger.warn(msg);
     };
 
-    this.client = new TS3FullClient(this.identity, addr, this.options.nickname, {
+    sdkClient = new TS3FullClient(this.identity, addr, this.options.nickname, {
       // Forward server password to the protocol library so it can be
       // included in clientinit for password-protected servers
       serverPassword: this.options.serverPassword,
-      resolver: this.voiceEndpointResolver,
+      resolver: voiceEndpointResolver,
       logger: {
-        debug: (msg) => this.logger.debug(msg),
-        info: (msg) => this.logger.info(msg),
+        debug: (msg) => { if (isCurrent()) this.logger.debug(msg); },
+        info: (msg) => { if (isCurrent()) this.logger.info(msg); },
         warn: throttledWarn,
-        error: (msg) => this.logger.error(msg),
+        error: (msg) => { if (isCurrent()) this.logger.error(msg); },
       },
     });
+    this.client = sdkClient;
 
-    this.client.on("textMessage", (msg: TextMessage) => {
+    sdkClient.on("textMessage", (msg: TextMessage) => {
+      if (!isCurrent()) return;
       if (msg.invokerID === this.clientId) return;
       this.emit("textMessage", toTS3TextMessage(msg));
     });
 
-    this.client.on("voiceData", (voice: VoiceData) => {
+    sdkClient.on("voiceData", (voice: VoiceData) => {
+      if (!isCurrent()) return;
       // The library normally suppresses our own packets; retain the explicit
       // guard so a future protocol change cannot make a bot duck itself.
       if (voice.clientId === this.clientId) return;
@@ -292,14 +331,20 @@ export class TS3Client extends EventEmitter {
       this.emit("voiceFrame", frame);
     });
 
-    this.client.on("disconnected", (err) => {
-      this.logger.warn({ err: err?.message }, "Connection closed");
+    sdkClient.on("disconnected", (err) => {
+      if (!isCurrent()) return;
+      const code = safeSocketErrorCode(err);
+      this.logger.warn(code ? { code } : {}, "Connection closed");
+      ++this.connectionGeneration;
+      this.resetVoiceSendState();
+      this.client = null;
       this.clientId = 0;
       this.clearVisibleClientUids();
       this.emit("disconnected");
     });
 
-    this.client.on("clientEnter", (info: ClientInfo) => {
+    sdkClient.on("clientEnter", (info: ClientInfo) => {
+      if (!isCurrent()) return;
       this.rememberVisibleClientUid(info.id, info.uid);
       this.logger.debug(
         { nickname: info.nickname, id: info.id },
@@ -308,13 +353,15 @@ export class TS3Client extends EventEmitter {
       this.emit("clientEnter", info);
     });
 
-    this.client.on("clientLeave", (ev: ClientLeftViewEvent) => {
+    sdkClient.on("clientLeave", (ev: ClientLeftViewEvent) => {
+      if (!isCurrent()) return;
       this.releaseVisibleClientUid(ev.id);
       this.logger.debug({ id: ev.id }, "Client left");
       this.emit("clientLeave", ev);
     });
 
-    this.client.on("clientMoved", (ev: ClientMovedEvent) => {
+    sdkClient.on("clientMoved", (ev: ClientMovedEvent) => {
+      if (!isCurrent()) return;
       this.logger.debug(
         { id: ev.id, targetChannelID: ev.targetChannelID.toString() },
         "Client moved"
@@ -322,15 +369,22 @@ export class TS3Client extends EventEmitter {
       this.emit("clientMoved", ev);
     });
 
-    await this.client.connect();
+    await sdkClient.connect();
+    if (!isCurrent()) {
+      // DNS/socket setup may finish after disconnect() closed the transport.
+      // Close it again without waiting on command replies from a stale session.
+      sdkClient.handler.close();
+      return;
+    }
     // Note: @honeybbq/teamspeak-client 0.2.x ships a universal clientinit
     // (client_version "3.?.? [Build: 5680278000]" + matching signature)
     // that works against both TS3 and TS6 servers. The old 3.6.2 monkey-
     // patch on handler.sendPacket was removed when we bumped to 0.2.1 — it
     // would have replaced the library's new correct version with a stale
     // signature and made TS6 handshakes fail.
-    await this.client.waitConnected();
-    this.clientId = this.client.clientID();
+    await sdkClient.waitConnected();
+    if (!isCurrent()) return;
+    this.clientId = sdkClient.clientID();
     this.voiceFramesSent = 0;
     this.logger.info(
       { clientId: this.clientId, protocol: this.detectedProtocol },
@@ -347,7 +401,7 @@ export class TS3Client extends EventEmitter {
       );
     }
 
-    this.emit("connected");
+    if (isCurrent()) this.emit("connected");
   }
 
   /**
@@ -365,21 +419,28 @@ export class TS3Client extends EventEmitter {
   }
 
   async joinChannel(channelName: string, password?: string): Promise<void> {
-    if (!this.client) return;
+    const client = this.client;
+    if (!client || this.disconnecting) return;
+    const clientId = this.clientId;
+    const generation = this.connectionGeneration;
+    const isCurrent = () => this.client === client && this.clientId === clientId &&
+      this.connectionGeneration === generation && !this.disconnecting;
 
     const isNumeric = /^\d+$/.test(channelName);
     if (isNumeric) {
       try {
-        await clientMove(this.client, this.clientId, BigInt(channelName), password);
+        await clientMove(client, clientId, BigInt(channelName), password);
+        if (!isCurrent()) return;
         this.logger.info({ channelName }, "Joined channel");
       } catch (err) {
-        this.logger.error({ err, channelName }, "Failed to join channel");
+        if (isCurrent()) this.logger.error({ err, channelName }, "Failed to join channel");
       }
       return;
     }
 
     try {
-      const channels = await listChannels(this.client);
+      const channels = await listChannels(client);
+      if (!isCurrent()) return;
       const channel = channels.find((ch) => ch.name === channelName);
 
       if (!channel) {
@@ -387,13 +448,14 @@ export class TS3Client extends EventEmitter {
         return;
       }
 
-      await clientMove(this.client, this.clientId, channel.id, password);
+      await clientMove(client, clientId, channel.id, password);
+      if (!isCurrent()) return;
       this.logger.info(
         { channelName, cid: channel.id.toString() },
         "Joined channel"
       );
     } catch (err) {
-      this.logger.error({ err, channelName }, "Failed to join channel");
+      if (isCurrent()) this.logger.error({ err, channelName }, "Failed to join channel");
     }
   }
 
@@ -490,19 +552,68 @@ export class TS3Client extends EventEmitter {
 
   private voiceFramesSent = 0;
 
-  sendVoiceData(opusFrame: Buffer): void {
-    if (!this.client || this.disconnecting) return;
+  sendVoiceData(opusFrame: Buffer): TS3VoiceSendResult {
+    const client = this.client;
+    if (!client || this.disconnecting) return "unavailable";
     try {
-      this.client.sendVoice(opusFrame, 5);
-      this.voiceFramesSent++;
-      if (this.voiceFramesSent === 1) {
-        this.logger.info({ opusBytes: opusFrame.length, clientId: this.clientId }, "First voice packet sent to TeamSpeak");
-      }
+      client.sendVoice(opusFrame, 5);
     } catch (err) {
-      if (this.voiceFramesSent === 0) {
-        this.logger.error({ err }, "Failed to send first voice packet");
+      if (this.voiceFailure) {
+        this.voiceFailure.consecutiveFailures++;
+        this.voiceFailure.code = safeSocketErrorCode(err) ?? this.voiceFailure.code;
+        return this.voiceFailureTimer ? "retrying" : "failed";
       }
+      const code = safeSocketErrorCode(err);
+      const failure = this.voiceFailure = {
+        ...(code ? { code } : {}), consecutiveFailures: 1, startedAt: Date.now(),
+      };
+      const generation = this.connectionGeneration;
+      this.voiceFailureTimer = setTimeout(() => {
+        if (this.client !== client || this.connectionGeneration !== generation ||
+          this.disconnecting || this.voiceFailure !== failure) return;
+        this.voiceFailureTimer = null;
+        const event = this.voiceFailureDetails(failure);
+        this.logger.error(event, "Voice sends have failed continuously; pausing playback is required");
+        this.emit("voiceSendFailed", event);
+      }, VOICE_SEND_FAILURE_TIMEOUT_MS);
+      this.voiceFailureTimer.unref?.();
+      const event = this.voiceFailureDetails(failure);
+      this.logger.warn(event, "Voice send failed");
+      this.emit("voiceSendFailure", event);
+      return "retrying";
     }
+    this.voiceFramesSent++;
+    if (this.voiceFramesSent === 1) {
+      this.logger.info({ opusBytes: opusFrame.length, clientId: this.clientId }, "First voice packet accepted by TeamSpeak client");
+    }
+    if (this.voiceFailure) {
+      const event = this.voiceFailureDetails(this.voiceFailure);
+      this.clearVoiceFailure();
+      this.logger.info(event, "Voice send recovered");
+      this.emit("voiceSendRecovered", event);
+    }
+    return "accepted";
+  }
+
+  private voiceFailureDetails(failure: NonNullable<TS3Client["voiceFailure"]>): TS3VoiceSendFailure {
+    return {
+      ...(failure.code ? { code: failure.code } : {}),
+      consecutiveFailures: failure.consecutiveFailures,
+      durationMs: Math.max(0, Date.now() - failure.startedAt),
+    };
+  }
+
+  private clearVoiceFailure(): void {
+    if (this.voiceFailureTimer) clearTimeout(this.voiceFailureTimer);
+    this.voiceFailureTimer = null;
+    this.voiceFailure = null;
+  }
+
+  private resetVoiceSendState(): void {
+    this.clearVoiceFailure();
+    this.voiceFramesSent = 0;
+    if (this.udpErrorTimer) clearTimeout(this.udpErrorTimer);
+    this.udpErrorTimer = null;
   }
 
   getIdentityExport(): string {
@@ -560,24 +671,20 @@ export class TS3Client extends EventEmitter {
   }
 
   disconnect(): void {
-    if (this.client && !this.disconnecting) {
+    const generation = ++this.connectionGeneration;
+    this.resetVoiceSendState();
+    const client = this.client;
+    this.client = null;
+    if (client && !this.disconnecting) {
       this.disconnecting = true;
-      const client = this.client;
       client.disconnect().catch(() => {}).finally(() => {
-        if (this.client === client) {
-          this.client = null;
-        }
-        this.disconnecting = false;
+        if (generation === this.connectionGeneration) this.disconnecting = false;
       });
     }
     this.clientId = 0;
     this.clearVisibleClientUids();
     this.httpQuery = null;
     this.detectedProtocol = "unknown";
-    if (this.udpErrorTimer) {
-      clearTimeout(this.udpErrorTimer);
-      this.udpErrorTimer = null;
-    }
     this.logger.info("Disconnected from TeamSpeak server");
   }
 }

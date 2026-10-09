@@ -374,13 +374,15 @@ describe("guest enforcement on player routes", () => {
     expect((await request(mountGuest({ transport: true })).post(`/api/player/${ALLOWED_BOT}/add-song`).send({ song: SONG })).status).toBe(403);
   });
 
-  it("playCollection flag gates /play-playlist, /play-album (issue #103)", async () => {
+  it("playCollection flag gates /play-playlist, /play-album, /play-artist (issue #103)", async () => {
     const allow = mountGuest({ playCollection: true });
     const deny = mountGuest({ playCollection: false });
     expect((await request(allow).post(`/api/player/${ALLOWED_BOT}/play-playlist`).send({ playlistId: "1" })).status).not.toBe(403);
     expect((await request(allow).post(`/api/player/${ALLOWED_BOT}/play-album`).send({ albumId: "1" })).status).not.toBe(403);
+    expect((await request(allow).post(`/api/player/${ALLOWED_BOT}/play-artist`).send({ artistId: "1" })).status).not.toBe(403);
     expect((await request(deny).post(`/api/player/${ALLOWED_BOT}/play-playlist`).send({ playlistId: "1" })).status).toBe(403);
     expect((await request(deny).post(`/api/player/${ALLOWED_BOT}/play-album`).send({ albumId: "1" })).status).toBe(403);
+    expect((await request(deny).post(`/api/player/${ALLOWED_BOT}/play-artist`).send({ artistId: "1" })).status).toBe(403);
     // playCollection does NOT leak into the destructive single-song / queue ops.
     expect((await request(allow).post(`/api/player/${ALLOWED_BOT}/play`).send({ query: "x" })).status).toBe(403);
     expect((await request(allow).post(`/api/player/${ALLOWED_BOT}/play-song`).send({ song: SONG })).status).toBe(403);

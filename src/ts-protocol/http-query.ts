@@ -167,7 +167,12 @@ export class TS6HttpQuery {
 
   /** List clients on a virtual server */
   async clientList(sid = 1): Promise<HttpQueryResult> {
-    return this.request("GET", `/1/clientlist?sid=${sid}`);
+    const path = `/1/clientlist?sid=${sid}`;
+    const result = await this.request("GET", path);
+    if (result.status < 200 || result.status >= 300) {
+      throw new HttpQueryError(path, result.status, result.body);
+    }
+    return result;
   }
 
   /** List channels on a virtual server */
@@ -206,6 +211,51 @@ export class TS6HttpQuery {
     if (result.status < 200 || result.status >= 300) {
       throw new HttpQueryError(path, result.status, result.body);
     }
+    return result;
+  }
+
+  /**
+   * Edit a specific connected client.
+   *
+   * clientUpdate() modifies the HTTP Query client itself.
+   * clientEdit() explicitly targets the supplied clid.
+   */
+  async clientEdit(
+    clid: number,
+    properties: Record<string, string | number>,
+    sid = 1,
+  ): Promise<HttpQueryResult> {
+    const path = `/1/clientedit?sid=${sid}`;
+    const result = await this.request("POST", path, {
+      clid,
+      ...properties,
+    });
+
+    if (result.status < 200 || result.status >= 300) {
+      throw new HttpQueryError(path, result.status, result.body);
+    }
+
+    return result;
+  }
+
+  /**
+   * Edit a specific channel.
+   */
+  async channelEdit(
+    cid: number,
+    properties: Record<string, string | number>,
+    sid = 1,
+  ): Promise<HttpQueryResult> {
+    const path = `/1/channeledit?sid=${sid}`;
+    const result = await this.request("POST", path, {
+      cid,
+      ...properties,
+    });
+
+    if (result.status < 200 || result.status >= 300) {
+      throw new HttpQueryError(path, result.status, result.body);
+    }
+
     return result;
   }
 
