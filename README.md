@@ -28,7 +28,7 @@
 
 > v1.10.0 新增**可选**的 [Jellyfin](https://jellyfin.org/) 音源（由 [@ItsEricRao](https://github.com/ItsEricRao) 在 [PR #123](https://github.com/ZHANGTIANYAO1/teamspeak-music-bot/pull/123) 中贡献）：连接自建 Jellyfin 服务器直接播放你自己的音乐库。默认关闭，在 **设置 → Jellyfin 音乐库** 一键开启；原有在线音源保持默认启用，行为不变。
 
-> 🍴 **PowerfulTS 专用分支**：本仓库的 [`merge/upstream-v1.12`](https://github.com/Slldyd2077/teamspeak-music-bot/tree/merge/upstream-v1.12) 分支是为 [PowerfulTS](https://github.com/Slldyd2077/PowerfulTS) 管理面板定制的专属分支——per-bot 多实例架构、网页通话双向 Opus 中继、语音闪避（含网页通话触发）等接口仅存在于该分支，未合入上游原版。**PowerfulTS 部署时必须使用本分支构建的 TSMusicBot**，上游 [ZHANGTIANYAO1/teamspeak-music-bot](https://github.com/ZHANGTIANYAO1/teamspeak-music-bot) 的发布版本不包含这些能力。
+> 🍴 **PowerfulTS 生产兼容分支**：[`codex/audio-production-compatible`](https://github.com/Slldyd2077/teamspeak-music-bot/tree/codex/audio-production-compatible) 保存本次实际上线的逐曲响度均衡和原 TS 连接层，包含 per-bot 多实例、网页双向 Opus 中继和语音闪避接口。现有服务器使用本分支已验收的固定提交构建；原版镜像不能直接替换。通用分支 `merge/upstream-v1.12` 另行同步上游，切换前需单独验证连接层。
 
 ## 功能特性
 
@@ -89,7 +89,7 @@ FFmpeg **已自动内置**，无需手动安装。
 
 ```bash
 # 下载项目
-git clone https://github.com/ZHANGTIANYAO1/teamspeak-music-bot.git
+git clone --branch codex/audio-production-compatible https://github.com/Slldyd2077/teamspeak-music-bot.git
 cd teamspeak-music-bot
 
 # 安装依赖
@@ -110,7 +110,7 @@ npm start
 所有依赖已内置（Node.js、FFmpeg、Opus 编码器），无需安装任何额外软件。
 
 ```bash
-git clone https://github.com/ZHANGTIANYAO1/teamspeak-music-bot.git
+git clone --branch codex/audio-production-compatible https://github.com/Slldyd2077/teamspeak-music-bot.git
 cd teamspeak-music-bot/scripts/docker
 docker-compose up -d
 ```
