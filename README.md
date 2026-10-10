@@ -1,3 +1,5 @@
+> **音频功能更新（2026-10-10）**：本分支保存 2026-10-10 实际上线的逐曲响度均衡引擎，基于 `2c1fc74`，保留生产 TS 连接层。 处理歌曲之间的整体响度，同一首固定增益。构建、升级及回归检查见[逐曲响度均衡说明](docs/track-loudness.md)。
+
 <p align="center">
   <img src="https://img.shields.io/badge/TeamSpeak-音乐机器人-blue?style=for-the-badge&logo=teamspeak" alt="TSMusicBot" />
 </p>

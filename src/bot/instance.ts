@@ -163,6 +163,7 @@ export interface BotStatus {
   effectiveDuration?: number;
   /** Decoder backlog for latency-sensitive live voice and ordinary media. */
   audioPipeline: PlaybackDiagnostics;
+  loudnessNormalization?: ReturnType<AudioPlayer["getLoudnessNormalization"]>;
   liveVoice: RealtimeVoiceTelemetry;
 }
 
@@ -255,6 +256,7 @@ export class BotInstance extends EventEmitter {
     };
     this.voiceServerScope = { ...this.configuredVoiceServerScope };
     this.queue = new PlayQueue();
+    this.player.setLoudnessNormalization?.(this.config.loudnessNormalization ?? { enabled: false, targetLufs: -18 });
 
     // Restore persisted per-bot player settings (#125): volume + play mode
     // survive restarts. getPlayerSettings returns validated values (the in-memory
@@ -702,6 +704,11 @@ export class BotInstance extends EventEmitter {
   updateVoiceDucking(settings: VoiceDuckingConfig): void {
     this.config.voiceDucking = { ...settings };
     this.voiceDucking.updateSettings(settings);
+  }
+
+  updateLoudnessNormalization(settings: BotConfig["loudnessNormalization"]): void {
+    this.config.loudnessNormalization = { ...settings };
+    this.player.setLoudnessNormalization(settings);
   }
 
   private _startIdlePoller(): void {
@@ -2069,6 +2076,7 @@ export class BotInstance extends EventEmitter {
       effectiveDuration: this.effectiveDuration,
       clientId: this.tsClient.getClientId(),
       audioPipeline,
+      loudnessNormalization: this.player.getLoudnessNormalization?.(),
       liveVoice: visibleRealtimeVoiceTelemetry(
         audioPipeline.mode,
         this.liveVoiceTelemetry,

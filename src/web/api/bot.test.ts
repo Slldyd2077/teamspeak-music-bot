@@ -28,6 +28,10 @@ function makeFakeBot() {
     idleTimeoutCalls: [] as number[],
     autoPauseCalls: [] as boolean[],
     voiceDuckingCalls: [] as VoiceDuckingConfig[],
+    loudnessCalls: [] as BotConfig["loudnessNormalization"][],
+    updateLoudnessNormalization(settings: BotConfig["loudnessNormalization"]) {
+      this.loudnessCalls.push({ ...settings });
+    },
     updateIdleTimeout(minutes: number) {
       this.idleTimeoutCalls.push(minutes);
     },
@@ -97,6 +101,25 @@ describe("bot router /settings", () => {
     const res = await request(app).get("/api/bot/settings").set("Cookie", cookie);
     expect(res.status).toBe(200);
     expect(res.body.voiceDucking).toEqual({ enabled: false, volumePercent: 30 });
+  });
+
+  it("persists loudness settings and applies them to all bots at the next track boundary", async () => {
+    const result = await request(app).post('/api/bot/settings').set('Cookie', cookie)
+      .send({ loudnessNormalization: { enabled: true } });
+    expect(result.status).toBe(200);
+    expect(result.body.loudnessNormalization).toEqual({ enabled: true, targetLufs: -18 });
+    expect(JSON.parse(readFileSync(configPath, 'utf8')).loudnessNormalization).toEqual({ enabled: true, targetLufs: -18 });
+    for (const bot of fakeBots) expect(bot.loudnessCalls).toEqual([{ enabled: true, targetLufs: -18 }]);
+    const target = await request(app).post('/api/bot/settings').set('Cookie', cookie)
+      .send({ loudnessNormalization: { targetLufs: -23 } });
+    expect(target.body.loudnessNormalization).toEqual({ enabled: true, targetLufs: -23 });
+  });
+
+  it.each([null, [], { enabled: 'yes' }, { targetLufs: -50 }, { targetLufs: 0 }])('rejects malformed loudness settings %j', async (value) => {
+    const result = await request(app).post('/api/bot/settings').set('Cookie', cookie)
+      .send({ loudnessNormalization: value });
+    expect(result.status).toBe(400);
+    expect(config.loudnessNormalization).toEqual({ enabled: false, targetLufs: -18 });
   });
 
   it("POST /settings safely partial-merges, persists and hot-applies voiceDucking", async () => {

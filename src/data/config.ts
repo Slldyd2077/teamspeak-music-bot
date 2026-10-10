@@ -60,6 +60,11 @@ export interface VoiceDuckingConfig {
   volumePercent: number;
 }
 
+export interface LoudnessNormalizationConfig {
+  enabled: boolean;
+  targetLufs: number;
+}
+
 /**
  * Providers gated by `enabledProviders`. Not listed here:
  *  - "local"   → governed by the existing `localAudioEnabled` flag
@@ -121,6 +126,7 @@ export interface BotConfig {
   autoPauseOnEmpty: boolean;
   /** Lower music volume while voice from another client is being received. */
   voiceDucking: VoiceDuckingConfig;
+  loudnessNormalization: LoudnessNormalizationConfig;
   idleTimeoutMinutes: number;
   /** Enable uploading and playback of server-stored local audio files. */
   localAudioEnabled: boolean;
@@ -188,6 +194,7 @@ export function getDefaultConfig(): BotConfig {
       enabled: false,
       volumePercent: 30,
     },
+    loudnessNormalization: { enabled: false, targetLufs: -18 },
     idleTimeoutMinutes: 0,
     localAudioEnabled: true,
     savedQueuesEnabled: false,
@@ -399,6 +406,12 @@ export function loadConfig(path: string): BotConfig {
     // directly by the audio path. Only a plain-object block with correctly
     // typed, finite and in-range fields may override the safe defaults.
     const rawVoiceDucking = partial.voiceDucking;
+    const rawLoudness = partial.loudnessNormalization;
+    const loudnessNormalization: LoudnessNormalizationConfig = {
+      enabled: typeof rawLoudness?.enabled === "boolean" ? rawLoudness.enabled : false,
+      targetLufs: typeof rawLoudness?.targetLufs === "number" && Number.isFinite(rawLoudness.targetLufs)
+        && rawLoudness.targetLufs >= -24 && rawLoudness.targetLufs <= -14 ? rawLoudness.targetLufs : -18,
+    };
     const partialVoiceDucking =
       rawVoiceDucking !== null &&
       typeof rawVoiceDucking === "object" &&
@@ -458,6 +471,7 @@ export function loadConfig(path: string): BotConfig {
       savedQueuesEnabled,
       playKeepsQueue,
       voiceDucking,
+      loudnessNormalization,
       defaultPlatform: defaultPlatformPref,
     };
   }

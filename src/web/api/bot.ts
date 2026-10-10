@@ -72,6 +72,7 @@ export function createBotRouter(
       idleTimeoutMinutes: config.idleTimeoutMinutes ?? 0,
       autoPauseOnEmpty: config.autoPauseOnEmpty,
       voiceDucking: config.voiceDucking,
+      loudnessNormalization: config.loudnessNormalization ?? { enabled: false, targetLufs: -18 },
       localAudioEnabled: config.localAudioEnabled,
       savedQueuesEnabled: config.savedQueuesEnabled,
       playKeepsQueue: config.playKeepsQueue,
@@ -92,6 +93,7 @@ export function createBotRouter(
       autoPauseOnEmpty,
       localAudioEnabled,
       voiceDucking,
+      loudnessNormalization,
       guestMode,
       adminGroups,
     } = req.body;
@@ -104,6 +106,24 @@ export function createBotRouter(
 
     const hasAutoPause = typeof autoPauseOnEmpty === "boolean";
     const hasLocalAudioEnabled = typeof localAudioEnabled === "boolean";
+    const hasLoudness = loudnessNormalization !== undefined;
+    if (hasLoudness && (
+      !loudnessNormalization || typeof loudnessNormalization !== "object" || Array.isArray(loudnessNormalization)
+      || (loudnessNormalization.enabled !== undefined && typeof loudnessNormalization.enabled !== "boolean")
+      || (loudnessNormalization.targetLufs !== undefined && (
+        typeof loudnessNormalization.targetLufs !== "number" || !Number.isFinite(loudnessNormalization.targetLufs)
+        || loudnessNormalization.targetLufs < -24 || loudnessNormalization.targetLufs > -14
+      ))
+    )) {
+      res.status(400).json({ error: "Invalid loudnessNormalization settings" });
+      return;
+    }
+    if (hasLoudness) {
+      config.loudnessNormalization = {
+        enabled: loudnessNormalization.enabled ?? config.loudnessNormalization?.enabled ?? false,
+        targetLufs: loudnessNormalization.targetLufs ?? config.loudnessNormalization?.targetLufs ?? -18,
+      };
+    }
 
     if (hasIdle) config.idleTimeoutMinutes = idleTimeoutMinutes;
     if (hasAutoPause) config.autoPauseOnEmpty = autoPauseOnEmpty;
@@ -274,12 +294,14 @@ export function createBotRouter(
       if (hasIdle) bot.updateIdleTimeout(config.idleTimeoutMinutes);
       if (hasAutoPause) bot.updateAutoPause(config.autoPauseOnEmpty);
       if (hasVoiceDucking) bot.updateVoiceDucking(config.voiceDucking);
+      if (hasLoudness) bot.updateLoudnessNormalization(config.loudnessNormalization);
     }
 
     res.json({
       idleTimeoutMinutes: config.idleTimeoutMinutes ?? 0,
       autoPauseOnEmpty: config.autoPauseOnEmpty,
       voiceDucking: config.voiceDucking,
+      loudnessNormalization: config.loudnessNormalization ?? { enabled: false, targetLufs: -18 },
       localAudioEnabled: config.localAudioEnabled,
       savedQueuesEnabled: config.savedQueuesEnabled,
       playKeepsQueue: config.playKeepsQueue,
