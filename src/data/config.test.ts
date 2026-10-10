@@ -55,6 +55,17 @@ describe("config", () => {
     });
   });
 
+  it("preserves loudness settings and restores defaults for legacy or invalid config", () => {
+    const dir = makeTmpDir();
+    const path = join(dir, 'loudness.json');
+    for (const raw of [null, [], 'on', { enabled: 'yes', targetLufs: -99 }, {}]) {
+      writeFileSync(path, JSON.stringify({ loudnessNormalization: raw }));
+      expect(loadConfig(path).loudnessNormalization).toEqual({ enabled: false, targetLufs: -18 });
+    }
+    writeFileSync(path, JSON.stringify({ loudnessNormalization: { enabled: true, targetLufs: -23 } }));
+    expect(loadConfig(path).loudnessNormalization).toEqual({ enabled: true, targetLufs: -23 });
+  });
+
   it("fills voiceDucking defaults for legacy and partial configs", () => {
     const dir = makeTmpDir();
     const legacyPath = join(dir, "legacy.json");

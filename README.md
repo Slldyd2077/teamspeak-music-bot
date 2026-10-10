@@ -1,3 +1,5 @@
+> **音频功能更新（2026-10-10）**：通用分支已包含逐曲响度均衡；现有生产服务器应使用已验收的 `codex/audio-production-compatible` 分支。 处理歌曲之间的整体响度，同一首固定增益。构建、升级及回归检查见[逐曲响度均衡说明](docs/track-loudness.md)。
+
 <p align="center">
   <img src="https://img.shields.io/badge/TeamSpeak-音乐机器人-blue?style=for-the-badge&logo=teamspeak" alt="TSMusicBot" />
 </p>

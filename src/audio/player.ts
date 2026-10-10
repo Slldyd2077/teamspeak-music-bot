@@ -13,6 +13,8 @@ import {
 import type { Readable } from "node:stream";
 import type { Logger } from "../logger.js";
 import { collectFfmpegDiagnostics, type FfmpegDiagnostics } from "./ffmpeg-diagnostics.js";
+import { TrackLoudnessAnalyzer, calculateTrackGainDb, type LoudnessMeasurement, type TrackNormalizationStatus } from "./track-loudness.js";
+import type { LoudnessNormalizationConfig } from "../data/config.js";
 
 const require = createRequire(import.meta.url);
 const ffmpegPath: string | null = require("ffmpeg-static");
@@ -114,6 +116,8 @@ export function cleanupTempDir(dir: string): void {
 
 export interface FfmpegInputOptions {
   realtime?: boolean;
+  /** Fixed for the entire track; seeking reuses this exact value. */
+  trackGainDb?: number;
 }
 
 export function buildFfmpegArgs(
@@ -180,6 +184,9 @@ export function buildFfmpegArgs(
   args.push("-i", url);
   // Output-side seek (after -i): works on CDNs that reject Range/keyframe seeks (NetEase music.126.net).
   if (seekSeconds > 0 && !inputSideSeek) args.push("-ss", String(seekSeconds));
+  if (!options.realtime && Number.isFinite(options.trackGainDb)) {
+    args.push("-af", `volume=${options.trackGainDb}dB`);
+  }
   args.push("-f", "s16le", "-ar", "48000", "-ac", "2", "-acodec", "pcm_s16le", "-");
 
   return args;
@@ -293,6 +300,7 @@ export function isValidSoundEffectUrl(
 }
 
 export interface AudioPlayerDependencies {
+  analyzeTrackLoudness?: (url: string, signal: AbortSignal) => Promise<LoudnessMeasurement>;
   spawnSoundEffect?: (
     command: string,
     args: string[],
@@ -453,6 +461,14 @@ export function isPcmFrameVoiced(frame: Buffer, peakThreshold = 256): boolean {
 }
 
 export class AudioPlayer extends EventEmitter {
+  private readonly loudnessAnalyzer = new TrackLoudnessAnalyzer();
+  private readonly analyzeTrackLoudness: (url: string, signal: AbortSignal) => Promise<LoudnessMeasurement>;
+  private loudnessSettings: LoudnessNormalizationConfig = { enabled: false, targetLufs: -18 };
+  private currentLoudnessSettings = { ...this.loudnessSettings };
+  private loudnessAbort: AbortController | null = null;
+  private trackAnalysisRequired = false;
+  private trackGainDb = 0;
+  private normalizationStatus: TrackNormalizationStatus = { state: "disabled", gainDb: 0 };
   private ffmpeg: ChildProcess | null = null;
   private ffmpegDiagnostics: FfmpegDiagnostics | null = null;
   private readonly intentionalCleanup = new WeakSet<ChildProcess>();
@@ -537,6 +553,8 @@ export class AudioPlayer extends EventEmitter {
     this.encoder = createOpusEncoder();
     this.logger = logger;
     this.spawnSoundEffect = dependencies.spawnSoundEffect ?? spawn;
+    this.analyzeTrackLoudness = dependencies.analyzeTrackLoudness ?? ((url, signal) =>
+      this.loudnessAnalyzer.measure(getFfmpegCommand(), this.currentUrl, buildFfmpegArgs(url, 0), signal));
   }
 
   play(
@@ -561,6 +579,10 @@ export class AudioPlayer extends EventEmitter {
     this.spawnFailed = false;
     this.emptyFrameAttempts = 0;
     this.currentSongDuration = songDuration;
+    this.currentLoudnessSettings = { ...this.loudnessSettings };
+    this.trackGainDb = Number.isFinite(options.trackGainDb) ? options.trackGainDb! : 0;
+    this.trackAnalysisRequired = this.currentLoudnessSettings.enabled && !options.realtime && options.trackGainDb === undefined;
+    this.normalizationStatus = { state: options.realtime ? "unavailable" : this.trackAnalysisRequired ? "analyzing" : "disabled", gainDb: this.trackGainDb };
 
     if (this.consecutiveFailures >= AudioPlayer.MAX_CONSECUTIVE_FAILURES) {
       this.logger.error({ failures: this.consecutiveFailures }, "FFmpeg failures limit reached");
@@ -574,7 +596,17 @@ export class AudioPlayer extends EventEmitter {
       return;
     }
 
-    const args = buildFfmpegArgs(url, seekSeconds, options);
+    if (this.trackAnalysisRequired) {
+      this.state = "playing";
+      void this.prepareTrackLoudness(url, currentSessionId, () =>
+        this.spawnUrlPlayback(url, this.seekOffset, currentSessionId, options));
+      return;
+    }
+    this.spawnUrlPlayback(url, seekSeconds, currentSessionId, options);
+  }
+
+  private spawnUrlPlayback(url: string, seekSeconds: number, currentSessionId: number, options: FfmpegInputOptions): void {
+    const args = buildFfmpegArgs(url, seekSeconds, { ...options, trackGainDb: this.trackGainDb });
 
     const ffmpegBin = getFfmpegCommand();
     this.ffmpeg = spawn(ffmpegBin, args, { stdio: ["ignore", "pipe", "pipe"] });
@@ -848,7 +880,12 @@ export class AudioPlayer extends EventEmitter {
         this.emit("error", new Error(`PowerShell download exited ${code}`));
         return;
       }
-      this.spawnFfmpegFromFile(tempFile, seekSeconds, sessionId);
+      if (this.trackAnalysisRequired) {
+        void this.prepareTrackLoudness(tempFile, sessionId, () =>
+          this.spawnFfmpegFromFile(tempFile, this.seekOffset, sessionId));
+      } else {
+        this.spawnFfmpegFromFile(tempFile, seekSeconds, sessionId);
+      }
     });
 
     ps.on("close", (code, signal) => {
@@ -884,7 +921,7 @@ export class AudioPlayer extends EventEmitter {
       return;
     }
 
-    const args = buildFfmpegArgs(tempFile, seekSeconds);
+    const args = buildFfmpegArgs(tempFile, seekSeconds, { trackGainDb: this.trackGainDb });
     const ffmpegBin = getFfmpegCommand();
     this.ffmpeg = spawn(ffmpegBin, args, { stdio: ["ignore", "pipe", "pipe"] });
     const child = this.ffmpeg;
@@ -962,6 +999,7 @@ export class AudioPlayer extends EventEmitter {
 
     const currentSessionId = this.sessionId;
     this.externalMode = true;
+    this.normalizationStatus = { state: "unavailable", gainDb: 0 };
     this.externalStream = readable;
     this.onExternalEnd = opts.onExternalEnd ?? null;
     // Leave this.ffmpeg = null; clear currentUrl so seek() cannot respawn ffmpeg.
@@ -1051,6 +1089,10 @@ export class AudioPlayer extends EventEmitter {
   stop(): void {
     // 3. 递增 ID 是最有效的逻辑“隔离墙”
     this.sessionId++; 
+    this.loudnessAbort?.abort();
+    this.loudnessAbort = null;
+    this.trackGainDb = 0;
+    this.normalizationStatus = { state: "disabled", gainDb: 0 };
     this.frameLoopRunning = false;
     
     // 立即清空缓冲区，确保切歌瞬间静音 （
@@ -1216,7 +1258,7 @@ export class AudioPlayer extends EventEmitter {
 
       // R3-4: likewise gated on state==="playing" — a drained/EOF'd stream must
       // not emit trackEnd while paused; end-detection resumes on resume().
-      if (this.state === "playing" && !this.externalMode && !this.ffmpeg && this.pcmBuffer.length < PCM_FRAME_BYTES) {
+      if (this.state === "playing" && !this.externalMode && !this.ffmpeg && !this.loudnessAbort && !this.downloader && this.pcmBuffer.length < PCM_FRAME_BYTES) {
         this.frameLoopRunning = false;
         // Outer gate guarantees state==="playing"; end directly (no !=="idle" guard).
         this.state = "idle";
@@ -1406,14 +1448,53 @@ export class AudioPlayer extends EventEmitter {
     // transport is delegated to the SpotifyController by the caller (Task 7).
     if (this.externalMode) return;
     if (this.currentUrl && Number.isFinite(seconds) && seconds >= 0) {
-      this.play(this.currentUrl, seconds, this.currentSongDuration);
+      if (this.normalizationStatus.state === "analyzing") {
+        this.seekOffset = seconds;
+        return;
+      }
+      this.resumeTrack(this.currentUrl, seconds, this.currentSongDuration);
     }
+  }
+  /** Resume the same track after a seek or refreshed CDN URL without changing its gain. */
+  resumeTrack(url: string, seconds: number, duration: number): void {
+    const status = this.getLoudnessNormalization();
+    this.play(url, seconds, duration, { trackGainDb: this.trackGainDb });
+    this.normalizationStatus = status;
   }
   pause(): void { if (this.state === "playing") this.state = "paused"; }
   resume(): void { if (this.state === "paused") { this.state = "playing"; this.nextFrameTime = performance.now(); } }
   resetFailures(): void { this.consecutiveFailures = 0; }
   setVolume(vol: number): void { this.volume = Math.max(0, Math.min(100, vol)); }
   getVolume(): number { return this.volume; }
+  setLoudnessNormalization(settings: LoudnessNormalizationConfig): void {
+    // Changing the setting applies to the next track, never to a playing song.
+    this.loudnessSettings = { ...settings };
+  }
+  getLoudnessNormalization(): TrackNormalizationStatus { return { ...this.normalizationStatus }; }
+
+  private async prepareTrackLoudness(input: string, sessionId: number, start: () => void): Promise<void> {
+    const controller = new AbortController();
+    this.loudnessAbort = controller;
+    this.normalizationStatus = { state: "analyzing", gainDb: 0 };
+    try {
+      const measured = await this.analyzeTrackLoudness(input, controller.signal);
+      if (controller.signal.aborted || this.sessionId !== sessionId) return;
+      this.trackGainDb = calculateTrackGainDb(measured, this.currentLoudnessSettings.targetLufs);
+      this.normalizationStatus = {
+        state: "applied", gainDb: this.trackGainDb,
+        ...(Number.isFinite(measured.integratedLufs) ? measured : {}),
+      };
+    } catch {
+      if (controller.signal.aborted || this.sessionId !== sessionId) return;
+      this.normalizationStatus = { state: "failed", gainDb: 0 };
+      this.logger.warn("Track loudness analysis failed; playing at original track gain");
+    }
+    if (this.loudnessAbort === controller) this.loudnessAbort = null;
+    if (controller.signal.aborted || this.sessionId !== sessionId) return;
+    const paused = this.state === "paused";
+    start();
+    if (paused) this.state = "paused";
+  }
   /** Set the temporary voice-ducking gain (0=silent, 1=unchanged). */
   setDuckingGain(gain: number, rampMs = 0): void {
     if (!Number.isFinite(gain)) return;
