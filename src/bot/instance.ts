@@ -49,6 +49,7 @@ import { SpotifyController } from "../music/spotify/controller.js";
 import type { SpotifyTrackEndedEvent } from "../music/spotify/backend.js";
 import type { SpotifyOAuth } from "../music/spotify/spotify-oauth.js";
 import { VoiceDuckingController } from "./voice-ducking.js";
+import { WebVoiceTransmitGate } from "./web-voice-transmit.js";
 import {
   ManagedVoiceClientRegistry,
   type ManagedVoiceClientKind,
@@ -185,6 +186,7 @@ export class BotInstance extends EventEmitter {
    *  bot (see setWebVoiceActive). Voice-bridge bots trigger ducking on music
    *  bots and never duck themselves. */
   private webVoiceBridge = false;
+  private readonly webVoiceTransmit = new WebVoiceTransmitGate();
   private spotifyController: SpotifyController;
   private queue: PlayQueue;
   private neteaseProvider: MusicProvider;
@@ -338,15 +340,21 @@ export class BotInstance extends EventEmitter {
 
   private setupPlayerEvents(): void {
     this.player.on("frame", (opusFrame: Buffer, metadata: PlayerFrameMetadata) => {
-      this.tsClient.sendVoiceData(opusFrame);
-      if (metadata.mode !== "realtime") return;
+      // Music bots react to received TS voice packets, including encoded silence.
+      // Gate only browser microphone bridges; media playback remains continuous.
+      const transmit = !this.webVoiceBridge || metadata?.mode !== "realtime"
+        || this.webVoiceTransmit.accept(metadata.voiced);
+      if (transmit) this.tsClient.sendVoiceData(opusFrame);
+      if (metadata?.mode !== "realtime") return;
 
+      const lastSentAt = this.liveVoiceTelemetry.lastFrameSentAt;
       const update = updateRealtimeVoiceTelemetry(this.liveVoiceTelemetry, {
         voiced: metadata.voiced,
         bufferedMs: metadata.diagnostics.bufferedMs,
         sentAt: Date.now(),
       });
       this.liveVoiceTelemetry = update.state;
+      if (!transmit) this.liveVoiceTelemetry.lastFrameSentAt = lastSentAt;
       if (update.speechStarted) {
         this.logger.info({
           sentAt: update.state.lastSpeechStartedAt,
@@ -2057,6 +2065,7 @@ export class BotInstance extends EventEmitter {
   }
 
   resetLiveVoiceTelemetry(): void {
+    this.webVoiceTransmit.reset();
     this.liveVoiceTelemetry = createRealtimeVoiceTelemetry();
   }
 
@@ -2093,6 +2102,7 @@ export class BotInstance extends EventEmitter {
    *  link, and reclassify this connection: while active the bot relays a live
    *  human microphone (voice-bridge) instead of playing music. */
   async setWebVoiceActive(active: boolean): Promise<void> {
+    this.webVoiceTransmit?.reset();
     this.webVoiceBridge = active;
     this.updateManagedVoiceClientKind(active ? "voice-bridge" : "music");
     // Ducking already in progress on this bot's output would now attenuate
