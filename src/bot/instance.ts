@@ -569,7 +569,7 @@ export class BotInstance extends EventEmitter {
       // While bridging a web caller this bot's output IS that person's voice;
       // ducking it would attenuate them mid-sentence.
       if (this.webVoiceBridge) return;
-      this.voiceDucking.handleVoiceActivity(activity.clientId);
+      this.voiceDucking.handleVoiceActivity(activity.clientId, activity.data, activity.codec);
     });
 
     // React near-instantly to channel membership changes. The 30s idle
