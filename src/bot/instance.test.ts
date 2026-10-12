@@ -231,7 +231,7 @@ describe("BotInstance voice-ducking lifecycle integration", () => {
     });
 
     expect(handleVoiceActivity).toHaveBeenCalledOnce();
-    expect(handleVoiceActivity).toHaveBeenCalledWith(21);
+    expect(handleVoiceActivity).toHaveBeenCalledWith(21, undefined, 5);
   });
 
   it("lets a voice-bridge bot's relayed speech duck a music bot", () => {
@@ -273,7 +273,7 @@ describe("BotInstance voice-ducking lifecycle integration", () => {
     });
 
     expect(handleVoiceActivity).toHaveBeenCalledOnce();
-    expect(handleVoiceActivity).toHaveBeenCalledWith(25);
+    expect(handleVoiceActivity).toHaveBeenCalledWith(25, undefined, 5);
   });
 
   it("never ducks a bot that is currently bridging a web caller", () => {

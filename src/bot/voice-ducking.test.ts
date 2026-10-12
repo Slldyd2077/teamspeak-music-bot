@@ -1,4 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
+vi.mock('@discordjs/opus', () => ({ default: { OpusEncoder: class {
+  decode(data: Buffer) { const pcm = Buffer.alloc(256); pcm.fill(data[0] === 0 ? 0 : 16); return pcm; }
+} } }));
 import { VoiceDuckingController } from "./voice-ducking.js";
 
 function makeHarness(
@@ -31,7 +34,7 @@ describe("VoiceDuckingController", () => {
     vi.useFakeTimers();
     const { controller, setDuckingGain, advance } = makeHarness(false);
 
-    controller.handleVoiceActivity(12);
+    controller.handleVoiceActivity(12, Buffer.from([1]), 5);
     advance(1_000);
 
     expect(setDuckingGain).not.toHaveBeenCalled();
@@ -43,11 +46,11 @@ describe("VoiceDuckingController", () => {
     vi.useFakeTimers();
     const { controller, setDuckingGain, advance } = makeHarness();
 
-    controller.handleVoiceActivity(12);
+    controller.handleVoiceActivity(12, Buffer.from([1]), 5);
     expect(setDuckingGain).toHaveBeenCalledWith(0.3, 50);
 
     advance(60);
-    controller.handleVoiceActivity(12);
+    controller.handleVoiceActivity(12, Buffer.from([1]), 5);
     expect(setDuckingGain).toHaveBeenCalledTimes(1);
 
     // The original t=100 sweep observes the refreshed t=160 deadline.
@@ -64,9 +67,9 @@ describe("VoiceDuckingController", () => {
     vi.useFakeTimers();
     const { controller, setDuckingGain, advance } = makeHarness();
 
-    controller.handleVoiceActivity(1);
+    controller.handleVoiceActivity(1, Buffer.from([1]), 5);
     advance(50);
-    controller.handleVoiceActivity(2);
+    controller.handleVoiceActivity(2, Buffer.from([1]), 5);
     advance(50);
 
     expect(controller.activeSpeakerCount()).toBe(1);
@@ -82,8 +85,8 @@ describe("VoiceDuckingController", () => {
     vi.useFakeTimers();
     const { controller, setDuckingGain } = makeHarness();
 
-    controller.handleVoiceActivity(1);
-    controller.handleVoiceActivity(2);
+    controller.handleVoiceActivity(1, Buffer.from([1]), 5);
+    controller.handleVoiceActivity(2, Buffer.from([1]), 5);
     controller.removeSpeaker(1);
     expect(controller.isDucking()).toBe(true);
     expect(controller.activeSpeakerCount()).toBe(1);
@@ -97,7 +100,7 @@ describe("VoiceDuckingController", () => {
     vi.useFakeTimers();
     const { controller, setDuckingGain } = makeHarness();
 
-    controller.handleVoiceActivity(7);
+    controller.handleVoiceActivity(7, Buffer.from([1]), 5);
     controller.updateSettings({ enabled: true, volumePercent: 45 });
     expect(setDuckingGain).toHaveBeenLastCalledWith(0.45, 50);
 
@@ -111,12 +114,12 @@ describe("VoiceDuckingController", () => {
     vi.useFakeTimers();
     const { controller, setDuckingGain, advance } = makeHarness();
 
-    controller.handleVoiceActivity(7);
+    controller.handleVoiceActivity(7, Buffer.from([1]), 5);
     advance(100);
     expect(setDuckingGain).toHaveBeenLastCalledWith(1, 200);
 
     advance(50);
-    controller.handleVoiceActivity(7);
+    controller.handleVoiceActivity(7, Buffer.from([1]), 5);
     expect(controller.isDucking()).toBe(true);
     expect(setDuckingGain).toHaveBeenLastCalledWith(0.3, 50);
   });
@@ -125,7 +128,7 @@ describe("VoiceDuckingController", () => {
     vi.useFakeTimers();
     const { controller, setDuckingGain, advance } = makeHarness();
 
-    controller.handleVoiceActivity(8);
+    controller.handleVoiceActivity(8, Buffer.from([1]), 5);
     controller.reset(true);
     const callsAfterReset = setDuckingGain.mock.calls.length;
     advance(1_000);
@@ -139,11 +142,11 @@ describe("VoiceDuckingController", () => {
     const { controller, setDuckingGain } = makeHarness();
 
     for (const id of [0, -1, 1.5, Number.NaN]) {
-      controller.handleVoiceActivity(id);
+      controller.handleVoiceActivity(id, Buffer.from([1]), 5);
     }
     expect(setDuckingGain).not.toHaveBeenCalled();
 
-    controller.handleVoiceActivity(8);
+    controller.handleVoiceActivity(8, Buffer.from([1]), 5);
     controller.reset(true);
     expect(controller.isDucking()).toBe(false);
     expect(controller.activeSpeakerCount()).toBe(0);

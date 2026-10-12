@@ -1,3 +1,11 @@
+import opus from '@discordjs/opus';
+import type { OpusEncoder as OpusDecoder } from '@discordjs/opus';
+const { OpusEncoder } = opus;
+
+// Match frontend voice-player-worklet.js, measured before playback gain.
+export const SPEAKING_START_RMS = 0.0032;
+export const SPEAKING_KEEP_RMS = 0.002;
+
 export interface VoiceDuckingSettings {
   enabled: boolean;
   volumePercent: number;
@@ -15,7 +23,7 @@ export interface VoiceDuckingTiming {
 
 export const DEFAULT_VOICE_DUCKING_TIMING: Readonly<VoiceDuckingTiming> = {
   attackMs: 50,
-  holdMs: 700,
+  holdMs: 180,
   releaseMs: 500,
 };
 
@@ -58,6 +66,7 @@ export class VoiceDuckingController {
   private timerDueAt = Number.POSITIVE_INFINITY;
   private timerGeneration = 0;
   private ducking = false;
+  private readonly decoders = new Map<number, { codec: number; decoder: OpusDecoder; lastSeen: number }>();
 
   constructor(
     private readonly target: VoiceDuckingGainTarget,
@@ -73,10 +82,41 @@ export class VoiceDuckingController {
     this.now = options.now ?? (() => performance.now());
   }
 
-  handleVoiceActivity(clientId: number): void {
+  handleVoiceActivity(clientId: number, data: Buffer, codec: number): void {
     if (!this.settings.enabled || !Number.isInteger(clientId) || clientId <= 0) return;
 
     const now = this.now();
+    // Packet presence is not speech: continuous silence must never refresh ducking.
+    if (!data?.length || (codec !== 4 && codec !== 5)) return;
+    for (const [id, state] of this.decoders) {
+      if (now - state.lastSeen > 5000) this.decoders.delete(id);
+    }
+    let state = this.decoders.get(clientId);
+    if (!state || state.codec !== codec) {
+      state = { codec, decoder: new OpusEncoder(48000, codec === 5 ? 2 : 1), lastSeen: now };
+      this.decoders.set(clientId, state);
+    }
+    state.lastSeen = now;
+    let pcm: Buffer;
+    try { pcm = state.decoder.decode(data); }
+    catch { this.decoders.delete(clientId); return; }
+    const threshold = (this.activeUntil.get(clientId) ?? -Infinity) > now
+      ? SPEAKING_KEEP_RMS : SPEAKING_START_RMS;
+    // Match the page's 128-frame AudioWorklet measurement windows.
+    const windowBytes = 128 * (codec === 5 ? 2 : 1) * 2;
+    let aboveThreshold = false;
+    for (let start = 0; start < pcm.length; start += windowBytes) {
+      const end = Math.min(pcm.length, start + windowBytes);
+      let energy = 0;
+      let count = 0;
+      for (let offset = start; offset + 1 < end; offset += 2) {
+        const sample = pcm.readInt16LE(offset) / 32768;
+        energy += sample * sample;
+        count++;
+      }
+      if (count && Math.sqrt(energy / count) >= threshold) aboveThreshold = true;
+    }
+    if (!aboveThreshold) return;
     this.activeUntil.set(clientId, now + this.timing.holdMs);
 
     if (!this.ducking) {
@@ -88,6 +128,7 @@ export class VoiceDuckingController {
   }
 
   removeSpeaker(clientId: number): void {
+    this.decoders.delete(clientId);
     if (!this.activeUntil.delete(clientId)) return;
     if (this.activeUntil.size === 0) {
       this.cancelTimer();
@@ -100,6 +141,7 @@ export class VoiceDuckingController {
     this.settings = normalizeSettings(settings);
 
     if (!this.settings.enabled) {
+      this.decoders.clear();
       this.activeUntil.clear();
       this.cancelTimer();
       this.release();
@@ -117,6 +159,7 @@ export class VoiceDuckingController {
   /** Clear all activity. Disconnects use an immediate reset; disabling the
    * feature uses updateSettings(), which returns smoothly over releaseMs. */
   reset(immediate = true): void {
+    this.decoders.clear();
     this.activeUntil.clear();
     this.cancelTimer();
     this.ducking = false;

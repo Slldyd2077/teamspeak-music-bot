@@ -78,9 +78,9 @@ export interface TS3VoiceFrame {
   data: Buffer;
 }
 
-/** Lightweight voice-packet signal used for activity detection. The encoded
- * payload is intentionally not forwarded beyond this protocol wrapper. */
+/** Voice packet signal; payload permits PCM-based speech detection. */
 export interface TS3VoiceActivity {
+  data: Buffer;
   clientId: number;
   codec: number;
   /** Stable TeamSpeak identity when the sender is present in the client view. */
@@ -271,6 +271,7 @@ export class TS3Client extends EventEmitter {
       if (voice.clientId === this.clientId) return;
       const clientUid = this.visibleClientUids.get(voice.clientId);
       const activity: TS3VoiceActivity = {
+        data: Buffer.from(voice.data),
         clientId: voice.clientId,
         codec: voice.codec,
         ...(clientUid ? { clientUid } : {}),

@@ -433,6 +433,8 @@ export class AudioPlayer extends EventEmitter {
   private loudnessAbort: AbortController | null = null;
   private trackAnalysisRequired = false;
   private trackGainDb = 0;
+  // Advance the one-time dB ramp only as music PCM is consumed, not while paused.
+  private trackGainRampElapsedMs = 5000;
   private normalizationStatus: TrackNormalizationStatus = { state: "disabled", gainDb: 0 };
   private ffmpeg: ChildProcess | null = null;
   private encoder: Encoder;
@@ -560,16 +562,17 @@ export class AudioPlayer extends EventEmitter {
     }
 
     if (this.trackAnalysisRequired) {
-      this.state = "playing";
-      void this.prepareTrackLoudness(url, currentSessionId, () =>
-        this.spawnUrlPlayback(url, this.seekOffset, currentSessionId, options));
+      this.spawnUrlPlayback(url, seekSeconds, currentSessionId, options);
+      void this.prepareTrackLoudness(url);
       return;
     }
     this.spawnUrlPlayback(url, seekSeconds, currentSessionId, options);
   }
 
   private spawnUrlPlayback(url: string, seekSeconds: number, currentSessionId: number, options: FfmpegInputOptions): void {
-    const args = buildFfmpegArgs(url, seekSeconds, { ...options, trackGainDb: this.trackGainDb });
+    // Track gain is applied to outgoing music PCM so analysis never restarts decoding.
+    const { trackGainDb: _trackGainDb, ...inputOptions } = options;
+    const args = buildFfmpegArgs(url, seekSeconds, inputOptions);
 
     const ffmpegBin = getFfmpegCommand();
     this.ffmpeg = spawn(ffmpegBin, args, { stdio: ["ignore", "pipe", "pipe"] });
@@ -836,8 +839,8 @@ export class AudioPlayer extends EventEmitter {
         return;
       }
       if (this.trackAnalysisRequired) {
-        void this.prepareTrackLoudness(tempFile, sessionId, () =>
-          this.spawnFfmpegFromFile(tempFile, this.seekOffset, sessionId));
+        this.spawnFfmpegFromFile(tempFile, this.seekOffset, sessionId);
+        void this.prepareTrackLoudness(tempFile);
       } else {
         this.spawnFfmpegFromFile(tempFile, seekSeconds, sessionId);
       }
@@ -870,7 +873,7 @@ export class AudioPlayer extends EventEmitter {
       return;
     }
 
-    const args = buildFfmpegArgs(tempFile, seekSeconds, { trackGainDb: this.trackGainDb });
+    const args = buildFfmpegArgs(tempFile, seekSeconds);
     const ffmpegBin = getFfmpegCommand();
     this.ffmpeg = spawn(ffmpegBin, args, { stdio: ["ignore", "pipe", "pipe"] });
 
@@ -1030,6 +1033,7 @@ export class AudioPlayer extends EventEmitter {
     this.loudnessAbort?.abort();
     this.loudnessAbort = null;
     this.trackGainDb = 0;
+    this.trackGainRampElapsedMs = 5000;
     this.normalizationStatus = { state: "disabled", gainDb: 0 };
     this.frameLoopRunning = false;
     
@@ -1178,6 +1182,8 @@ export class AudioPlayer extends EventEmitter {
             }
           }
           this.consecutiveFailures = 0;
+          this.loudnessAbort?.abort();
+          this.loudnessAbort = null;
           this.emit("trackEnd");
           return;
         }
@@ -1188,10 +1194,12 @@ export class AudioPlayer extends EventEmitter {
 
       // R3-4: likewise gated on state==="playing" — a drained/EOF'd stream must
       // not emit trackEnd while paused; end-detection resumes on resume().
-      if (this.state === "playing" && !this.externalMode && !this.ffmpeg && !this.loudnessAbort && !this.downloader && this.pcmBuffer.length < PCM_FRAME_BYTES) {
+      if (this.state === "playing" && !this.externalMode && !this.ffmpeg && !this.downloader && this.pcmBuffer.length < PCM_FRAME_BYTES) {
         this.frameLoopRunning = false;
         // Outer gate guarantees state==="playing"; end directly (no !=="idle" guard).
         this.state = "idle";
+        this.loudnessAbort?.abort();
+        this.loudnessAbort = null;
         if (!this.spawnFailed) {
           this.consecutiveFailures = 0;
           this.emit("trackEnd");
@@ -1242,6 +1250,7 @@ export class AudioPlayer extends EventEmitter {
       const adjustedPrimary = this.applyVolume(
         primaryFrame ?? Buffer.alloc(PCM_FRAME_BYTES),
         volumeAt,
+        this.playbackMode === "media",
       );
       const adjustedEffect = effectFrame
         ? this.applyVolume(effectFrame, volumeAt)
@@ -1263,6 +1272,7 @@ export class AudioPlayer extends EventEmitter {
         this.framesPlayed++;
       }
       if (primaryFrame) {
+        this.trackGainRampElapsedMs = Math.min(5000, this.trackGainRampElapsedMs + FRAME_DURATION_MS);
         this.healthyFrames++;
         if (this.healthyFrames >= AudioPlayer.HEALTHY_FRAME_RESET) {
           this.consecutiveFailures = 0;
@@ -1310,14 +1320,17 @@ export class AudioPlayer extends EventEmitter {
     }
   }
 
-  private applyVolume(pcm: Buffer, now = performance.now()): Buffer {
+  private applyVolume(pcm: Buffer, now = performance.now(), normalizeTrack = false): Buffer {
     const baseFactor = volumeToFactor(this.volume);
     const startDuckingGain = this.duckingGainAt(now);
     const endDuckingGain = this.duckingGainAt(now + FRAME_DURATION_MS);
-    const startFactor = baseFactor * startDuckingGain;
-    const endFactor = baseFactor * endDuckingGain;
+    const trackFactor = (offset: number) => normalizeTrack
+      ? 10 ** (this.trackGainDb * Math.min(1, (this.trackGainRampElapsedMs + offset) / 5000) / 20)
+      : 1;
+    const startFactor = baseFactor * startDuckingGain * trackFactor(0);
+    const endFactor = baseFactor * endDuckingGain * trackFactor(FRAME_DURATION_MS);
 
-    if (startFactor >= 1 && endFactor >= 1) {
+    if (startFactor === 1 && endFactor === 1) {
       return Buffer.from(pcm);
     }
 
@@ -1378,7 +1391,7 @@ export class AudioPlayer extends EventEmitter {
     // transport is delegated to the SpotifyController by the caller (Task 7).
     if (this.externalMode) return;
     if (this.currentUrl && Number.isFinite(seconds) && seconds >= 0) {
-      if (this.normalizationStatus.state === "analyzing") {
+      if (this.downloader && !this.ffmpeg) {
         this.seekOffset = seconds;
         return;
       }
@@ -1388,8 +1401,19 @@ export class AudioPlayer extends EventEmitter {
   /** Resume the same track after a seek or refreshed CDN URL without changing its gain. */
   resumeTrack(url: string, seconds: number, duration: number): void {
     const status = this.getLoudnessNormalization();
+    const controller = this.loudnessAbort;
+    const rampElapsedMs = this.trackGainRampElapsedMs;
+    const settings = this.currentLoudnessSettings;
+    const paused = this.state === "paused";
+    // Preserve this track's background scan across a decoder restart. stop() still
+    // cancels it on a real stop or track change; controller identity fences results.
+    this.loudnessAbort = null;
     this.play(url, seconds, duration, { trackGainDb: this.trackGainDb });
+    this.loudnessAbort = controller;
+    this.trackGainRampElapsedMs = rampElapsedMs;
+    this.currentLoudnessSettings = settings;
     this.normalizationStatus = status;
+    if (paused) this.state = "paused";
   }
   pause(): void { if (this.state === "playing") this.state = "paused"; }
   resume(): void { if (this.state === "paused") { this.state = "playing"; this.nextFrameTime = performance.now(); } }
@@ -1402,28 +1426,25 @@ export class AudioPlayer extends EventEmitter {
   }
   getLoudnessNormalization(): TrackNormalizationStatus { return { ...this.normalizationStatus }; }
 
-  private async prepareTrackLoudness(input: string, sessionId: number, start: () => void): Promise<void> {
+  private async prepareTrackLoudness(input: string): Promise<void> {
     const controller = new AbortController();
     this.loudnessAbort = controller;
     this.normalizationStatus = { state: "analyzing", gainDb: 0 };
     try {
       const measured = await this.analyzeTrackLoudness(input, controller.signal);
-      if (controller.signal.aborted || this.sessionId !== sessionId) return;
+      if (controller.signal.aborted || this.loudnessAbort !== controller) return;
       this.trackGainDb = calculateTrackGainDb(measured, this.currentLoudnessSettings.targetLufs);
+      this.trackGainRampElapsedMs = 0;
       this.normalizationStatus = {
         state: "applied", gainDb: this.trackGainDb,
         ...(Number.isFinite(measured.integratedLufs) ? measured : {}),
       };
     } catch {
-      if (controller.signal.aborted || this.sessionId !== sessionId) return;
+      if (controller.signal.aborted || this.loudnessAbort !== controller) return;
       this.normalizationStatus = { state: "failed", gainDb: 0 };
       this.logger.warn("Track loudness analysis failed; playing at original track gain");
     }
     if (this.loudnessAbort === controller) this.loudnessAbort = null;
-    if (controller.signal.aborted || this.sessionId !== sessionId) return;
-    const paused = this.state === "paused";
-    start();
-    if (paused) this.state = "paused";
   }
   /** Set the temporary voice-ducking gain (0=silent, 1=unchanged). */
   setDuckingGain(gain: number, rampMs = 0): void {
