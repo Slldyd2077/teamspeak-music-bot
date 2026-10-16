@@ -104,7 +104,7 @@ FFmpeg **已自动内置**，无需手动安装。
 
 ```bash
 # 下载项目
-git clone --branch merge/upstream-v1.12 --single-branch https://github.com/Slldyd2077/teamspeak-music-bot.git
+git clone --branch main --single-branch https://github.com/Slldyd2077/teamspeak-music-bot.git
 cd teamspeak-music-bot
 
 # 安装依赖
@@ -125,9 +125,9 @@ npm start
 所有依赖已内置（Node.js、FFmpeg、Opus 编码器），无需安装任何额外软件。
 
 ```bash
-git clone --branch merge/upstream-v1.12 --single-branch https://github.com/Slldyd2077/teamspeak-music-bot.git
+git clone --branch main --single-branch https://github.com/Slldyd2077/teamspeak-music-bot.git
 cd teamspeak-music-bot/scripts/docker
-docker-compose up -d
+docker compose pull && docker compose up -d
 ```
 
 打开浏览器访问 **http://localhost:3000**
@@ -135,7 +135,9 @@ docker-compose up -d
 <details>
 <summary>Docker 详细说明</summary>
 
-- 首次构建需要几分钟（编译原生模块）
+- 默认拉取本 fork 的预构建镜像 `ghcr.io/slldyd2077/teamspeak-music-bot:latest`（amd64 / arm64），无需本地编译
+- 更新时先 `git pull` 获取新的 Compose，再执行 `docker compose pull && docker compose up -d`；只执行 `up -d` 不会拉取新镜像
+- 固定版本可改用 `:1.12.3`；镜像包含 per-bot 账号隔离、网页双向语音、语音闪避、入场音效及后台逐曲响度均衡
 - 默认使用 `host` 网络模式，机器人可直接连接局域网 TS3 服务器
 - 数据持久化在 Docker 命名卷 `tsmusicbot-data` 中（数据库、Cookie、日志）
 - 内置健康检查（`/api/health`），支持 Docker 自动重启
@@ -143,7 +145,7 @@ docker-compose up -d
 ```bash
 docker logs -f tsmusicbot          # 查看日志
 docker-compose down                # 停止
-docker-compose up -d --build       # 代码更新后重新构建
+docker compose pull && docker compose up -d       # 代码更新后重新构建
 ```
 
 如果 TS3 服务器在其他机器上，编辑 `docker-compose.yml`：
@@ -325,7 +327,7 @@ cd scripts/docker
 git pull
 
 # 重新构建并启动（数据自动保留）
-docker-compose up -d --build
+docker compose pull && docker compose up -d
 ```
 
 > 数据（数据库、Cookie、日志）保存在 Docker 命名卷 `tsmusicbot-data` 中，更新不会丢失。
@@ -944,7 +946,7 @@ A：B站搜索需要 buvid3 匿名 Cookie（程序启动时自动获取）。如
 A：YouTube 是可选音源，需要手动安装 `yt-dlp`。详见 [可选：YouTube 音源](#可选youtube-音源) 章节。快速验证：在项目根目录执行 `bin/yt-dlp --version`（或系统 `yt-dlp --version`），能打印版本号即可。若 yt-dlp 已安装但仍搜索失败，通常是网络/地域问题或 yt-dlp 版本过旧（执行 `yt-dlp -U` 升级）。
 
 **Q：如何更新到新版本？**
-A：`git pull` 拉取最新代码，然后 `npm install && npm run build && npm start` 重新构建启动。Docker 用户执行 `docker-compose up -d --build`。
+A：`git pull` 拉取最新代码，然后 `npm install && npm run build && npm start` 重新构建启动。Docker 用户执行 `docker compose pull && docker compose up -d`。
 
 **Q：忘记管理员密码怎么办？**
 A：直接操作 SQLite 数据库。最简单的办法是清空 `users` 表然后重新进入 first-run 流程：`sqlite3 data/tsmusicbot.db "DELETE FROM users; DELETE FROM sessions;"`，重启后浏览器会自动跳转 `/first-run` 让你重新创建管理员。详细方法见 [从 WebUI 无鉴权版本升级](#从-webui-无鉴权版本升级重要)。
