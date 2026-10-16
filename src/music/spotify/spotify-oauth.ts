@@ -1,0 +1,298 @@
+import axios, { type AxiosInstance } from "axios";
+import { createHash, randomBytes } from "node:crypto";
+import {
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  renameSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
+import { dirname } from "node:path";
+
+/**
+ * Player-control scopes requested for the USER token: streaming (drives
+ * librespot as a Connect device) + read/modify playback + currently-playing +
+ * private-playlist reads.
+ */
+export const SPOTIFY_CONTROL_SCOPES =
+  "streaming user-read-playback-state user-modify-playback-state user-read-currently-playing playlist-read-private";
+
+const ACCOUNTS_BASE = "https://accounts.spotify.com";
+// Hand a token back only if it survives ~30s, matching webapi.ts's skew.
+const EXPIRY_SKEW_MS = 30_000;
+// RFC 7636 §4.1 unreserved set: [A-Za-z0-9-._~].
+const PKCE_CHARS =
+  "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~";
+const FORM_HEADERS = { "Content-Type": "application/x-www-form-urlencoded" };
+
+export interface OAuthTokens {
+  accessToken: string;
+  refreshToken: string;
+  expiresAt: number;
+  scope: string;
+}
+
+export interface OAuthTokenStore {
+  load(): OAuthTokens | null;
+  save(t: OAuthTokens): void;
+  clear(): void;
+}
+
+export interface SpotifyOAuthOptions {
+  /**
+   * Correction C3.2: the caller's OWN Spotify Developer app client_id. There is
+   * no librespot-public-client fallback — an empty clientId disables OAuth.
+   */
+  clientId?: string;
+  /**
+   * Loopback redirect registered on the caller's Spotify app, supplied by the
+   * bot's web layer (e.g. its `/api/spotify/callback`). Must exactly match the
+   * value used at both the authorize and token steps.
+   */
+  redirectUri?: string;
+  store: OAuthTokenStore;
+  deps?: { http?: AxiosInstance; now?: () => number };
+}
+
+/** 64 random chars from the PKCE unreserved set (43-128 allowed by the spec). */
+export function generateCodeVerifier(): string {
+  const bytes = randomBytes(64);
+  let out = "";
+  for (let i = 0; i < 64; i++) out += PKCE_CHARS[bytes[i] % PKCE_CHARS.length];
+  return out;
+}
+
+/** base64url(SHA256(verifier)) with no padding — the S256 code challenge. */
+export function codeChallengeS256(verifier: string): string {
+  return createHash("sha256").update(verifier).digest("base64url");
+}
+
+/** Persist OAuth tokens as a 0600 JSON file (used by the controller). */
+export function createFileOAuthTokenStore(filePath: string): OAuthTokenStore {
+  return {
+    load() {
+      try {
+        if (!existsSync(filePath)) return null;
+        const parsed = JSON.parse(readFileSync(filePath, "utf8"));
+        return parsed?.refreshToken ? (parsed as OAuthTokens) : null;
+      } catch {
+        return null; // missing/corrupt -> treat as unauthorized
+      }
+    },
+    save(t: OAuthTokens) {
+      mkdirSync(dirname(filePath), { recursive: true });
+      // Atomic write: serialize to a sibling temp file in the SAME directory,
+      // then rename it onto the final path. rename is an atomic replace on POSIX
+      // and modern Windows, so a crash / power loss / ENOSPC mid-write can never
+      // leave the token file truncated — a reader always sees either the previous
+      // file or the fully-written new one, never a partial. This matters because
+      // refresh() persists a ROTATED refresh token here: Spotify invalidates the
+      // OLD one the instant it responds, so a torn write would silently
+      // de-authenticate the operator (next load() JSON.parse-fails -> null ->
+      // full PKCE re-login). Mirrors config.ts saveConfig. The temp lives in the
+      // same dir so the rename stays on one filesystem; pid + timestamp keep
+      // concurrent writers from colliding on the temp name. 0600 is preserved.
+      const tmp = `${filePath}.${process.pid}.${Date.now()}.tmp`;
+      try {
+        writeFileSync(tmp, JSON.stringify(t, null, 2), { mode: 0o600 });
+        renameSync(tmp, filePath);
+      } catch (err) {
+        // Never leave a partial temp file behind on failure.
+        try {
+          rmSync(tmp, { force: true });
+        } catch {
+          /* best-effort cleanup */
+        }
+        throw err;
+      }
+    },
+    clear() {
+      try {
+        rmSync(filePath, { force: true });
+      } catch {
+        /* already gone */
+      }
+    },
+  };
+}
+
+/**
+ * Authorization Code + PKCE flow for the USER player-control token. Public
+ * client (no secret).
+ *
+ * Correction C3.2: this REQUIRES the operator's own registered Spotify app —
+ * there is NO reuse of librespot's first-party keymaster client / fixed
+ * :5588 redirect. Without a clientId, `isAuthorized()` is false and
+ * `buildAuthorizeUrl()` throws.
+ *
+ * Refresh rotates the refresh token, so the newest is always persisted;
+ * invalid_grant clears the store (re-login required). Access/refresh tokens
+ * are never logged.
+ */
+export class SpotifyOAuth {
+  private clientId: string;
+  private redirectUri: string;
+  private store: OAuthTokenStore;
+  private http: AxiosInstance;
+  // Injectable clock (tests drive a mutable now); defaults to Date.now.
+  private now: () => number;
+  // Pending PKCE verifiers keyed by state, awaiting the loopback redirect back.
+  private pendingVerifiers = new Map<
+    string,
+    { verifier: string; expiresAt: number }
+  >();
+  // A verifier is abandoned if the redirect never returns; drop it after TTL and
+  // cap the map so parallel logins can't grow it without bound.
+  private static readonly VERIFIER_TTL_MS = 10 * 60 * 1000;
+  private static readonly VERIFIER_MAX = 32;
+  // Collapse concurrent refreshes into one POST (rotation invalidates the token
+  // a second in-flight refresh would send); cleared in .finally().
+  private refreshInFlight: Promise<string | null> | null = null;
+
+  constructor(o: SpotifyOAuthOptions) {
+    this.clientId = o.clientId ?? "";
+    this.redirectUri = o.redirectUri ?? "";
+    this.store = o.store;
+    this.http =
+      o.deps?.http ?? axios.create({ baseURL: ACCOUNTS_BASE, timeout: 15_000 });
+    this.now = o.deps?.now ?? (() => Date.now());
+  }
+
+  private evictStaleVerifiers(): void {
+    const t = this.now();
+    for (const [state, e] of this.pendingVerifiers) {
+      if (e.expiresAt < t) this.pendingVerifiers.delete(state);
+    }
+    // Bound memory even if all are unexpired: drop oldest (insertion order).
+    while (this.pendingVerifiers.size >= SpotifyOAuth.VERIFIER_MAX) {
+      const oldest = this.pendingVerifiers.keys().next().value;
+      if (oldest === undefined) break;
+      this.pendingVerifiers.delete(oldest);
+    }
+  }
+
+  /** Update the operator's app credentials at runtime (from Settings save) so
+   *  a UI-entered Client ID takes effect without a process restart. Empty
+   *  clientId disables OAuth (isAuthorized()/buildAuthorizeUrl() gate on it). */
+  configure(clientId?: string, redirectUri?: string): void {
+    this.clientId = clientId?.trim() || "";
+    this.redirectUri = redirectUri || "";
+  }
+
+  getClientId(): string {
+    return this.clientId;
+  }
+
+  getRedirectUri(): string {
+    return this.redirectUri;
+  }
+
+  isAuthorized(): boolean {
+    // C3.2: no client_id means we could never refresh, so treat as unauthorized.
+    return !!this.clientId && !!this.store.load()?.refreshToken;
+  }
+
+  buildAuthorizeUrl(): { url: string; state: string } {
+    if (!this.clientId) {
+      // C3.2: cannot start OAuth against nobody's app.
+      throw new Error("Set your Spotify Client ID in settings first");
+    }
+    const state = randomBytes(16).toString("hex");
+    const verifier = generateCodeVerifier();
+    this.evictStaleVerifiers();
+    this.pendingVerifiers.set(state, {
+      verifier,
+      expiresAt: this.now() + SpotifyOAuth.VERIFIER_TTL_MS,
+    });
+    const params = new URLSearchParams({
+      client_id: this.clientId,
+      response_type: "code",
+      redirect_uri: this.redirectUri,
+      code_challenge: codeChallengeS256(verifier),
+      code_challenge_method: "S256",
+      scope: SPOTIFY_CONTROL_SCOPES,
+      state,
+    });
+    return { url: `${ACCOUNTS_BASE}/authorize?${params.toString()}`, state };
+  }
+
+  async handleCallback(code: string, state: string): Promise<boolean> {
+    const entry = this.pendingVerifiers.get(state);
+    if (!entry || entry.expiresAt < this.now()) {
+      // unknown/expired state -> CSRF guard (drop any stale entry too)
+      this.pendingVerifiers.delete(state);
+      return false;
+    }
+    const verifier = entry.verifier;
+    // C3.7: drop the state->verifier entry on EVERY terminal path (success,
+    // rejected token exchange, or throw) so a failed login can't leak/replay it.
+    try {
+      const body = new URLSearchParams({
+        grant_type: "authorization_code",
+        code,
+        redirect_uri: this.redirectUri,
+        client_id: this.clientId,
+        code_verifier: verifier,
+      });
+      const { data } = await this.http.post("/api/token", body.toString(), {
+        headers: FORM_HEADERS,
+      });
+      if (!data?.access_token || !data?.refresh_token) return false;
+      this.store.save(this.toTokens(data, data.refresh_token, data.scope));
+      return true;
+    } catch {
+      return false;
+    } finally {
+      this.pendingVerifiers.delete(state);
+    }
+  }
+
+  async getAccessToken(): Promise<string | null> {
+    if (!this.clientId) return null; // C3.2: no app => nothing to mint against
+    const tokens = this.store.load();
+    if (!tokens?.refreshToken) return null; // unauthorized
+    if (tokens.accessToken && this.now() < tokens.expiresAt) {
+      return tokens.accessToken;
+    }
+    // Collapse concurrent refreshes: rotation makes a second in-flight refresh
+    // use a refresh token the first one already invalidated.
+    if (this.refreshInFlight) return this.refreshInFlight;
+    this.refreshInFlight = this.refresh(tokens).finally(() => {
+      this.refreshInFlight = null;
+    });
+    return this.refreshInFlight;
+  }
+
+  private async refresh(current: OAuthTokens): Promise<string | null> {
+    const body = new URLSearchParams({
+      grant_type: "refresh_token",
+      refresh_token: current.refreshToken,
+      client_id: this.clientId,
+    });
+    try {
+      const { data } = await this.http.post("/api/token", body.toString(), {
+        headers: FORM_HEADERS,
+      });
+      if (!data?.access_token) return null;
+      // PKCE rotates the refresh token; fall back to the current one if omitted.
+      const rotated = data.refresh_token || current.refreshToken;
+      const saved = this.toTokens(data, rotated, data.scope ?? current.scope);
+      this.store.save(saved);
+      return saved.accessToken;
+    } catch (err: any) {
+      // invalid_grant => refresh token revoked/expired: discard, force re-login.
+      if (err?.response?.data?.error === "invalid_grant") this.store.clear();
+      return null;
+    }
+  }
+
+  private toTokens(data: any, refreshToken: string, scope: string): OAuthTokens {
+    return {
+      accessToken: data.access_token,
+      refreshToken,
+      expiresAt: this.now() + (data.expires_in ?? 3600) * 1000 - EXPIRY_SKEW_MS,
+      scope: scope ?? SPOTIFY_CONTROL_SCOPES,
+    };
+  }
+}

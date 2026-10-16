@@ -6,6 +6,7 @@ import pino from "pino";
 import { createDatabase, type BotDatabase } from "../../data/database.js";
 import { createUserStore, type UserStore } from "../../data/users.js";
 import { createSessionStore, type SessionStore } from "../../data/sessions.js";
+import { createApiKeyStore, type ApiKeyStore } from "../../data/api-keys.js";
 import { createAuditStore } from "../../data/audit.js";
 import { createPermissionStore } from "../../data/permissions.js";
 import { getDefaultConfig, type GuestModeConfig } from "../../data/config.js";
@@ -13,7 +14,7 @@ import type { GuestPermissions, BotAccess } from "../../data/permissions.js";
 import { createSessionRouter } from "./session.js";
 import { SESSION_COOKIE_NAME } from "../auth/validateSession.js";
 
-function makeApp(botDb: BotDatabase, users: UserStore, sessions: SessionStore) {
+function makeApp(botDb: BotDatabase, users: UserStore, sessions: SessionStore, apiKeys?: ApiKeyStore) {
   const app = express();
   app.use(express.json());
   app.use(cookieParser());
@@ -27,7 +28,8 @@ function makeApp(botDb: BotDatabase, users: UserStore, sessions: SessionStore) {
       audit,
       pino({ level: "silent" }),
       permissions,
-      () => getDefaultConfig().guestMode
+      () => getDefaultConfig().guestMode,
+      apiKeys
     )
   );
   return app;
@@ -167,6 +169,74 @@ describe("session router", () => {
     expect(meB.status).toBe(401);
 
     expect(u.id).toBe(meA.body.id);
+    // 20s, not the 5s default: this case runs SIX bcryptjs rounds (one hash to
+    // create the user, four verifies, one hash for the new password), and
+    // bcryptjs is pure JS. It takes ~4.5s on an idle machine — close enough to
+    // the default that it tipped over whenever the full suite saturated the
+    // CPU, which made it look like a real intermittent failure. The work is
+    // genuinely slow, not hung, so the timeout is what was wrong.
+  }, 20000);
+});
+
+describe("session router — API key revocation", () => {
+  let botDb: BotDatabase;
+  let users: UserStore;
+  let sessions: SessionStore;
+  let apiKeys: ApiKeyStore;
+  let app: express.Express;
+  let userId: string;
+  let currentCookie: string;
+  let rawKey: string;
+
+  beforeEach(async () => {
+    botDb = createDatabase(":memory:");
+    users = createUserStore(botDb.db);
+    sessions = createSessionStore(botDb.db);
+    apiKeys = createApiKeyStore(botDb.db);
+    const member = await users.createUser("alice", "old-password", "member");
+    userId = member.id;
+    currentCookie = `${SESSION_COOKIE_NAME}=${sessions.createSession(userId).token}`;
+    rawKey = apiKeys.create(userId, "integration")!.rawKey;
+    app = makeApp(botDb, users, sessions, apiKeys);
+  });
+
+  afterEach(() => botDb.close());
+
+  it("successful password change revokes all owned keys and preserves only the active browser session", async () => {
+    const secondKey = apiKeys.create(userId, "another-integration")!.rawKey;
+    const otherSession = `${SESSION_COOKIE_NAME}=${sessions.createSession(userId).token}`;
+    const otherUser = await users.createUser("bob", "other-password", "member");
+    const otherUserKey = apiKeys.create(otherUser.id, "other-user-integration")!.rawKey;
+
+    const changed = await request(app).post("/api/session/change-password")
+      .set("Cookie", currentCookie)
+      .send({ oldPassword: "old-password", newPassword: "new-password" });
+    expect(changed.status).toBe(204);
+    expect(apiKeys.validateAndTouch(rawKey)).toBeNull();
+    expect(apiKeys.validateAndTouch(secondKey)).toBeNull();
+    expect(apiKeys.listForUser(userId)).toEqual([]);
+    expect(apiKeys.validateAndTouch(otherUserKey)?.userId).toBe(otherUser.id);
+    expect((await request(app).get("/api/session/me").set("Cookie", currentCookie)).status).toBe(200);
+    expect((await request(app).get("/api/session/me").set("Cookie", otherSession)).status).toBe(401);
+  }, 20_000);
+
+  it.each([
+    { oldPassword: "wrong-password", newPassword: "new-password", status: 401 },
+    { oldPassword: "old-password", newPassword: "short", status: 400 },
+  ])("failed password change ($status) leaves API keys valid", async ({ oldPassword, newPassword, status }) => {
+    const changed = await request(app).post("/api/session/change-password")
+      .set("Cookie", currentCookie)
+      .send({ oldPassword, newPassword });
+    expect(changed.status).toBe(status);
+    expect(apiKeys.validateAndTouch(rawKey)?.userId).toBe(userId);
+    expect((await request(app).get("/api/session/me").set("Cookie", currentCookie)).status).toBe(200);
+  });
+
+  it("unauthenticated password change leaves API keys valid", async () => {
+    const changed = await request(app).post("/api/session/change-password")
+      .send({ oldPassword: "old-password", newPassword: "new-password" });
+    expect(changed.status).toBe(401);
+    expect(apiKeys.validateAndTouch(rawKey)?.userId).toBe(userId);
   });
 });
 

@@ -1,5 +1,6 @@
 import crypto from "node:crypto";
 import { EventEmitter } from "node:events";
+import path from "node:path";
 import {
   BotInstance,
   type BotInstanceOptions,
@@ -14,6 +15,8 @@ import type { Logger } from "../logger.js";
 import type { ServerProtocol } from "../ts-protocol/client.js";
 import type { AvatarStore } from "../data/avatars.js";
 import type { PermissionStore } from "../data/permissions.js";
+import type { SpotifyOAuth } from "../music/spotify/spotify-oauth.js";
+import { ManagedVoiceClientRegistry } from "./managed-voice-clients.js";
 
 /**
  * Run bot.connect() with a hard deadline. If the handshake hangs (e.g. the
@@ -73,6 +76,9 @@ export class BotManager extends EventEmitter {
   private bots = new Map<string, BotInstance>();
   private factory: ProviderFactory;
   private cookieStore: CookieStore;
+  private readonly managedVoiceClients = new ManagedVoiceClientRegistry();
+  private spotifyDataDir: string;
+  private readonly spotifyOAuth?: SpotifyOAuth;
   private database: BotDatabase;
   private config: BotConfig;
   private logger: Logger;
@@ -89,10 +95,14 @@ export class BotManager extends EventEmitter {
     avatarStore: AvatarStore,
     permissions: PermissionStore,
     configPath: string,
+    spotifyDataDir?: string,
+    spotifyOAuth?: SpotifyOAuth
   ) {
     super();
     this.factory = factory;
     this.cookieStore = cookieStore;
+    this.spotifyDataDir = spotifyDataDir ?? path.join(process.cwd(), "data", "spotify");
+    this.spotifyOAuth = spotifyOAuth;
     // Let the local provider see which uploads are still referenced by any
     // bot's queue, so it never deletes a file another queue/bot still needs.
     const referenceable = this.factory.localProvider as Partial<{
@@ -109,9 +119,9 @@ export class BotManager extends EventEmitter {
 
   /**
    * Build a fresh per-bot provider set: each cookie-bearing platform gets its
-   * own instance with that bot's saved cookie loaded; local + youtube come from
-   * the shared singletons. Called for every BotInstance construction so a bot
-   * restart picks up cookies saved after it was first loaded.
+   * own instance with that bot's saved cookie loaded; local + youtube + spotify
+   * come from the shared singletons. Called for every BotInstance construction
+   * so a bot restart picks up cookies saved after it was first loaded.
    */
   private buildProvidersFor(botId: string): {
     neteaseProvider: MusicProvider;
@@ -120,11 +130,14 @@ export class BotManager extends EventEmitter {
     youtubeProvider: MusicProvider;
     localProvider: MusicProvider;
     kugouProvider: MusicProvider;
+    spotifyProvider: MusicProvider;
+    jellyfinProvider: MusicProvider;
   } {
     const neteaseProvider = this.factory.createNetease();
     const qqProvider = this.factory.createQQ();
     const bilibiliProvider = this.factory.createBiliBili();
     const kugouProvider = this.factory.createKugou();
+    const jellyfinProvider = this.factory.createJellyfin(this.logger);
     const cookieBearing: Array<[MusicProvider, CookiePlatform]> = [
       [neteaseProvider, "netease"],
       [qqProvider, "qq"],
@@ -135,8 +148,9 @@ export class BotManager extends EventEmitter {
       const cookie = this.cookieStore.load(botId, platform);
       if (cookie) provider.setCookie(cookie);
     }
+    this.restoreJellyfinForBot(jellyfinProvider, botId);
     const savedQuality = this.database.getMusicQuality(botId);
-    for (const provider of [neteaseProvider, qqProvider, bilibiliProvider, kugouProvider]) {
+    for (const provider of [neteaseProvider, qqProvider, bilibiliProvider, kugouProvider, jellyfinProvider]) {
       const quality = savedQuality[provider.platform];
       if (quality) provider.setQuality(quality);
     }
@@ -145,14 +159,100 @@ export class BotManager extends EventEmitter {
       qqProvider,
       bilibiliProvider,
       kugouProvider,
+      jellyfinProvider,
       localProvider: this.factory.localProvider,
       youtubeProvider: this.factory.youtubeProvider,
+      spotifyProvider: this.factory.spotifyProvider,
     };
+  }
+
+  /**
+   * Rehydrate a bot's Jellyfin provider from its per-bot cookie slot. The slot
+   * stores a combined blob: connection credentials (serverUrl / authMode /
+   * username / password / apiKey — written by the per-bot jellyfin login API)
+   * plus the provider's persisted auth state (accessToken / userId / deviceId).
+   */
+  restoreJellyfinForBot(provider: MusicProvider, botId: string): void {
+    const jellyfin = provider as import("../music/jellyfin.js").JellyfinProvider;
+    const raw = this.cookieStore.load(botId, "jellyfin");
+    if (raw) {
+      try {
+        const blob = JSON.parse(raw) as Record<string, unknown>;
+        jellyfin.configure({
+          serverUrl: typeof blob.serverUrl === "string" ? blob.serverUrl : "",
+          authMode: blob.authMode === "apikey" ? "apikey" : "userpass",
+          username: typeof blob.username === "string" ? blob.username : "",
+          password: typeof blob.password === "string" ? blob.password : "",
+          apiKey: typeof blob.apiKey === "string" ? blob.apiKey : "",
+          userId: typeof blob.userId === "string" ? blob.userId : "",
+        });
+        if (typeof blob.accessToken === "string" && blob.accessToken) {
+          jellyfin.setCookie(
+            JSON.stringify({
+              accessToken: blob.accessToken,
+              userId: blob.userId ?? "",
+              deviceId: blob.deviceId ?? "",
+            })
+          );
+        }
+      } catch {
+        // Not the JSON blob we persist — leave the provider unconfigured.
+      }
+    }
+    // After a lazy login the provider re-persists only its auth state; merge
+    // that back into the combined blob so credentials survive round-trips.
+    jellyfin.setPersist((serialized) => this.persistJellyfinForBot(botId, serialized));
+  }
+
+  /** Persist Jellyfin credentials for a bot (used by the per-bot login API). */
+  saveJellyfinCredentials(
+    botId: string,
+    credentials: { serverUrl: string; authMode: "userpass" | "apikey"; username: string; password: string; apiKey: string }
+  ): void {
+    const existing = (() => {
+      try {
+        return JSON.parse(this.cookieStore.load(botId, "jellyfin") || "{}") as Record<string, unknown>;
+      } catch {
+        return {} as Record<string, unknown>;
+      }
+    })();
+    this.cookieStore.save(
+      botId,
+      "jellyfin",
+      JSON.stringify({ ...existing, ...credentials })
+    );
+  }
+
+  private persistJellyfinForBot(botId: string, serializedAuth: string): void {
+    const existing = (() => {
+      try {
+        return JSON.parse(this.cookieStore.load(botId, "jellyfin") || "{}") as Record<string, unknown>;
+      } catch {
+        return {} as Record<string, unknown>;
+      }
+    })();
+    let auth: Record<string, unknown> = {};
+    try {
+      auth = JSON.parse(serializedAuth) as Record<string, unknown>;
+    } catch {
+      // keep empty auth
+    }
+    this.cookieStore.save(botId, "jellyfin", JSON.stringify({ ...existing, ...auth }));
   }
 
   /** Shared local-audio provider (used by the music router for /local/upload). */
   getLocalProvider(): MusicProvider {
     return this.factory.localProvider;
+  }
+
+  /** Shared Spotify metadata provider (global admin credentials via setCreds). */
+  getSpotifyProvider(): MusicProvider {
+    return this.factory.spotifyProvider;
+  }
+
+  /** Personal web logins must never read or replace a bot's platform cookie. */
+  createPersonalNeteaseProvider(): MusicProvider {
+    return this.factory.createNetease();
   }
 
   async createBot(params: CreateBotParams): Promise<BotInstance> {
@@ -178,6 +278,9 @@ export class BotManager extends EventEmitter {
       config: this.config,
       logger: this.logger,
       avatarStore: this.avatarStore,
+      managedVoiceClients: this.managedVoiceClients,
+      spotifyDataDir: this.spotifyDataDir,
+      spotifyOAuth: this.spotifyOAuth,
     });
 
     this.bots.set(id, bot);
@@ -196,6 +299,8 @@ export class BotManager extends EventEmitter {
       serverProtocol: params.serverProtocol ?? "",
       ts6ApiKey: params.ts6ApiKey ?? "",
       serverPassword: params.serverPassword ?? "",
+      // Persist the generated key and security offset before the first start.
+      identity: bot.getIdentityExport(),
     });
 
     this.logger.info({ botId: id, name: params.name }, "Bot instance created");
@@ -313,13 +418,24 @@ export class BotManager extends EventEmitter {
         config: this.config,
         logger: this.logger,
         avatarStore: this.avatarStore,
+        managedVoiceClients: this.managedVoiceClients,
+        spotifyDataDir: this.spotifyDataDir,
+        spotifyOAuth: this.spotifyOAuth,
       });
       this.bots.set(id, bot);
       this.emit("botInstance", bot);
-      await connectWithTimeout(bot, 15_000, this.logger);
-      // Mark as autoStart so it reconnects on Docker restart, and persist identity
-      this.database.saveBotInstance({ ...saved, autoStart: true });
+      // A failed handshake must not cause the next start to generate a new UID.
       this.persistBotIdentity(saved, bot);
+      await connectWithTimeout(bot, 15_000, this.logger);
+      // Save both fields together so an identity write cannot undo autoStart.
+      const connected = this.getBotConfig(id);
+      if (connected) {
+        this.database.saveBotInstance({
+          ...connected,
+          identity: bot.getIdentityExport(),
+          autoStart: true,
+        });
+      }
     } else {
       await connectWithTimeout(oldBot, 15_000, this.logger);
     }
@@ -362,10 +478,15 @@ export class BotManager extends EventEmitter {
         config: this.config,
         logger: this.logger,
         avatarStore: this.avatarStore,
+        managedVoiceClients: this.managedVoiceClients,
+        spotifyDataDir: this.spotifyDataDir,
+        spotifyOAuth: this.spotifyOAuth,
       });
 
       this.bots.set(saved.id, bot);
       this.emit("botInstance", bot);
+      // Repair legacy NULL identities even when autoStart is disabled.
+      this.persistBotIdentity(saved, bot);
 
       // Only auto-connect bots that have autoStart enabled
       if (saved.autoStart) {
@@ -401,8 +522,9 @@ export class BotManager extends EventEmitter {
 
   private persistBotIdentity(saved: import("../data/database.js").BotInstance, bot: BotInstance): void {
     const identity = bot.getIdentityExport();
-    if (identity && identity !== saved.identity) {
-      this.database.saveBotInstance({ ...saved, identity });
+    const current = this.getBotConfig(saved.id);
+    if (current && identity && identity !== current.identity) {
+      this.database.saveBotInstance({ ...current, identity });
     }
   }
 

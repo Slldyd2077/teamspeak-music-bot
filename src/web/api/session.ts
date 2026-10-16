@@ -3,6 +3,7 @@ import type { Request, Response, NextFunction } from "express";
 import type { Logger } from "../../logger.js";
 import type { UserStore } from "../../data/users.js";
 import type { SessionStore } from "../../data/sessions.js";
+import type { ApiKeyStore } from "../../data/api-keys.js";
 import type { AuditStore } from "../../data/audit.js";
 import { resolvePermissionContext, type PermissionStore } from "../../data/permissions.js";
 import { SESSION_TTL_MS, GUEST_SESSION_TTL_MS } from "../../data/sessions.js";
@@ -54,7 +55,8 @@ export function createSessionRouter(
   audit: AuditStore,
   logger: Logger,
   permissions: PermissionStore,
-  getGuestConfig: () => GuestModeConfig
+  getGuestConfig: () => GuestModeConfig,
+  apiKeys?: ApiKeyStore
 ): Router {
   const router = Router();
 
@@ -202,6 +204,7 @@ export function createSessionRouter(
     await users.changePassword(u.id, newPassword);
     const currentToken = parseTokenFromCookie(req.headers.cookie);
     sessions.deleteAllForUser(u.id, currentToken ?? undefined);
+    apiKeys?.deleteAllForUser(u.id);
     try {
       audit.record({
         actorId: u.id, actorUsername: u.username,

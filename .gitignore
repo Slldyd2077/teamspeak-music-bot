@@ -7,6 +7,8 @@ config.json
 cookies/
 .superpowers/
 .worktrees/
+.claude/
+setup.log
 /bin/
 scripts/navbar_bigger.png
 # fork 调试用的登录会话 cookie（含凭据，绝不入库）

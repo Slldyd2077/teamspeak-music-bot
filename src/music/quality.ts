@@ -1,6 +1,6 @@
 import type { AuthStatus } from "./provider.js";
 
-export type QualityPlatform = "netease" | "qq" | "bilibili" | "kugou";
+export type QualityPlatform = "netease" | "qq" | "bilibili" | "kugou" | "spotify" | "jellyfin";
 
 export const QUALITY_POLICY: Record<QualityPlatform, Readonly<Record<string, boolean>>> = {
   netease: {
@@ -14,6 +14,11 @@ export const QUALITY_POLICY: Record<QualityPlatform, Readonly<Record<string, boo
   qq: { "128": false, "320": false, flac: true },
   bilibili: { high: false },
   kugou: { "128": false, "320": false, flac: true, high: true },
+  // Spotify playback bitrate (applied by the per-bot SpotifyController); the
+  // provider itself is metadata-only.
+  spotify: { "96": false, "160": false, "320": false },
+  // Jellyfin transcode tiers (direct = original stream, no server transcode).
+  jellyfin: { direct: false, "128": false, "192": false, "320": false },
 };
 
 export function isQualityPlatform(value: unknown): value is QualityPlatform {

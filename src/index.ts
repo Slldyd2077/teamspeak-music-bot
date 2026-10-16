@@ -1,9 +1,11 @@
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { loadConfig, saveConfig, migrateLegacyConfig } from "./data/config.js";
+import { loadConfig, saveConfig, migrateLegacyConfig, isProviderEnabled } from "./data/config.js";
 import { createDatabase } from "./data/database.js";
 import { createLogger } from "./logger.js";
 import { createApiServerManager } from "./music/api-server.js";
+import { SpotifyProvider } from "./music/spotify/provider.js";
+import { SpotifyOAuth, createFileOAuthTokenStore } from "./music/spotify/spotify-oauth.js";
 import { createCookieStore } from "./music/auth.js";
 import { createAvatarStore } from "./data/avatars.js";
 import { createPermissionStore } from "./data/permissions.js";
@@ -24,6 +26,7 @@ const LOG_DIR = path.join(DATA_DIR, "logs");
 const COOKIE_DIR = path.join(DATA_DIR, "cookies");
 const AVATAR_DIR = path.join(DATA_DIR, "avatars");
 const LOCAL_AUDIO_DIR = path.join(DATA_DIR, "local-audio");
+const SPOTIFY_DATA_DIR = path.join(DATA_DIR, "spotify");
 const STATIC_DIR = path.join(ROOT_DIR, "web", "dist");
 
 async function main() {
@@ -45,7 +48,14 @@ async function main() {
   const db = createDatabase(DB_PATH);
 
   const apiServer = createApiServerManager(
-    { neteasePort: config.neteaseApiPort, qqMusicPort: config.qqMusicApiPort },
+    {
+      neteasePort: config.neteaseApiPort,
+      qqMusicPort: config.qqMusicApiPort,
+      // Provider gating: a sidecar only starts (and binds 3001/3200) when its
+      // source is listed in enabledProviders — both are on in the default config.
+      neteaseEnabled: isProviderEnabled(config, "netease"),
+      qqEnabled: isProviderEnabled(config, "qq"),
+    },
     logger
   );
   await apiServer.start();
@@ -60,6 +70,34 @@ async function main() {
     localAudioDir: LOCAL_AUDIO_DIR,
   });
 
+  // Spotify safety gate (spec §7): the metadata source stays inert unless
+  // EXPLICITLY enabled. Only feed credentials when enabled — otherwise the
+  // shared provider has no creds, hasCreds() is false, search returns empty,
+  // and getAuthStatus() is loggedIn:false, so setting a Client ID/Secret
+  // alone (enabled:false) never activates Spotify.
+  if (config.spotify.enabled && config.spotify.clientId) {
+    (providerFactory.spotifyProvider as SpotifyProvider).setCreds(
+      config.spotify.clientId,
+      config.spotify.clientSecret,
+    );
+  }
+
+  // Single process-wide Spotify authorization (one Premium account for Stage 3).
+  // Threaded into BOTH the web OAuth router and every bot's SpotifyController so
+  // a web login immediately authorizes playback (C3.1). Own-app clientId => the
+  // redirect points at this bot's web callback; empty clientId leaves OAuth
+  // disabled (isAuthorized() stays false and the Rust backend never starts).
+  const spotifyOAuthClientId = config.spotify.clientId.trim();
+  const spotifyOAuth = new SpotifyOAuth({
+    clientId: spotifyOAuthClientId || undefined,
+    redirectUri: spotifyOAuthClientId
+      ? `http://127.0.0.1:${config.webPort}/api/spotify/callback`
+      : undefined,
+    store: createFileOAuthTokenStore(
+      path.join(SPOTIFY_DATA_DIR, "oauth", "oauth-tokens.json"),
+    ),
+  });
+
   // Per-bot platform cookies: each bot loads its own saved cookie when
   // constructed (BotManager.buildProvidersFor). No global startup load.
   const botManager = new BotManager(
@@ -71,6 +109,8 @@ async function main() {
     avatarStore,
     permissions,
     CONFIG_PATH,
+    SPOTIFY_DATA_DIR,
+    spotifyOAuth
   );
   await botManager.loadSavedBots();
 
@@ -84,6 +124,7 @@ async function main() {
     logger,
     cookieStore,
     staticDir: STATIC_DIR,
+    spotifyOAuth,
   });
   await webServer.start();
 

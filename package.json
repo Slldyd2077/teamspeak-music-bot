@@ -1,12 +1,17 @@
 {
   "name": "tsmusicbot",
-  "version": "0.3.4",
+  "version": "1.12.2",
   "description": "TeamSpeak music bot with NetEase Cloud Music and QQ Music support",
   "type": "module",
+  "engines": {
+    "node": "^22.12.0 || >=24.0.0"
+  },
   "scripts": {
     "dev": "tsx watch src/index.ts",
     "build": "tsc && npm run build:web",
     "build:web": "cd web && npm run build",
+    "check:native": "node scripts/check-native.mjs",
+    "prestart": "node scripts/check-native.mjs",
     "start": "node dist/index.js",
     "play": "node dist/index.js",
     "test": "vitest run",
@@ -47,5 +52,18 @@
     "tsx": "^4.21.0",
     "typescript": "^6.0.2",
     "vitest": "^4.1.2"
+  },
+  "allowScripts": {
+    "@discordjs/opus@0.10.0": true,
+    "better-sqlite3@12.11.1": true,
+    "cpu-features@0.0.10": true,
+    "esbuild@0.28.1": true,
+    "ffmpeg-static@5.3.0": true,
+    "ssh2@1.17.0": true
+  },
+  "overrides": {
+    "@discordjs/node-pre-gyp": {
+      "tar": "7.5.22"
+    }
   }
 }

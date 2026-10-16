@@ -27,6 +27,69 @@ const WBI_MIXIN_KEY_ENC_TAB = [
 
 const WBI_KEY_TTL_MS = 6 * 60 * 60 * 1000; // wbi keys rotate ~daily; refresh every 6h
 
+export interface BiliVideoPart {
+  part: number;
+  cid: number;
+  title: string;
+  duration: number;
+}
+
+export interface BiliVideoPartsResult {
+  bvid: string;
+  title: string;
+  coverUrl: string;
+  artist: string;
+  parts: BiliVideoPart[];
+}
+
+/**
+ * PCDN / P2P edge hosts (xy*.mcdn.bilivideo.cn:<port>, *.szbdyd.com). Their
+ * sessions get cut mid-file, which kills long streams partway (#89, #161),
+ * and a reconnect to the same host rarely recovers.
+ */
+const BILI_PCDN_HOST = /\.mcdn\.bilivideo\.cn$|\.szbdyd\.com$/i;
+
+/**
+ * Pick the audio URL least likely to die mid-stream: the first upos/cos
+ * mirror among baseUrl + backupUrl, else the baseUrl as before.
+ */
+export function pickStableAudioUrl(stream: {
+  baseUrl?: string;
+  base_url?: string;
+  backupUrl?: string[];
+  backup_url?: string[];
+}): string | undefined {
+  const primary = stream.baseUrl ?? stream.base_url;
+  const candidates = [primary, ...(stream.backupUrl ?? stream.backup_url ?? [])].filter(
+    (u): u is string => typeof u === "string" && u.length > 0,
+  );
+  const stable = candidates.find((u) => {
+    try {
+      return !BILI_PCDN_HOST.test(new URL(u).hostname);
+    } catch {
+      return false;
+    }
+  });
+  return stable ?? primary;
+}
+
+/**
+ * 解析带有分P信息的 B站 ID 或 URL。
+ * 支持形如 "BVxxxx", "BVxxxx?p=2", "BVxxxx:p2" 以及完整 URL 等格式，默认 page 为 1。
+ */
+export function parseBilibiliId(songId: string): { bvid: string; page: number } {
+  const str = (songId ?? "").trim();
+  const bvMatch = str.match(/BV[0-9A-Za-z]+/i);
+  if (!bvMatch) {
+    return { bvid: str, page: 1 };
+  }
+  const bvid = bvMatch[0];
+  const pageMatch = str.match(/[?&]p=(\d+)|:p?(\d+)/i);
+  const pageStr = pageMatch ? (pageMatch[1] ?? pageMatch[2]) : undefined;
+  const page = pageStr ? parseInt(pageStr, 10) : 1;
+  return { bvid, page: Math.max(1, page) };
+}
+
 export class BiliBiliProvider implements MusicProvider {
   readonly platform = "bilibili" as const;
   private api: AxiosInstance;
@@ -148,12 +211,16 @@ export class BiliBiliProvider implements MusicProvider {
     return fixed;
   }
 
-  async search(query: string, limit = 20): Promise<SearchResult> {
+  async search(query: string, limit = 20, offset = 0): Promise<SearchResult> {
     await this.ensureBuvidCookie();
     await this.ensureWbiKeys();
+    // /search/type is page-based; the web pages in limit-aligned steps so
+    // offset is a multiple of page_size.
+    const page = Math.floor(offset / limit) + 1;
     const signed = this.signWbi({
       search_type: "video",
       keyword: query,
+      page,
       page_size: limit,
     });
     const res = await this.api.get("/x/web-interface/wbi/search/type", {
@@ -189,18 +256,41 @@ export class BiliBiliProvider implements MusicProvider {
   }
 
   async getSongDetail(songId: string): Promise<Song | null> {
+    const { bvid, page } = parseBilibiliId(songId);
     try {
       const res = await this.api.get("/x/web-interface/view", {
-        params: { bvid: songId },
+        params: { bvid },
         headers: this.cookieHeaders,
       });
 
       const data = res.data?.data;
       if (!data) return null;
 
-      // Cache cid for later audio URL fetching
-      if (data.pages?.[0]?.cid) {
-        this.cidCache.set(songId, data.pages[0].cid);
+      const pages = data.pages ?? [];
+      // 缓存所有分P的 cid 映射
+      for (const p of pages) {
+        this.cidCache.set(`${bvid}?p=${p.page}`, p.cid);
+      }
+      if (pages[0]?.cid) {
+        this.cidCache.set(bvid, pages[0].cid);
+      }
+
+      const targetPage = pages.find((p: any) => p.page === page) ?? pages[0];
+
+      // 若为多P视频，返回对应分P的名称与独立时长
+      if (pages.length > 1 && targetPage) {
+        const partTitle = targetPage.part && targetPage.part !== data.title
+          ? `${data.title} - P${targetPage.page} ${targetPage.part}`
+          : `${data.title} (P${targetPage.page})`;
+        return {
+          id: `${bvid}?p=${targetPage.page}`,
+          name: partTitle,
+          artist: data.owner?.name ?? "",
+          album: "",
+          duration: targetPage.duration ?? 0,
+          coverUrl: this.normalizeCover(data.pic ?? ""),
+          platform: "bilibili" as const,
+        };
       }
 
       return {
@@ -208,7 +298,7 @@ export class BiliBiliProvider implements MusicProvider {
         name: data.title ?? "",
         artist: data.owner?.name ?? "",
         album: "",
-        duration: data.duration ?? 0,
+        duration: targetPage?.duration ?? data.duration ?? 0,
         coverUrl: this.normalizeCover(data.pic ?? ""),
         platform: "bilibili" as const,
       };
@@ -217,9 +307,47 @@ export class BiliBiliProvider implements MusicProvider {
     }
   }
 
+  /** 获取视频所有分P列表 */
+  async getVideoParts(bvid: string): Promise<BiliVideoPartsResult | null> {
+    const { bvid: cleanBvid } = parseBilibiliId(bvid);
+    try {
+      const res = await this.api.get("/x/web-interface/view", {
+        params: { bvid: cleanBvid },
+        headers: this.cookieHeaders,
+      });
+
+      const data = res.data?.data;
+      if (!data) return null;
+
+      const pages = data.pages ?? [];
+      for (const p of pages) {
+        this.cidCache.set(`${cleanBvid}?p=${p.page}`, p.cid);
+      }
+      if (pages[0]?.cid) {
+        this.cidCache.set(cleanBvid, pages[0].cid);
+      }
+
+      return {
+        bvid: cleanBvid,
+        title: data.title ?? "",
+        coverUrl: this.normalizeCover(data.pic ?? ""),
+        artist: data.owner?.name ?? "",
+        parts: pages.map((p: any) => ({
+          part: p.page,
+          cid: p.cid,
+          title: p.part ?? `P${p.page}`,
+          duration: p.duration ?? 0,
+        })),
+      };
+    } catch {
+      return null;
+    }
+  }
+
   /** Get CID for a bvid, using cache when available */
-  private async getCid(bvid: string): Promise<number | null> {
-    const cached = this.cidCache.get(bvid);
+  private async getCid(bvid: string, page = 1): Promise<number | null> {
+    const key = page > 1 ? `${bvid}?p=${page}` : bvid;
+    const cached = this.cidCache.get(key) ?? (page === 1 ? this.cidCache.get(`${bvid}?p=1`) : undefined);
     if (cached) return cached;
 
     // Limit cache size to prevent unbounded growth
@@ -228,20 +356,22 @@ export class BiliBiliProvider implements MusicProvider {
       if (firstKey) this.cidCache.delete(firstKey);
     }
 
-    const detail = await this.getSongDetail(bvid);
+    const songId = page > 1 ? `${bvid}?p=${page}` : bvid;
+    const detail = await this.getSongDetail(songId);
     if (!detail) return null;
-    return this.cidCache.get(bvid) ?? null;
+    return this.cidCache.get(key) ?? this.cidCache.get(`${bvid}?p=${page}`) ?? this.cidCache.get(bvid) ?? null;
   }
 
   async getSongUrl(songId: string, _quality?: string): Promise<SongUrlResult | null> {
-    const cid = await this.getCid(songId);
+    const { bvid, page } = parseBilibiliId(songId);
+    const cid = await this.getCid(bvid, page);
     if (!cid) return null;
 
     try {
       const res = await this.api.get("/x/player/playurl", {
         params: {
           cid,
-          bvid: songId,
+          bvid,
           fnval: 16, // DASH format
         },
         headers: this.cookieHeaders,
@@ -255,7 +385,7 @@ export class BiliBiliProvider implements MusicProvider {
         (b.bandwidth ?? 0) > (a.bandwidth ?? 0) ? b : a
       );
 
-      const biliUrl = best.baseUrl ?? best.base_url;
+      const biliUrl = pickStableAudioUrl(best);
       return biliUrl ? { url: biliUrl } : null;
     } catch {
       return null;
