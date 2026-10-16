@@ -107,7 +107,7 @@ export function createWebServer(options: WebServerOptions): WebServer {
   });
 
   app.get("/api/health", (_req, res) => {
-    res.json({ status: "ok", version: "1.12.1" });
+    res.json({ status: "ok", version: "1.12.3", distribution: "powerfults" });
   });
 
   app.get("/api/config/public-url", (_req, res) => {
