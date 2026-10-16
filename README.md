@@ -1,4 +1,4 @@
-> **音频功能更新（2026-10-10）**：通用分支已包含逐曲响度均衡；现有生产服务器应使用已验收的 `codex/audio-production-compatible` 分支。 处理歌曲之间的整体响度，同一首固定增益。构建、升级及回归检查见[逐曲响度均衡说明](docs/track-loudness.md)。
+> **Docker 定制版 v1.12.3（2026-10-16）**：`main` 已整合通用分支、后台逐曲响度分析、5 秒平滑增益与 PCM 语音闪避。默认镜像为 `ghcr.io/slldyd2077/teamspeak-music-bot:latest`；历史生产兼容分支仍保留供旧连接层部署回退。
 
 <p align="center">
   <img src="https://img.shields.io/badge/TeamSpeak-音乐机器人-blue?style=for-the-badge&logo=teamspeak" alt="TSMusicBot" />
@@ -28,7 +28,7 @@
 
 > v1.10.0 新增**可选**的 [Jellyfin](https://jellyfin.org/) 音源（由 [@ItsEricRao](https://github.com/ItsEricRao) 在 [PR #123](https://github.com/ZHANGTIANYAO1/teamspeak-music-bot/pull/123) 中贡献）：连接自建 Jellyfin 服务器直接播放你自己的音乐库。默认关闭，在 **设置 → Jellyfin 音乐库** 一键开启；原有在线音源保持默认启用，行为不变。
 
-> 🍴 **PowerfulTS 定制分支**：[`merge/upstream-v1.12`](https://github.com/Slldyd2077/teamspeak-music-bot/tree/merge/upstream-v1.12) 是 [PowerfulTS](https://github.com/Slldyd2077/PowerfulTS) 管理面板配套的音乐与网页语音引擎。本分支持续合并 [原版主干](https://github.com/ZHANGTIANYAO1/teamspeak-music-bot)，并保留 PowerfulTS 所需的 per-bot 音源及平台账号隔离、双向 Opus 中继、网页语音闪避和入场音效接口。**PowerfulTS 需从本分支构建引擎；原版镜像不能直接替换。** 分支名中的 `v1.12` 是历史名称，不表示当前只包含上游 v1.12 的代码。
+> 🍴 **PowerfulTS 定制分支**：[`main`](https://github.com/Slldyd2077/teamspeak-music-bot/tree/main) 是 [PowerfulTS](https://github.com/Slldyd2077/PowerfulTS) 管理面板配套的音乐与网页语音引擎。本分支持续合并 [原版主干](https://github.com/ZHANGTIANYAO1/teamspeak-music-bot)，并保留 PowerfulTS 所需的 per-bot 音源及平台账号隔离、双向 Opus 中继、网页语音闪避和入场音效接口。**PowerfulTS 需从本分支构建引擎；原版镜像不能直接替换。** 分支名中的 `v1.12` 是历史名称，不表示当前只包含上游 v1.12 的代码。
 
 ## 与 PowerfulTS 的关系
 
@@ -145,7 +145,7 @@ docker compose pull && docker compose up -d
 ```bash
 docker logs -f tsmusicbot          # 查看日志
 docker-compose down                # 停止
-docker compose pull && docker compose up -d       # 代码更新后重新构建
+docker compose pull && docker compose up -d       # 拉取定制镜像并重建容器
 ```
 
 如果 TS3 服务器在其他机器上，编辑 `docker-compose.yml`：
@@ -326,7 +326,7 @@ cd scripts/docker
 # 拉取最新代码
 git pull
 
-# 重新构建并启动（数据自动保留）
+# 拉取最新定制镜像并启动（数据自动保留）
 docker compose pull && docker compose up -d
 ```
 

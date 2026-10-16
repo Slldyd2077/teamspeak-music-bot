@@ -6,6 +6,7 @@ import { vi } from "vitest";
 import { createRealtimeVoiceTelemetry } from "../audio/realtime-voice-telemetry.js";
 import { VoiceDuckingController } from "./voice-ducking.js";
 import { ManagedVoiceClientRegistry } from "./managed-voice-clients.js";
+import opus from "@discordjs/opus";
 
 describe("browser speech transmission", () => {
   it("speech ducks the receiving music bot and continuous encoded silence lets it recover", () => {
@@ -22,8 +23,19 @@ describe("browser speech transmission", () => {
         webVoiceBridge: false };
       (BotInstance.prototype as any).setupTsEvents.call(music);
       const gate = new WebVoiceTransmitGate();
+      const encoder = new opus.OpusEncoder(48000, 2);
+      const speech = Buffer.alloc(960 * 2 * 2);
+      for (let frame = 0; frame < 960; frame++) {
+        const sample = Math.round(4000 * Math.sin(2 * Math.PI * 440 * frame / 48000));
+        speech.writeInt16LE(sample, frame * 4);
+        speech.writeInt16LE(sample, frame * 4 + 2);
+      }
+      const silence = Buffer.alloc(speech.length);
       const transmit = (voiced: boolean) => {
-        if (gate.accept(voiced)) receive.emit('voiceActivity', { clientId: 12, codec: 5, clientUid: 'web-user' });
+        if (gate.accept(voiced)) receive.emit('voiceActivity', {
+          clientId: 12, codec: 5, clientUid: 'web-user',
+          data: encoder.encode(voiced ? speech : silence),
+        });
       };
       transmit(false);
       expect(ducking.isDucking()).toBe(false);
