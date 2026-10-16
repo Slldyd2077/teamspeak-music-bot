@@ -70,4 +70,28 @@ describe("csrfOriginCheck middleware", () => {
     expect(res.status).toBe(403);
     expect(res.body).toEqual({ error: "bad origin" });
   });
+
+  // API-key clients authenticate via a header the browser never attaches
+  // automatically, so CSRF cannot abuse them — the origin check is skipped.
+  it("allows POST with an X-API-Key header and no session cookie", async () => {
+    const res = await request(app).post("/").set("X-API-Key", "tsmb_abc");
+    expect(res.status).toBe(200);
+  });
+
+  it("allows POST with an Authorization: Bearer key and no session cookie", async () => {
+    const res = await request(app).post("/").set("Authorization", "Bearer tsmb_abc");
+    expect(res.status).toBe(200);
+  });
+
+  it("does NOT skip the origin check when a session cookie rides along with an API key", async () => {
+    // An attacker page can set arbitrary headers while the victim's cookie is
+    // attached ambiently — the cookie keeps the request under the gate.
+    const res = await request(app)
+      .post("/")
+      .set("Host", "example.com")
+      .set("Origin", "https://evil.com")
+      .set("Cookie", "tsmb_session=whatever")
+      .set("X-API-Key", "tsmb_abc");
+    expect(res.status).toBe(403);
+  });
 });

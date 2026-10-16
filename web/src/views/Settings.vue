@@ -48,6 +48,7 @@
       </form>
       <p v-if="ownPwError" class="user-error">{{ ownPwError }}</p>
       <p v-if="ownPwSuccess" class="user-success">{{ ownPwSuccess }}</p>
+      <PersonalNeteaseAccount v-if="providerOn('netease') && !session.isGuest.value" />
     </section>
 
     <!-- Bot Management (create/edit/delete/start-stop) requires bot.manage -->
@@ -165,12 +166,110 @@
       </div>
     </section>
 
-    <!-- Music Account - QR Code Login (platform auth) requires platform.auth -->
+    <!-- Jellyfin — optional self-hosted music source. The connection is
+         PER-BOT (each bot owns its credentials, like the other music
+         accounts), no QR flow. The card stays visible even while the source
+         is disabled: the enable toggle below is the only UI that flips its
+         enabledProviders membership, so hiding the card would leave no way
+         to turn Jellyfin on. -->
     <section v-if="can('platform.auth')" class="settings-section">
+      <h2 class="section-title">Jellyfin 音乐库（可选）</h2>
+
+      <div class="account-card">
+        <div class="account-header">
+          <Icon icon="mdi:jellyfish" class="account-icon jellyfin-icon" />
+          <div class="account-info">
+            <div class="account-name">Jellyfin</div>
+            <div class="account-status" :class="{ logged: jellyfinAuth.loggedIn }">
+              {{ jellyfinAuth.loggedIn ? `已连接: ${jellyfinAuth.nickname}` : '未连接' }}
+            </div>
+            <div class="account-status">凭据按机器人独立保存（当前：{{ store.activeBotId ? '已选中机器人' : '未选择机器人' }}）</div>
+          </div>
+        </div>
+
+        <!-- Enable (opt-in source: presence in enabledProviders) -->
+        <label class="profile-toggle behavior-toggle spotify-toggle">
+          <div class="profile-toggle-text">
+            <div class="profile-toggle-label">启用 Jellyfin 音源</div>
+            <div class="profile-toggle-hint">开启后 Jellyfin 出现在搜索、首页与聊天命令（!play -j）的音源列表中。默认关闭，点击下方「保存」后生效。</div>
+          </div>
+          <input v-model="jellyfinEnabledForm" type="checkbox" class="profile-toggle-switch" />
+        </label>
+
+        <div class="form-group">
+          <label>服务器地址</label>
+          <input v-model="jellyfinForm.serverUrl" class="input" autocomplete="off" placeholder="https://jellyfin.example.com" />
+        </div>
+
+        <div class="setting-row spotify-row">
+          <div class="setting-label">认证方式</div>
+          <div class="spotify-btn-group">
+            <button
+              class="spotify-choice"
+              :class="{ active: jellyfinForm.authMode === 'userpass' }"
+              @click="jellyfinForm.authMode = 'userpass'"
+            >账号密码</button>
+            <button
+              class="spotify-choice"
+              :class="{ active: jellyfinForm.authMode === 'apikey' }"
+              @click="jellyfinForm.authMode = 'apikey'"
+            >API Key</button>
+          </div>
+        </div>
+
+        <template v-if="jellyfinForm.authMode === 'userpass'">
+          <div class="form-group">
+            <label>用户名</label>
+            <input v-model="jellyfinForm.username" class="input" autocomplete="off" placeholder="Jellyfin 用户名" />
+          </div>
+          <div class="form-group">
+            <label>密码</label>
+            <input
+              v-model="jellyfinForm.password"
+              class="input"
+              type="password"
+              autocomplete="off"
+              placeholder="留空表示沿用该机器人已保存的密码"
+            />
+          </div>
+        </template>
+        <template v-else>
+          <div class="form-group">
+            <label>API Key</label>
+            <input
+              v-model="jellyfinForm.apiKey"
+              class="input"
+              type="password"
+              autocomplete="off"
+              placeholder="留空表示沿用该机器人已保存的 API Key"
+            />
+          </div>
+          <div class="form-group">
+            <label>用户 ID</label>
+            <input v-model="jellyfinForm.userId" class="input" autocomplete="off" placeholder="该 Key 对应使用的 Jellyfin 用户 ID" />
+          </div>
+        </template>
+
+        <div class="spotify-actions">
+          <button class="btn-secondary" :disabled="jellyfinTesting" @click="testJellyfin">
+            {{ jellyfinTesting ? '测试中…' : '测试连接' }}
+          </button>
+          <button class="btn-primary" :disabled="jellyfinSaving" @click="saveJellyfin">
+            {{ jellyfinSaving ? '保存中…' : '保存' }}
+          </button>
+        </div>
+
+        <p v-if="jellyfinMessage" class="spotify-message" :class="`tone-${jellyfinMessageTone}`">{{ jellyfinMessage }}</p>
+      </div>
+    </section>
+
+    <!-- Music Account - QR Code Login (platform auth) requires platform.auth.
+         Cards for sources disabled via enabledProviders are hidden. -->
+    <section v-if="can('platform.auth') && (providerOn('netease') || providerOn('qq') || providerOn('bilibili') || providerOn('kugou'))" class="settings-section">
       <h2 class="section-title">音乐账号</h2>
 
       <!-- NetEase -->
-      <div class="account-card">
+      <div v-if="providerOn('netease')" class="account-card">
         <div class="account-header">
           <Icon icon="mdi:cloud-outline" class="account-icon" />
           <div class="account-info">
@@ -240,7 +339,7 @@
       </div>
 
       <!-- QQ Music -->
-      <div class="account-card">
+      <div v-if="providerOn('qq')" class="account-card">
         <div class="account-header">
           <Icon icon="mdi:music-circle-outline" class="account-icon" />
           <div class="account-info">
@@ -281,7 +380,7 @@
             <img :src="qqQr.dataUrl" class="qr-image" alt="QR Code" />
             <div class="qr-status" :class="qqQr.status">
               <template v-if="qqQr.status === 'waiting'">
-                <Icon icon="mdi:cellphone" /> 请使用QQ音乐APP扫码
+                <Icon icon="mdi:cellphone" /> 请使用手机QQ扫码
               </template>
               <template v-else-if="qqQr.status === 'scanned'">
                 <Icon icon="mdi:check" /> 已扫码，请在手机上确认
@@ -309,7 +408,7 @@
         </div>
       </div>
       <!-- BiliBili -->
-      <div class="account-card">
+      <div v-if="providerOn('bilibili')" class="account-card">
         <div class="account-header">
           <Icon icon="mdi:video-outline" class="account-icon bilibili-icon" />
           <div class="account-info">
@@ -379,7 +478,7 @@
       </div>
 
       <!-- Kugou -->
-      <div class="account-card">
+      <div v-if="providerOn('kugou')" class="account-card">
         <div class="account-header">
           <Icon icon="mdi:music-circle-outline" class="account-icon kugou-icon" />
           <div class="account-info">
@@ -449,10 +548,158 @@
       </div>
     </section>
 
+    <!-- Default music source (issue #126): the source used by chat commands
+         (!play/!add …) and the WebUI when no platform flag is given. Saving is a
+         global bot setting, so gate on bot.manage like the other behavior rows. -->
+    <section v-if="can('bot.manage')" class="settings-section">
+      <h2 class="section-title">默认音源</h2>
+      <p class="profile-section-hint">
+        设置不带音源参数时（如聊天里的 <code>!play 歌名</code> 或网页搜索）默认使用的音源。
+        例如把默认音源设为「哔哩哔哩」后，点播 B 站音乐就不用每次都加 <code>-b</code>。
+        选择「自动」则按内置优先级挑选第一个已启用的音源（网易云 → QQ → 酷狗 → Jellyfin → 哔哩哔哩 → YouTube）。
+      </p>
+      <div class="setting-row">
+        <div class="setting-label">
+          <Icon icon="mdi:music-box-multiple-outline" class="setting-icon" />
+          默认音源
+        </div>
+        <div class="prefix-input-wrap">
+          <select v-model="defaultPlatformForm" class="input input-sm default-source-select">
+            <option value="">自动（按优先级）</option>
+            <option v-for="opt in defaultSourceOptions" :key="opt.value" :value="opt.value">
+              {{ opt.label }}
+            </option>
+          </select>
+          <button class="btn-primary" :disabled="defaultSourceSaving" @click="saveDefaultSource">
+            {{ defaultSourceSaving ? '保存中…' : '保存' }}
+          </button>
+        </div>
+      </div>
+      <p v-if="defaultSourceMessage" class="spotify-message" :class="`tone-${defaultSourceMessageTone}`">{{ defaultSourceMessage }}</p>
+    </section>
+
+    <!-- Spotify (Connect) playback via librespot — requires platform.auth -->
+    <section v-if="can('platform.auth')" class="settings-section">
+      <h2 class="section-title">Spotify 播放（实验性）</h2>
+      <p class="spotify-disclaimer">{{ SPOTIFY_DISCLAIMER }}</p>
+
+      <div class="account-card">
+        <div class="account-header">
+          <Icon icon="mdi:spotify" class="account-icon spotify-icon" />
+          <div class="account-info">
+            <div class="account-name">Spotify (librespot)</div>
+            <div class="account-status" :class="`tone-${spotifyStatusSummary.tone}`">
+              {{ spotifyStatusSummary.label }}
+            </div>
+          </div>
+        </div>
+
+        <!-- Enable -->
+        <label class="profile-toggle behavior-toggle spotify-toggle">
+          <div class="profile-toggle-text">
+            <div class="profile-toggle-label">启用 Spotify 播放</div>
+            <div class="profile-toggle-hint">开启后可通过 librespot 后端播放 Spotify（需 Premium 账号 + 你自己注册的开发者应用凭据）。默认关闭。</div>
+          </div>
+          <input v-model="spotifyForm.enabled" type="checkbox" class="profile-toggle-switch" />
+        </label>
+
+        <!-- Backend -->
+        <div class="setting-row spotify-row">
+          <div class="setting-label">播放后端</div>
+          <div class="spotify-btn-group">
+            <button
+              v-for="b in SPOTIFY_BACKENDS"
+              :key="b.value"
+              class="spotify-choice"
+              :class="{ active: spotifyForm.backend === b.value }"
+              @click="spotifyForm.backend = b.value"
+            >
+              {{ b.label }}
+            </button>
+          </div>
+        </div>
+
+        <!-- Bitrate -->
+        <div class="setting-row spotify-row">
+          <div class="setting-label">比特率 (kbps)</div>
+          <div class="spotify-btn-group">
+            <button
+              v-for="rate in SPOTIFY_BITRATES"
+              :key="rate"
+              class="spotify-choice"
+              :class="{ active: spotifyForm.bitrate === rate }"
+              @click="spotifyForm.bitrate = rate"
+            >
+              {{ rate }}
+            </button>
+          </div>
+        </div>
+
+        <!-- Client ID -->
+        <div class="form-group">
+          <label>Client ID</label>
+          <input v-model="spotifyForm.clientId" class="input" autocomplete="off" placeholder="Spotify 开发者应用 Client ID" />
+        </div>
+
+        <!-- Client Secret (write-only) -->
+        <div class="form-group">
+          <label>
+            Client Secret
+            <span class="spotify-secret-hint" :class="{ set: spotifyHasSecret }">
+              {{ spotifyHasSecret ? '已设置' : '未设置' }}
+            </span>
+          </label>
+          <input
+            v-model="spotifyForm.clientSecret"
+            class="input"
+            type="password"
+            autocomplete="off"
+            placeholder="留空表示不修改已保存的 Secret"
+          />
+        </div>
+
+        <!-- Device name -->
+        <div class="form-group">
+          <label>设备名称</label>
+          <input v-model="spotifyForm.deviceName" class="input" autocomplete="off" placeholder="TSMusicBot" />
+        </div>
+
+        <div class="spotify-actions">
+          <button class="btn-primary" :disabled="spotifySaving" @click="saveSpotify">
+            {{ spotifySaving ? '保存中…' : '保存' }}
+          </button>
+          <button class="btn-secondary spotify-connect" :disabled="spotifyConnecting" @click="connectSpotify">
+            <Icon icon="mdi:spotify" />
+            {{ spotifyConnecting ? '跳转中…' : '连接 Spotify' }}
+          </button>
+        </div>
+
+        <p v-if="spotifyMessage" class="spotify-message" :class="`tone-${spotifyMessageTone}`">{{ spotifyMessage }}</p>
+      </div>
+    </section>
+
     <!-- Audio Quality requires quality -->
     <section v-if="can('quality')" class="settings-section">
       <h2 class="section-title">音质设置</h2>
-      <div class="setting-row">
+      <div v-if="providerOn('jellyfin')" class="setting-row">
+        <div class="setting-label">
+          <Icon icon="mdi:jellyfish" class="setting-icon" />
+          Jellyfin 音质
+        </div>
+        <div class="quality-options">
+          <button
+            v-for="q in jellyfinQualityLevels"
+            :key="q.value"
+            class="quality-btn"
+            :class="{ active: jellyfinQuality === q.value }"
+            @click="setJellyfinQuality(q.value)"
+          >
+            <div class="quality-name">{{ q.label }}</div>
+            <div class="quality-desc">{{ q.desc }}</div>
+          </button>
+        </div>
+      </div>
+      <div v-if="providerOn('netease') || providerOn('qq') || providerOn('kugou') || providerOn('bilibili')" class="setting-row">
         <div class="setting-label">
           <Icon icon="mdi:music-note-eighth" class="setting-icon" />
           音源质量
@@ -526,6 +773,70 @@
 
       <label class="profile-toggle behavior-toggle">
         <div class="profile-toggle-text">
+          <div class="profile-toggle-label">语音闪避</div>
+          <div class="profile-toggle-hint">检测到其他客户端说话时自动压低音乐音量，说话结束后恢复。默认关闭。</div>
+        </div>
+        <input
+          v-model="voiceDuckingEnabled"
+          type="checkbox"
+          class="profile-toggle-switch"
+          :disabled="voiceDuckingControlsDisabled"
+          @change="saveVoiceDucking"
+        />
+      </label>
+
+      <div class="setting-row voice-ducking-volume">
+        <div class="setting-label">
+          <Icon icon="mdi:volume-minus" class="setting-icon" />
+          <div>
+            <div>说话时保留原音量</div>
+            <div class="voice-ducking-hint">例如设为 30%，有人说话时音乐将降至原音量的 30%。</div>
+          </div>
+        </div>
+        <div class="voice-ducking-controls">
+          <input
+            v-model.number="voiceDuckingVolumePercent"
+            type="range"
+            min="0"
+            max="100"
+            step="0.1"
+            class="voice-ducking-range"
+            :disabled="voiceDuckingControlsDisabled"
+            aria-label="说话时保留原音量百分比"
+          />
+          <div class="prefix-input-wrap">
+            <input
+              v-model.number="voiceDuckingVolumePercent"
+              type="number"
+              min="0"
+              max="100"
+              step="0.1"
+              class="input input-sm"
+              style="max-width:80px"
+              :disabled="voiceDuckingControlsDisabled"
+              aria-label="说话时保留原音量百分比"
+              @blur="normalizeVoiceDuckingVolume"
+            />
+            <span class="voice-ducking-unit">%</span>
+            <button class="btn-primary" :disabled="voiceDuckingControlsDisabled" @click="saveVoiceDucking">
+              {{ !voiceDuckingLoaded ? '加载设置…' : voiceDuckingSaving ? '保存中…' : '保存比例' }}
+            </button>
+          </div>
+        </div>
+        <p
+          v-if="voiceDuckingMessage"
+          class="voice-ducking-message"
+          :class="`tone-${voiceDuckingMessageTone}`"
+          :role="voiceDuckingMessageTone === 'warn' ? 'alert' : 'status'"
+          :aria-live="voiceDuckingMessageTone === 'warn' ? 'assertive' : 'polite'"
+          aria-atomic="true"
+        >
+          {{ voiceDuckingMessage }}
+        </p>
+      </div>
+
+      <label class="profile-toggle behavior-toggle">
+        <div class="profile-toggle-text">
           <div class="profile-toggle-label">本地音频播放</div>
           <div class="profile-toggle-hint">开启后允许在搜索页拖拽/选择本地音频上传并播放；关闭后会拒绝新的本地上传和本地歌曲播放请求。</div>
         </div>
@@ -534,6 +845,32 @@
           type="checkbox"
           class="profile-toggle-switch"
           @change="saveLocalAudioEnabled"
+        />
+      </label>
+
+      <label class="profile-toggle behavior-toggle">
+        <div class="profile-toggle-text">
+          <div class="profile-toggle-label">保存/加载播放清单（含重启后自动恢复队列）</div>
+          <div class="profile-toggle-hint">开启后可在网页与聊天命令（!save / !load / !queues）保存和加载播放清单，并在机器人重启后自动恢复并继续播放上次的队列。重启只能从当前曲目的开头恢复（不记忆进度）；Spotify 恢复为尽力而为。默认关闭。</div>
+        </div>
+        <input
+          v-model="savedQueuesEnabled"
+          type="checkbox"
+          class="profile-toggle-switch"
+          @change="saveSavedQueuesEnabled"
+        />
+      </label>
+
+      <label class="profile-toggle behavior-toggle">
+        <div class="profile-toggle-text">
+          <div class="profile-toggle-label">直接播放单曲时不清空队列</div>
+          <div class="profile-toggle-hint">开启后，直接播放单曲会插入到当前歌曲之后并立即播放，播完继续原队列，而不是清空整个队列。仅影响单曲的「直接播放」；歌单/专辑/电台仍会替换队列。默认关闭。</div>
+        </div>
+        <input
+          v-model="playKeepsQueue"
+          type="checkbox"
+          class="profile-toggle-switch"
+          @change="savePlayKeepsQueue"
         />
       </label>
     </section>
@@ -790,6 +1127,60 @@
       </div>
     </section>
 
+    <!-- API Keys -->
+    <section class="settings-section">
+      <h2 class="section-title">API 密钥</h2>
+      <p class="apikey-hint">
+        通过 API Key 调用本机的 REST API（请求头 <code>Authorization: Bearer</code> 或 <code>X-API-Key</code>）。
+        权限与你的账户一致；明文只在生成时显示一次，之后仅能看到前缀。
+      </p>
+      <div class="user-list">
+        <div v-for="k in apiKeyList" :key="k.id" class="user-item">
+          <div class="user-info">
+            <div class="user-name">{{ k.name }}</div>
+            <div class="apikey-meta">
+              <code class="apikey-prefix">{{ k.keyPrefix }}…</code>
+              <span>创建于 {{ formatDate(k.createdAt) }}</span>
+              <span>{{ k.lastUsedAt ? `最后使用 ${formatDate(k.lastUsedAt)}` : '从未使用' }}</span>
+            </div>
+          </div>
+          <div class="user-actions">
+            <button class="btn-sm btn-delete" title="吊销此密钥" @click="onRevokeApiKey(k)">
+              <Icon icon="mdi:delete" />
+            </button>
+          </div>
+        </div>
+        <div v-if="apiKeyList.length === 0 && !apiKeyLoadError" class="user-empty">还没有 API Key。</div>
+        <div v-if="apiKeyLoadError" class="user-error">{{ apiKeyLoadError }}</div>
+      </div>
+
+      <form class="user-add-form" @submit.prevent="onCreateApiKey">
+        <input v-model="newApiKeyName" class="input" placeholder="密钥名称（如：home-assistant）" maxlength="64" required />
+        <button class="btn-sm btn-primary" type="submit" :disabled="creatingApiKey">
+          {{ creatingApiKey ? '生成中…' : '生成密钥' }}
+        </button>
+      </form>
+      <p v-if="apiKeyMutationError" class="user-error">{{ apiKeyMutationError }}</p>
+
+      <!-- Created key modal: plaintext shown exactly once -->
+      <div v-if="createdKey" class="edit-modal-overlay" @click.self="createdKey = null">
+        <div class="edit-modal">
+          <h3 class="modal-title">密钥「{{ createdKey.key.name }}」已生成</h3>
+          <p class="modal-hint">请立即复制保存——这串明文只显示这一次，关闭后只能看到前缀。</p>
+          <div class="apikey-raw-row">
+            <code class="apikey-raw">{{ createdKey.rawKey }}</code>
+            <button class="btn-sm" @click="copyCreatedKey">
+              <Icon icon="mdi:content-copy" /> 复制
+            </button>
+          </div>
+          <p v-if="keyCopied" class="apikey-copied">已复制到剪贴板</p>
+          <div class="form-actions">
+            <button class="btn-sm btn-primary" @click="createdKey = null">完成</button>
+          </div>
+        </div>
+      </div>
+    </section>
+
     <!-- Audit Log -->
     <section v-if="session.isAdmin.value" class="settings-section">
       <h2 class="section-title">
@@ -812,14 +1203,23 @@
 </template>
 
 <script setup lang="ts">
-import { ref, reactive, onMounted, onUnmounted } from 'vue';
+import { ref, reactive, computed, onMounted, onUnmounted } from 'vue';
 import { Icon } from '@iconify/vue';
 import axios from 'axios';
 import AvatarUpload from '../components/AvatarUpload.vue';
 import CustomAvatarRow from '../components/CustomAvatarRow.vue';
+import PersonalNeteaseAccount from '../components/PersonalNeteaseAccount.vue';
 import QRCode from 'qrcode';
 import { usePlayerStore } from '../stores/player.js';
 import { useSession } from '../composables/useSession.js';
+import {
+  buildSpotifyPayload,
+  parseSpotifyRedirect,
+  statusSummary,
+  SPOTIFY_DISCLAIMER,
+  type SpotifyConfigForm,
+  type SpotifyStatus,
+} from '../composables/useSpotifySettings.js';
 
 const store = usePlayerStore();
 
@@ -876,17 +1276,35 @@ const qualityLevels = [
   { value: 'jymaster', label: '超清母带', desc: '最高质量' },
 ];
 
+// Jellyfin quality tiers (direct = untranscoded original; the rest are
+// server-side transcodes for low-bandwidth Jellyfin links).
+const jellyfinQuality = ref('direct');
+const jellyfinQualityLevels = [
+  { value: 'direct', label: '原始直传', desc: 'Direct（无转码）' },
+  { value: '320', label: '320kbps', desc: '服务器转码' },
+  { value: '192', label: '192kbps', desc: '服务器转码' },
+  { value: '128', label: '128kbps', desc: '服务器转码' },
+];
+
 async function loadQuality() {
   try {
     const res = await axios.get('/api/music/quality', { params: { botId: store.activeBotId ?? undefined } });
     currentQuality.value = res.data.netease || 'exhigh';
+    jellyfinQuality.value = res.data.jellyfin || 'direct';
   } catch { /* ignore */ }
 }
 
 async function setQuality(q: string) {
   currentQuality.value = q;
   try {
-    await axios.post('/api/music/quality', { quality: q, botId: store.activeBotId ?? undefined });
+    await axios.post('/api/music/quality', { quality: q, platform: 'netease', botId: store.activeBotId ?? undefined });
+  } catch { /* ignore */ }
+}
+
+async function setJellyfinQuality(q: string) {
+  jellyfinQuality.value = q;
+  try {
+    await axios.post('/api/music/quality', { quality: q, platform: 'jellyfin', botId: store.activeBotId ?? undefined });
   } catch { /* ignore */ }
 }
 
@@ -901,6 +1319,185 @@ const neteaseAuth = reactive({ loggedIn: false, nickname: '', avatarUrl: '' });
 const qqAuth = reactive({ loggedIn: false, nickname: '', avatarUrl: '' });
 const bilibiliAuth = reactive({ loggedIn: false, nickname: '', avatarUrl: '' });
 const kugouAuth = reactive({ loggedIn: false, nickname: '', avatarUrl: '' });
+const jellyfinAuth = reactive({ loggedIn: false, nickname: '' });
+
+// Server-side source gate (enabledProviders): cards for disabled sources are
+// hidden. Empty until GET /api/bot/settings responds — treat as all-on so a
+// slow load doesn't blank the page.
+const enabledProviders = ref<string[]>([]);
+function providerOn(p: string): boolean {
+  return enabledProviders.value.length === 0 || enabledProviders.value.includes(p);
+}
+
+// --- Default music source (issue #126) ---
+// Chinese labels for the gateable providers, shown in the default-source select.
+const PROVIDER_LABELS: Record<string, string> = {
+  netease: '网易云音乐',
+  qq: 'QQ音乐',
+  kugou: '酷狗音乐',
+  bilibili: '哔哩哔哩',
+  youtube: 'YouTube',
+  jellyfin: 'Jellyfin',
+};
+// Empty string = "auto" (follow the fixed priority order); persisted as null.
+const defaultPlatformForm = ref('');
+const defaultSourceSaving = ref(false);
+const defaultSourceMessage = ref('');
+const defaultSourceMessageTone = ref<'ok' | 'warn'>('ok');
+// Only currently-enabled sources can be picked as the default.
+const defaultSourceOptions = computed(() =>
+  enabledProviders.value
+    .filter((p) => p in PROVIDER_LABELS)
+    .map((p) => ({ value: p, label: PROVIDER_LABELS[p] })),
+);
+
+async function saveDefaultSource() {
+  defaultSourceSaving.value = true;
+  defaultSourceMessage.value = '';
+  try {
+    const res = await axios.post('/api/bot/settings', {
+      defaultPlatform: defaultPlatformForm.value || null,
+    });
+    defaultPlatformForm.value = res.data?.defaultPlatform ?? '';
+    // Push the new default across the app immediately (search bar / play calls
+    // read store.defaultSource, refreshed via GET /api/music/providers).
+    await store.fetchProviders();
+    defaultSourceMessageTone.value = 'ok';
+    defaultSourceMessage.value = '已保存';
+  } catch (err: any) {
+    defaultSourceMessageTone.value = 'warn';
+    defaultSourceMessage.value = err?.response?.status === 403
+      ? '没有权限修改设置（需要 bot.manage）'
+      : '保存失败，请稍后重试';
+  } finally {
+    defaultSourceSaving.value = false;
+  }
+}
+
+// --- Jellyfin connection (per-bot; password/apiKey are write-only) ---
+const jellyfinForm = reactive({
+  serverUrl: '',
+  authMode: 'userpass' as 'userpass' | 'apikey',
+  username: '',
+  password: '',
+  apiKey: '',
+  userId: '',
+});
+const jellyfinSaving = ref(false);
+const jellyfinTesting = ref(false);
+const jellyfinMessage = ref('');
+const jellyfinMessageTone = ref<'ok' | 'warn'>('ok');
+// Jellyfin is opt-in: its "enabled" bit is membership in enabledProviders
+// (unlike Spotify's dedicated spotify.enabled flag). Only trust the toggle
+// once the real list has loaded, so an early save can't clobber the other
+// providers with the empty placeholder list.
+const jellyfinEnabledForm = ref(false);
+const enabledProvidersLoaded = ref(false);
+
+// Credentials are stored per bot and never round-trip — the form starts blank
+// and empty secret fields mean "keep the bot's saved values".
+
+/** True when the form carries anything worth submitting as credentials. */
+function jellyfinFormHasCredentials(): boolean {
+  return Boolean(
+    jellyfinForm.serverUrl.trim() ||
+    jellyfinForm.username.trim() ||
+    jellyfinForm.password ||
+    jellyfinForm.apiKey ||
+    jellyfinForm.userId.trim(),
+  );
+}
+
+async function saveJellyfin() {
+  jellyfinSaving.value = true;
+  jellyfinMessage.value = '';
+  try {
+    // 1. Source on/off toggle (global, config-level).
+    // enabledProviders is a full-replace field, so only send it when the
+    // current list is known — otherwise we'd wipe the other sources.
+    const payload: Record<string, unknown> = {};
+    if (enabledProvidersLoaded.value) {
+      const others = enabledProviders.value.filter((p) => p !== 'jellyfin');
+      payload.enabledProviders = jellyfinEnabledForm.value ? [...others, 'jellyfin'] : others;
+    }
+    if (Object.keys(payload).length > 0) {
+      const res = await axios.post('/api/bot/settings', payload);
+      if (Array.isArray(res.data?.enabledProviders)) {
+        enabledProviders.value = res.data.enabledProviders;
+        jellyfinEnabledForm.value = res.data.enabledProviders.includes('jellyfin');
+        enabledProvidersLoaded.value = true;
+        // Search bar / home sections / FM cards react without a reload.
+        store.fetchProviders();
+      }
+      // Disabling a source can clear a default that pointed at it (backend
+      // reconciles enabledProviders → defaultPlatform); keep the select in sync.
+      if (res.data && 'defaultPlatform' in res.data) {
+        defaultPlatformForm.value = res.data.defaultPlatform ?? '';
+      }
+    }
+    // 2. Per-bot credentials: persist + reconfigure the live provider + verify.
+    if (jellyfinFormHasCredentials()) {
+      if (!store.activeBotId) {
+        jellyfinMessageTone.value = 'warn';
+        jellyfinMessage.value = '请先选择一个机器人再保存连接';
+        return;
+      }
+      const res = await axios.post('/api/auth/jellyfin/login', {
+        ...jellyfinForm,
+        botId: store.activeBotId,
+      });
+      if (!res.data?.ok) {
+        jellyfinMessageTone.value = 'warn';
+        jellyfinMessage.value = `凭据已保存，但连接失败：${res.data?.error ?? '未知错误'}`;
+        await checkAuthStatus();
+        return;
+      }
+    }
+    jellyfinMessageTone.value = 'ok';
+    jellyfinMessage.value = '已保存';
+    await checkAuthStatus();
+  } catch (err: any) {
+    jellyfinMessageTone.value = 'warn';
+    jellyfinMessage.value = err?.response?.status === 403
+      ? '没有权限修改设置（需要 bot.manage）'
+      : '保存失败，请稍后重试';
+  } finally {
+    jellyfinSaving.value = false;
+  }
+}
+
+// Round-trips /System/Info against the SELECTED BOT with the CURRENT form
+// values (empty secret fields fall back to the bot's stored ones
+// server-side), without touching saved credentials.
+async function testJellyfin() {
+  if (!store.activeBotId) {
+    jellyfinMessageTone.value = 'warn';
+    jellyfinMessage.value = '请先选择一个机器人再测试连接';
+    return;
+  }
+  jellyfinTesting.value = true;
+  jellyfinMessage.value = '';
+  try {
+    const res = await axios.post('/api/auth/jellyfin/test', {
+      ...jellyfinForm,
+      botId: store.activeBotId,
+    });
+    if (res.data?.ok) {
+      jellyfinMessageTone.value = 'ok';
+      jellyfinMessage.value = `连接成功：${res.data.serverName ?? 'Jellyfin'} ${res.data.version ?? ''}`;
+    } else {
+      jellyfinMessageTone.value = 'warn';
+      jellyfinMessage.value = `连接失败：${res.data?.error ?? '未知错误'}`;
+    }
+  } catch (err: any) {
+    jellyfinMessageTone.value = 'warn';
+    jellyfinMessage.value = err?.response?.status === 403
+      ? '没有权限执行平台登录（需要 platform.auth）'
+      : '测试请求失败，请稍后重试';
+  } finally {
+    jellyfinTesting.value = false;
+  }
+}
 
 // QR state
 interface QrState {
@@ -931,20 +1528,23 @@ function getQrState(platform: string): QrState {
 }
 
 async function checkAuthStatus() {
-  try {
-    const botId = store.activeBotId ?? undefined;
-    const [nRes, qRes, bRes, kRes] = await Promise.all([
-      axios.get('/api/auth/status', { params: { platform: 'netease', botId } }),
-      axios.get('/api/auth/status', { params: { platform: 'qq', botId } }),
-      axios.get('/api/auth/status', { params: { platform: 'bilibili', botId } }),
-      axios.get('/api/auth/status', { params: { platform: 'kugou', botId } }),
-    ]);
-    Object.assign(neteaseAuth, nRes.data);
-    Object.assign(qqAuth, qRes.data);
-    Object.assign(bilibiliAuth, bRes.data);
-    Object.assign(kugouAuth, kRes.data);
-  } catch {
-    // API not ready
+  // allSettled: one slow/unconfigured platform must not hide the others'
+  // status (jellyfin probes its server with a real HTTP round-trip).
+  const botId = store.activeBotId ?? undefined;
+  const [nRes, qRes, bRes, kRes, jRes] = await Promise.allSettled([
+    axios.get('/api/auth/status', { params: { platform: 'netease', botId } }),
+    axios.get('/api/auth/status', { params: { platform: 'qq', botId } }),
+    axios.get('/api/auth/status', { params: { platform: 'bilibili', botId } }),
+    axios.get('/api/auth/status', { params: { platform: 'kugou', botId } }),
+    axios.get('/api/auth/status', { params: { platform: 'jellyfin', botId } }),
+  ]);
+  if (nRes.status === 'fulfilled') Object.assign(neteaseAuth, nRes.value.data);
+  if (qRes.status === 'fulfilled') Object.assign(qqAuth, qRes.value.data);
+  if (bRes.status === 'fulfilled') Object.assign(bilibiliAuth, bRes.value.data);
+  if (kRes.status === 'fulfilled') Object.assign(kugouAuth, kRes.value.data);
+  if (jRes.status === 'fulfilled') {
+    jellyfinAuth.loggedIn = Boolean(jRes.value.data?.loggedIn);
+    jellyfinAuth.nickname = jRes.value.data?.nickname ?? '';
   }
 }
 
@@ -1135,17 +1735,79 @@ async function savePrefix() {
 const idleTimeout = ref(0);
 // Defaults OFF to match the backend default (config.ts getDefaultConfig).
 const autoPauseOnEmpty = ref(false);
+// Voice ducking defaults OFF and retains 30% of the configured player volume.
+const voiceDuckingEnabled = ref(false);
+const voiceDuckingVolumePercent = ref(30);
+const voiceDuckingLoaded = ref(false);
+const voiceDuckingSaving = ref(false);
+const voiceDuckingControlsDisabled = computed(
+  () => !voiceDuckingLoaded.value || voiceDuckingSaving.value,
+);
+const voiceDuckingMessage = ref('');
+const voiceDuckingMessageTone = ref<'ok' | 'warn'>('ok');
+let savedVoiceDucking = { enabled: false, volumePercent: 30 };
+let voiceDuckingRequestRevision = 0;
 const localAudioEnabled = ref(true);
+// Saved-queues + play-keeps-queue toggles (#119), both default OFF.
+const savedQueuesEnabled = ref(false);
+const playKeepsQueue = ref(false);
+
+function normalizeVoiceDuckingVolume(): number {
+  const raw = voiceDuckingVolumePercent.value as number | string;
+  const value = raw === '' ? Number.NaN : Number(raw);
+  voiceDuckingVolumePercent.value = Number.isFinite(value)
+    ? Math.min(100, Math.max(0, value))
+    : savedVoiceDucking.volumePercent;
+  return voiceDuckingVolumePercent.value;
+}
+
+function applyVoiceDuckingConfig(config: unknown) {
+  if (!config || typeof config !== 'object') return;
+  const value = config as { enabled?: unknown; volumePercent?: unknown };
+  voiceDuckingEnabled.value = typeof value.enabled === 'boolean' ? value.enabled : false;
+  const percent = value.volumePercent;
+  voiceDuckingVolumePercent.value = typeof percent === 'number' && Number.isFinite(percent)
+    ? Math.min(100, Math.max(0, percent))
+    : 30;
+  savedVoiceDucking = {
+    enabled: voiceDuckingEnabled.value,
+    volumePercent: voiceDuckingVolumePercent.value,
+  };
+}
 
 async function loadIdleTimeout() {
+  const voiceDuckingLoadRevision = voiceDuckingRequestRevision;
   try {
     const res = await axios.get('/api/bot/settings');
     idleTimeout.value = res.data.idleTimeoutMinutes ?? 0;
     autoPauseOnEmpty.value = res.data.autoPauseOnEmpty ?? false;
+    // A later save owns the state. Do not let an older GET response overwrite
+    // it if this loader is ever re-entered while a POST is in flight.
+    if (voiceDuckingLoadRevision === voiceDuckingRequestRevision) {
+      applyVoiceDuckingConfig(res.data.voiceDucking ?? { enabled: false, volumePercent: 30 });
+      voiceDuckingLoaded.value = true;
+      voiceDuckingMessage.value = '';
+    }
     localAudioEnabled.value = res.data.localAudioEnabled ?? true;
+    savedQueuesEnabled.value = res.data.savedQueuesEnabled ?? false;
+    playKeepsQueue.value = res.data.playKeepsQueue ?? false;
+    store.savedQueuesEnabled = savedQueuesEnabled.value;
     applyGuestModeFromServer(res.data.guestMode);
     applyAdminGroupsFromServer(res.data.adminGroups);
-  } catch { /* ignore */ }
+    applySpotifyConfig(res.data.spotify);
+    if (Array.isArray(res.data.enabledProviders)) {
+      enabledProviders.value = res.data.enabledProviders;
+      jellyfinEnabledForm.value = res.data.enabledProviders.includes('jellyfin');
+      enabledProvidersLoaded.value = true;
+    }
+    // null (unset) → "" so the select shows "自动（按优先级）".
+    defaultPlatformForm.value = res.data.defaultPlatform ?? '';
+  } catch {
+    if (!voiceDuckingLoaded.value) {
+      voiceDuckingMessageTone.value = 'warn';
+      voiceDuckingMessage.value = '语音闪避设置加载失败，请刷新页面重试';
+    }
+  }
 }
 
 async function saveIdleTimeout() {
@@ -1160,11 +1822,141 @@ async function saveAutoPause() {
   } catch { /* ignore */ }
 }
 
+async function saveVoiceDucking() {
+  if (!voiceDuckingLoaded.value || voiceDuckingSaving.value) return;
+  voiceDuckingSaving.value = true;
+  voiceDuckingRequestRevision++;
+  voiceDuckingMessage.value = '';
+  const submitted = {
+    enabled: voiceDuckingEnabled.value,
+    volumePercent: normalizeVoiceDuckingVolume(),
+  };
+  try {
+    const res = await axios.post('/api/bot/settings', { voiceDucking: submitted });
+    applyVoiceDuckingConfig(res.data?.voiceDucking ?? submitted);
+    voiceDuckingMessageTone.value = 'ok';
+    voiceDuckingMessage.value = '已保存';
+  } catch {
+    applyVoiceDuckingConfig(savedVoiceDucking);
+    voiceDuckingMessageTone.value = 'warn';
+    voiceDuckingMessage.value = '保存失败，请稍后重试';
+  } finally {
+    voiceDuckingSaving.value = false;
+  }
+}
+
 async function saveLocalAudioEnabled() {
   try {
     const res = await axios.post('/api/bot/settings', { localAudioEnabled: localAudioEnabled.value });
     localAudioEnabled.value = res.data.localAudioEnabled ?? localAudioEnabled.value;
   } catch { /* ignore */ }
+}
+
+async function saveSavedQueuesEnabled() {
+  try {
+    const res = await axios.post('/api/bot/settings', { savedQueuesEnabled: savedQueuesEnabled.value });
+    savedQueuesEnabled.value = res.data.savedQueuesEnabled ?? savedQueuesEnabled.value;
+    // Keep the shared store flag (nav gate) in sync without a reload.
+    store.savedQueuesEnabled = savedQueuesEnabled.value;
+  } catch { /* ignore */ }
+}
+
+async function savePlayKeepsQueue() {
+  try {
+    const res = await axios.post('/api/bot/settings', { playKeepsQueue: playKeepsQueue.value });
+    playKeepsQueue.value = res.data.playKeepsQueue ?? playKeepsQueue.value;
+  } catch { /* ignore */ }
+}
+
+// --- Spotify (Connect) settings (§8) ---
+// NOTE: This card's status comes ONLY from /api/spotify/status (playback OAuth
+// `authorized`). It is deliberately NOT wired to the player store's
+// authStatus.spotify (which reflects /api/auth/status?platform=spotify — the
+// separate metadata Web-API login). Keep the two concepts distinct.
+const spotifyForm = reactive<SpotifyConfigForm>({
+  enabled: false,
+  backend: 'auto',
+  clientId: '',
+  clientSecret: '',
+  deviceName: 'TSMusicBot',
+  bitrate: 320,
+});
+const spotifyHasSecret = ref(false);
+const spotifyStatus = ref<SpotifyStatus | null>(null);
+const spotifySaving = ref(false);
+const spotifyConnecting = ref(false);
+const spotifyMessage = ref('');
+const spotifyMessageTone = ref<'ok' | 'warn'>('ok');
+
+const SPOTIFY_BACKENDS: { value: SpotifyConfigForm['backend']; label: string }[] = [
+  { value: 'auto', label: '自动' },
+  { value: 'go-librespot', label: 'go-librespot' },
+  { value: 'librespot', label: 'librespot' },
+];
+const SPOTIFY_BITRATES = [96, 160, 320];
+
+const spotifyStatusSummary = computed(() => statusSummary(spotifyStatus.value, spotifyForm.enabled));
+
+// Populate the form from the masked GET /api/bot/settings response. The raw
+// clientSecret is write-only and never returned — only `hasClientSecret`.
+function applySpotifyConfig(sp: any) {
+  if (!sp || typeof sp !== 'object') return;
+  spotifyForm.enabled = Boolean(sp.enabled);
+  if (sp.backend === 'auto' || sp.backend === 'go-librespot' || sp.backend === 'librespot') {
+    spotifyForm.backend = sp.backend;
+  }
+  spotifyForm.clientId = typeof sp.clientId === 'string' ? sp.clientId : '';
+  spotifyForm.deviceName = typeof sp.deviceName === 'string' ? sp.deviceName : '';
+  if (typeof sp.bitrate === 'number') spotifyForm.bitrate = sp.bitrate;
+  spotifyForm.clientSecret = ''; // always blank on load; blank on save = unchanged
+  spotifyHasSecret.value = Boolean(sp.hasClientSecret);
+}
+
+async function loadSpotifyStatus() {
+  try {
+    const res = await axios.get('/api/spotify/status');
+    spotifyStatus.value = res.data;
+  } catch {
+    spotifyStatus.value = null;
+  }
+}
+
+async function saveSpotify() {
+  spotifySaving.value = true;
+  try {
+    const res = await axios.post('/api/bot/settings', buildSpotifyPayload(spotifyForm));
+    applySpotifyConfig(res.data?.spotify);
+    await loadSpotifyStatus();
+  } catch { /* ignore */ } finally {
+    spotifySaving.value = false;
+  }
+}
+
+async function connectSpotify() {
+  spotifyConnecting.value = true;
+  spotifyMessage.value = '';
+  try {
+    const { data } = await axios.get('/api/spotify/login');
+    window.location.href = data.url;
+  } catch (err: any) {
+    spotifyConnecting.value = false;
+    spotifyMessageTone.value = 'warn';
+    spotifyMessage.value = err?.response?.status === 403
+      ? '没有权限执行平台登录（需要 platform.auth）'
+      : '无法开始 Spotify 授权，请稍后重试';
+  }
+}
+
+// On mount, surface the ?spotify=success|error redirect result, then strip the
+// param so a refresh doesn't re-show it.
+function handleSpotifyRedirect() {
+  const r = parseSpotifyRedirect(window.location.search);
+  if (!r) return;
+  spotifyMessageTone.value = r === 'success' ? 'ok' : 'warn';
+  spotifyMessage.value = r === 'success' ? 'Spotify 授权成功' : 'Spotify 授权失败或被取消';
+  const url = new URL(window.location.href);
+  url.searchParams.delete('spotify');
+  history.replaceState(null, '', url.pathname + url.search + url.hash);
 }
 
 // --- Guest mode (admin only) ---
@@ -1481,6 +2273,90 @@ async function onConfirmReset() {
   }
 }
 
+// --- API Keys management ---
+interface ApiKeyEntry { id: string; name: string; keyPrefix: string; createdAt: number; lastUsedAt: number | null }
+const apiKeyList = ref<ApiKeyEntry[]>([]);
+const apiKeyLoadError = ref('');
+const apiKeyMutationError = ref('');
+const newApiKeyName = ref('');
+const creatingApiKey = ref(false);
+const createdKey = ref<{ key: ApiKeyEntry; rawKey: string } | null>(null);
+const keyCopied = ref(false);
+
+async function loadApiKeys() {
+  apiKeyLoadError.value = '';
+  try {
+    const res = await fetch('/api/keys');
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const body = await res.json();
+    apiKeyList.value = body.keys ?? [];
+  } catch (e) {
+    apiKeyLoadError.value = (e as Error).message;
+  }
+}
+
+async function onCreateApiKey() {
+  const name = newApiKeyName.value.trim();
+  if (!name) return;
+  apiKeyMutationError.value = '';
+  creatingApiKey.value = true;
+  try {
+    const res = await fetch('/api/keys', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name }),
+    });
+    const body = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(body.error ?? `HTTP ${res.status}`);
+    createdKey.value = body;
+    keyCopied.value = false;
+    newApiKeyName.value = '';
+    await loadApiKeys();
+  } catch (e) {
+    apiKeyMutationError.value = (e as Error).message;
+  } finally {
+    creatingApiKey.value = false;
+  }
+}
+
+async function onRevokeApiKey(k: ApiKeyEntry) {
+  if (!confirm(`确认吊销 API Key「${k.name}」？使用它的集成将立即失效。`)) return;
+  apiKeyMutationError.value = '';
+  try {
+    const res = await fetch(`/api/keys/${k.id}`, { method: 'DELETE' });
+    if (!res.ok) {
+      const b = await res.json().catch(() => ({}));
+      throw new Error(b.error ?? `HTTP ${res.status}`);
+    }
+    await loadApiKeys();
+  } catch (e) {
+    apiKeyMutationError.value = (e as Error).message;
+  }
+}
+
+async function copyCreatedKey() {
+  if (!createdKey.value) return;
+  const text = createdKey.value.rawKey;
+  try {
+    await navigator.clipboard.writeText(text);
+    keyCopied.value = true;
+  } catch {
+    // Clipboard API is unavailable on non-secure origins — fall back to a
+    // temporary textarea + execCommand.
+    const ta = document.createElement('textarea');
+    ta.value = text;
+    ta.style.position = 'fixed';
+    ta.style.opacity = '0';
+    document.body.appendChild(ta);
+    ta.select();
+    try {
+      keyCopied.value = document.execCommand('copy');
+    } finally {
+      document.body.removeChild(ta);
+    }
+  }
+}
+
 // --- Per-user permission editor (members only) ---
 const CAPABILITIES: { token: string; label: string }[] = [
   { token: 'player.control', label: '播放控制' },
@@ -1617,13 +2493,15 @@ function describeAction(e: AuditEntry): string {
     case 'user.password_changed':   return `修改自己的密码`;
     case 'user.role_changed':       return `变更 ${target} 的角色`;
     case 'user.permissions_changed': return `权限变更 → ${target}`;
+    case 'api_key.created':          return `${target} 生成 API Key`;
+    case 'api_key.deleted':          return `${target} 吊销 API Key`;
     default:                        return `${e.action} → ${target}`;
   }
 }
 
 function auditActionClass(action: string): string {
   if (action === 'user.deleted') return 'audit-action-danger';
-  if (action === 'user.password_reset' || action === 'user.password_changed') return 'audit-action-warn';
+  if (action === 'user.password_reset' || action === 'user.password_changed' || action === 'api_key.deleted') return 'audit-action-warn';
   return 'audit-action-ok';
 }
 
@@ -1631,7 +2509,10 @@ onMounted(() => {
   store.fetchBots(); // Refresh bot status on page visit
   checkAuthStatus();
   loadQuality();
-  loadIdleTimeout();
+  loadIdleTimeout(); // also populates the Spotify config form (same endpoint)
+  loadSpotifyStatus();
+  handleSpotifyRedirect();
+  loadApiKeys();
   if (session.isAdmin.value) {
     loadUsers();
     loadAudit();
@@ -1788,6 +2669,10 @@ onUnmounted(() => {
   &.kugou-icon {
     color: var(--brand-kugou);
   }
+
+  &.jellyfin-icon {
+    color: var(--brand-jellyfin);
+  }
 }
 
 .account-name {
@@ -1892,6 +2777,79 @@ onUnmounted(() => {
   align-self: flex-end;
 }
 
+// --- Spotify (Connect) card ---
+.spotify-disclaimer {
+  font-size: 13px;
+  line-height: 1.6;
+  color: var(--color-paused);
+  background: var(--color-paused-15);
+  border-radius: var(--radius-sm);
+  padding: 12px 14px;
+  margin: -4px 0 16px;
+}
+
+.spotify-icon { color: #1db954; }
+
+.account-status {
+  &.tone-ok { color: var(--color-online); }
+  &.tone-warn { color: var(--color-paused); }
+  &.tone-off { color: var(--text-tertiary); }
+}
+
+.spotify-toggle { padding-top: 0; margin-bottom: 4px; }
+.spotify-row { margin-top: 4px; }
+
+.spotify-btn-group {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.spotify-choice {
+  padding: 8px 16px;
+  background: var(--bg-card);
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-sm);
+  font-size: 13px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: all var(--transition-fast);
+
+  &:hover { border-color: var(--color-primary); color: var(--color-primary); }
+  &.active {
+    background: var(--color-primary-10);
+    border-color: var(--color-primary);
+    color: var(--color-primary);
+  }
+}
+
+.spotify-secret-hint {
+  margin-left: 8px;
+  font-size: 11px;
+  font-weight: 500;
+  color: var(--text-tertiary);
+  &.set { color: var(--color-online); }
+}
+
+.spotify-actions {
+  display: flex;
+  gap: 10px;
+  margin-top: 8px;
+}
+
+.spotify-connect {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.spotify-message {
+  margin: 10px 0 0;
+  font-size: 13px;
+  &.tone-ok { color: var(--color-online); }
+  &.tone-warn { color: #e26a6a; }
+}
+
 // Shared
 .form-row {
   display: flex;
@@ -1916,6 +2874,13 @@ onUnmounted(() => {
 }
 
 .input-sm { max-width: 80px; }
+
+// The default-source picker holds full source names ("网易云音乐"), so it needs
+// more room than the 80px .input-sm cap.
+.default-source-select {
+  max-width: none;
+  flex: 0 0 160px;
+}
 
 .textarea {
   width: 100%;
@@ -2244,6 +3209,45 @@ onUnmounted(() => {
   padding-top: 4px;
 }
 
+.voice-ducking-volume {
+  padding: 4px 0 14px;
+}
+
+.voice-ducking-hint {
+  font-size: 12px;
+  color: var(--text-tertiary);
+  margin-top: 4px;
+  line-height: 1.4;
+  font-weight: 400;
+}
+
+.voice-ducking-controls {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  flex-wrap: wrap;
+}
+
+.voice-ducking-range {
+  flex: 1 1 240px;
+  min-width: 160px;
+  accent-color: var(--color-primary);
+  cursor: pointer;
+}
+
+.voice-ducking-unit {
+  font-size: 13px;
+  opacity: 0.7;
+}
+
+.voice-ducking-message {
+  margin: 8px 0 0;
+  font-size: 12px;
+
+  &.tone-ok { color: var(--color-online); }
+  &.tone-warn { color: #e26a6a; }
+}
+
 @media (max-width: 768px) {
   .profile-bot-header {
     padding: 14px 12px;
@@ -2271,6 +3275,17 @@ onUnmounted(() => {
       transform: translateX(20px);
     }
   }
+
+  .voice-ducking-controls {
+    align-items: stretch;
+    flex-direction: column;
+    gap: 10px;
+  }
+
+  .voice-ducking-range {
+    flex-basis: auto;
+    width: 100%;
+  }
 }
 
 // --- User Management ---
@@ -2293,6 +3308,18 @@ onUnmounted(() => {
 .user-add-form .input { flex: 1; min-width: 140px; }
 .user-empty, .user-error { font-size: 12px; color: var(--text-secondary); padding: 8px 0; }
 .user-error { color: #e26a6a; }
+.apikey-hint { font-size: 12px; color: var(--text-secondary); margin: 0 0 10px; line-height: 1.6; }
+.apikey-hint code { background: var(--bg-card); border: 1px solid var(--border-color); border-radius: 4px; padding: 1px 4px; }
+.apikey-meta { display: flex; gap: 12px; flex-wrap: wrap; font-size: 12px; color: var(--text-secondary); margin-top: 2px; }
+.apikey-prefix { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px; }
+.apikey-raw-row { display: flex; gap: 8px; align-items: center; }
+.apikey-raw {
+  flex: 1; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12px; word-break: break-all; padding: 8px;
+  background: var(--bg-card); border: 1px solid var(--border-color); border-radius: 6px;
+  user-select: all;
+}
+.apikey-copied { font-size: 12px; color: var(--color-primary); margin: 6px 0 0; }
 .modal-hint { color: var(--text-secondary); font-size: 12px; margin: 0 0 8px; }
 .form-actions { display: flex; gap: 8px; justify-content: flex-end; margin-top: 8px; }
 

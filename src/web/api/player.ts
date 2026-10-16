@@ -1,17 +1,71 @@
-import { Router } from "express";
+import { Router, type RequestHandler } from "express";
 import type { BotManager } from "../../bot/manager.js";
 import type { BotDatabase } from "../../data/database.js";
+import type { MusicProvider, Song, ArtistSongPage } from "../../music/provider.js";
 import type { Logger } from "../../logger.js";
 import { parseCommand } from "../../bot/commands.js";
 import { requireBotAccess } from "../middleware/requirePermission.js";
 import { authorize } from "../middleware/authorize.js";
+import {
+  isValidSoundEffectUrl,
+  normalizeSoundEffectTrustedOrigin,
+  SoundEffectReplacedError,
+} from "../../audio/player.js";
+import { createRateLimit } from "../middleware/rateLimit.js";
+import { supportsPersonalLogin } from "./personal-music.js";
+
+/** Hard cap on how many tracks one "播放全部" request may queue — a safety net
+ *  against a pathological catalogue (and against an upstream paging bug). */
+const MAX_ARTIST_QUEUE = 500;
+const ARTIST_QUEUE_PAGE = 100;
+
+/** Walks every page of an artist's catalogue (best-first, de-duplicated). */
+export async function collectArtistSongs(
+  fetchPage: (artistId: string, offset?: number, limit?: number) => Promise<ArtistSongPage>,
+  artistId: string
+): Promise<Song[]> {
+  const songs: Song[] = [];
+  const seen = new Set<string>();
+  for (let offset = 0; offset < MAX_ARTIST_QUEUE; offset += ARTIST_QUEUE_PAGE) {
+    const page = await fetchPage(artistId, offset, ARTIST_QUEUE_PAGE);
+    for (const song of page.songs) {
+      if (!seen.has(song.id)) {
+        seen.add(song.id);
+        songs.push(song);
+        if (songs.length === MAX_ARTIST_QUEUE) return songs;
+      }
+    }
+    if (!page.hasMore || page.songs.length === 0) break;
+  }
+  return songs;
+}
 
 export function createPlayerRouter(
   botManager: BotManager,
   logger: Logger,
   database?: BotDatabase,
+  soundEffectTrustedOrigin = process.env.POWERFUL_TS_ORIGIN ?? "",
 ): Router {
   const router = Router();
+  const normalizedSoundEffectOrigin = normalizeSoundEffectTrustedOrigin(
+    soundEffectTrustedOrigin,
+  );
+  const requireSoundEffectOrigin: RequestHandler = (_req, res, next) => {
+    if (!normalizedSoundEffectOrigin) {
+      res.status(503).json({ error: "Trusted PowerfulTS origin is not configured" });
+      return;
+    }
+    next();
+  };
+  const soundEffectLimit = createRateLimit({
+    capacity: 3,
+    refillPerSec: 1 / 3,
+    keyFn: (req) => {
+      const userId = req.user?.id ?? req.ip ?? "unknown";
+      const botId = (req.params as Record<string, string | undefined>).botId ?? "unknown";
+      return `${userId}:${botId}`;
+    },
+  });
 
   // Access check runs BEFORE the existence/resolver check so a member who is
   // not allowed a bot always gets a uniform 403 — whether or not the bot
@@ -36,6 +90,10 @@ export function createPlayerRouter(
     if (platform === "qq") return "-q";
     if (platform === "youtube") return "-y";
     if (platform === "kugou") return "-k";
+    if (platform === "jellyfin") return "-j";
+    // The flag-less default is now the configured default platform (jellyfin
+    // unless disabled), so netease needs an explicit flag.
+    if (platform === "netease") return "-n";
     return "";
   };
 
@@ -47,6 +105,11 @@ export function createPlayerRouter(
 
   function rejectDisabledLocalAudio(res: any): void {
     res.status(403).json({ error: "本地音频播放已关闭" });
+  }
+
+  function requesterName(req: any): string {
+    const name = req.user?.username;
+    return typeof name === "string" && name.trim() ? name.trim() : "游客";
   }
 
   router.post("/:botId/play", authorize({ capability: "player.control" }), async (req, res) => {
@@ -62,7 +125,7 @@ export function createPlayerRouter(
         res.status(400).json({ error: "Invalid command" });
         return;
       }
-      const response = await bot.executeCommand(cmd);
+      const response = await bot.executeCommand(cmd, undefined, requesterName(req));
       res.json({ message: response });
     } catch (err) {
       res.status(500).json({ error: (err as Error).message });
@@ -78,12 +141,46 @@ export function createPlayerRouter(
         res.status(400).json({ error: "Invalid command" });
         return;
       }
-      const response = await bot.executeCommand(cmd);
+      const response = await bot.executeCommand(cmd, undefined, requesterName(req));
       res.json({ message: response });
     } catch (err) {
       res.status(500).json({ error: (err as Error).message });
     }
   });
+
+  // Overlay a short, pre-authorized entrance sound without touching the
+  // primary track/live relay or queue. AudioPlayer owns replacement, decoding,
+  // duration, buffer, and failure isolation for this independent one-shot.
+  router.post(
+    "/:botId/sound-effect",
+    authorize({ capability: "player.control" }),
+    requireSoundEffectOrigin,
+    soundEffectLimit,
+    async (req, res) => {
+      const bot = (req as any).bot;
+      const { url } = req.body ?? {};
+      if (!isValidSoundEffectUrl(url, normalizedSoundEffectOrigin!)) {
+        res.status(400).json({ error: "A valid http(s) sound effect URL is required" });
+        return;
+      }
+      if (!bot.isConnected()) {
+        res.status(409).json({ error: "Bot is not connected" });
+        return;
+      }
+
+      try {
+        await bot.getPlayer().playSoundEffect(url);
+        res.json({ ok: true, soundEffect: true });
+      } catch (err) {
+        if (err instanceof SoundEffectReplacedError) {
+          res.json({ ok: true, soundEffect: false, replaced: true });
+          return;
+        }
+        logger.warn({ err }, "Sound effect start failed");
+        res.status(502).json({ error: "Sound effect could not be started" });
+      }
+    },
+  );
 
   // Pull a short-lived HTTP stream produced by an explicitly authorized
   // browser capture session. FFmpeg already handles the WebM/Opus stream and
@@ -142,12 +239,20 @@ export function createPlayerRouter(
         rejectDisabledLocalAudio(res);
         return;
       }
-      const provider = bot.getProviderFor(
-        platform === "bilibili" || platform === "qq" || platform === "youtube" || platform === "local" || platform === "kugou"
+      let provider = bot.getProviderFor(
+        platform === "bilibili" || platform === "qq" || platform === "youtube" || platform === "local" || platform === "kugou" || platform === "jellyfin"
           ? platform
           : "netease"
       );
-      const message = await bot.startFm(provider);
+      // A signed-in user who linked their own NetEase account gets FM from
+      // THEIR taste, not the bot's shared login (#164). Songs still resolve
+      // through the shared provider when played.
+      const user = (req as any).user;
+      if (provider.platform === "netease" && user && user.role !== "guest" && database) {
+        const cookie = database.getUserMusicCookie(user.id, "netease");
+        if (cookie && supportsPersonalLogin(provider)) provider = provider.withCookie(cookie);
+      }
+      const message = await bot.startFm(provider, requesterName(req));
       res.json({
         ok:
           !message.startsWith("No FM songs") &&
@@ -225,7 +330,7 @@ export function createPlayerRouter(
           .json({ error: "position must be a finite non-negative number" });
         return;
       }
-      bot.getPlayer().seek(position);
+      bot.seek(position);
       res.json({ message: `Seeked to ${Math.floor(position)}s`, seekOffset: position });
     } catch (err) {
       res.status(500).json({ error: (err as Error).message });
@@ -320,7 +425,7 @@ export function createPlayerRouter(
         `!playlist ${platformFlag(platform)} ${playlistId}`.trim(),
         "!"
       )!;
-      const response = await bot.executeCommand(cmd);
+      const response = await bot.executeCommand(cmd, undefined, requesterName(req));
       res.json({ message: response });
     } catch (err) {
       res.status(500).json({ error: (err as Error).message });
@@ -340,7 +445,7 @@ export function createPlayerRouter(
       // Use the bot's own provider lookup — it already knows about youtube,
       // which the router's constructor params did not.
       const provider = bot.getProviderFor(
-        platform === "bilibili" || platform === "qq" || platform === "youtube" || platform === "local" || platform === "kugou"
+        platform === "bilibili" || platform === "qq" || platform === "youtube" || platform === "local" || platform === "kugou" || platform === "jellyfin"
           ? platform
           : "netease"
       );
@@ -381,7 +486,7 @@ export function createPlayerRouter(
       const queue = bot.getQueueManager();
       queue.clear();
       for (const song of queueable) {
-        queue.add({ ...song, platform: provider.platform });
+        queue.add({ ...song, platform: provider.platform, requestedBy: requesterName(req) });
       }
       // Sweep AFTER the queue is rebuilt: the previous queue's local uploads are
       // released and deleted, but an empty/failed playlist (early return above)
@@ -433,7 +538,7 @@ export function createPlayerRouter(
         return;
       }
       const provider = bot.getProviderFor(
-        platform === "bilibili" || platform === "qq" || platform === "youtube" || platform === "local" || platform === "kugou"
+        platform === "bilibili" || platform === "qq" || platform === "youtube" || platform === "local" || platform === "kugou" || platform === "jellyfin"
           ? platform
           : "netease"
       );
@@ -467,7 +572,7 @@ export function createPlayerRouter(
       const queue = bot.getQueueManager();
       queue.clear();
       for (const song of queueable) {
-        queue.add({ ...song, platform: provider.platform });
+        queue.add({ ...song, platform: provider.platform, requestedBy: requesterName(req) });
       }
       // Sweep AFTER the queue is rebuilt (see play-playlist).
       bot.cleanupQueuedLocalSongs?.("queue_replaced");
@@ -501,7 +606,104 @@ export function createPlayerRouter(
     }
   });
 
-  // Play a single song by ID — resolves URL on demand
+  // Play an artist's songs. An artist page queues the singer's FULL catalogue —
+  // never just the hot 50 — so this pages through getArtistAllSongs when the
+  // source can page a catalogue, and falls back to getArtistSongs (hot songs)
+  // when it cannot.
+  router.post("/:botId/play-artist", authorize({ capability: "player.control", guestFlag: "playCollection" }), async (req, res) => {
+    try {
+      const bot = (req as any).bot;
+      const { artistId, platform } = req.body;
+      if (!artistId) {
+        res.status(400).json({ error: "artistId is required" });
+        return;
+      }
+      if (isLocalAudioDisabled(bot, platform)) {
+        rejectDisabledLocalAudio(res);
+        return;
+      }
+      const provider = bot.getProviderFor(
+        platform === "bilibili" || platform === "qq" || platform === "youtube" || platform === "local" || platform === "kugou" || platform === "jellyfin"
+          ? platform
+          : "netease"
+      );
+      if (typeof provider.getArtistSongs !== "function") {
+        res.status(501).json({ error: "Not supported by this provider" });
+        return;
+      }
+      // Whole catalogue when the source can page it (bounded by the collector's
+      // safety cap); otherwise the hot songs are the best it can offer.
+      const fetchPage = provider.getArtistAllSongs?.bind(provider);
+
+      const songs = fetchPage
+        ? await collectArtistSongs(fetchPage, artistId)
+        : await provider.getArtistSongs(artistId, 50);
+      if (songs.length === 0) {
+        res.json({ ok: false, message: "该歌手暂无可用歌曲" });
+        return;
+      }
+
+      // Same QQ batch-resolve optimization as play-album: drop tracks that are
+      // region/copyright blocked instead of burning retries on them.
+      let queueable: { id: string }[] = songs;
+      const totalCount = songs.length;
+      const qqLike = provider as { getPlayableSongIds?: (ids: string[]) => Promise<Set<string> | null> };
+      if (typeof qqLike.getPlayableSongIds === "function") {
+        const playable = await qqLike.getPlayableSongIds(songs.map((s: { id: string }) => s.id));
+        if (playable !== null) {
+          queueable = songs.filter((s: { id: string }) => playable.has(s.id));
+        }
+      }
+      if (queueable.length === 0) {
+        res.json({ ok: false, message: `歌手 ${totalCount} 首歌曲均无版权可播放（区域/版权限制）` });
+        return;
+      }
+
+      // Catalogue and copyright lookups leave current playback running. Only
+      // the queue replacement and playback itself occupy the shared play gate.
+      const body = await bot.runExclusive(async () => {
+        bot.getPlayer().stop();
+        bot.getPlayer().resetFailures();
+        const queue = bot.getQueueManager();
+        queue.clear();
+        for (const song of queueable) {
+          queue.add({ ...song, platform: provider.platform, requestedBy: requesterName(req) });
+        }
+        // Sweep AFTER the queue is rebuilt (see play-playlist).
+        bot.cleanupQueuedLocalSongs?.("queue_replaced");
+
+        const mode = queue.getMode();
+        let first;
+        if (mode === "random" || mode === "rloop") {
+          const idx = Math.floor(Math.random() * queue.size());
+          first = queue.playAt(idx);
+        } else {
+          first = queue.play();
+        }
+
+        let started = first ? await bot.resolveAndPlay(first) : false;
+        if (first && !started) started = await bot.playNext(20);
+
+        const playing = queue.current();
+        const loadedMsg = queueable.length < totalCount
+          ? `已加载 ${queueable.length}/${totalCount} 首（其余区域/版权限制）`
+          : `已加载 ${queueable.length} 首`;
+        return started && playing
+          ? { ok: true, message: `${loadedMsg}，正在播放：${playing.name}` }
+          : { ok: false, message: `${loadedMsg}，但无法开始播放。` };
+      });
+      res.json(body);
+    } catch (err) {
+      logger.error({ err }, "play-artist failed");
+      res.status(500).json({ error: (err as Error).message });
+    }
+  });
+
+  // Play a single song by ID — resolves URL on demand. Funnels through
+  // bot.playSingleSong so the config.playKeepsQueue decision (clear-and-play vs
+  // insert-and-jump, keeping the queue) lives in one place shared with chat
+  // !play. Serialized via runExclusive like /play-now-song so concurrent
+  // requests can't interleave the queue mutation + playback (#119).
   router.post("/:botId/play-song", authorize({ capability: "player.control" }), async (req, res) => {
     try {
       const bot = (req as any).bot;
@@ -514,23 +716,16 @@ export function createPlayerRouter(
         rejectDisabledLocalAudio(res);
         return;
       }
-      const queue = bot.getQueueManager();
-      bot.getPlayer().stop();
-      queue.clear();
-      queue.add(song);
-      queue.play();
-
-      bot.getPlayer().resetFailures();
-      const ok = await bot.resolveAndPlay(queue.current()!);
-      // Sweep AFTER the new song is queued+resolved, so replaying a local song
-      // that was still in the queue doesn't delete the file we're about to play.
-      bot.cleanupQueuedLocalSongs?.("queue_replaced");
-      if (!ok) {
-        res.json({ ok: false, message: `无法播放「${song.name || song.id}」（区域/版权限制）` });
-        return;
-      }
-
-      res.json({ ok: true, message: `正在播放：${song.name || 'Unknown'} - ${song.artist || 'Unknown'}` });
+      // The cleanupQueuedLocalSongs sweep now lives inside playSingleSong's
+      // clear branch — do NOT also call it here, or it would delete retained
+      // local uploads in keep-queue mode.
+      const body = await bot.runExclusive(async () => {
+        const ok = await bot.playSingleSong({ ...song }, requesterName(req));
+        return ok
+          ? { ok: true, message: `正在播放：${song.name || 'Unknown'} - ${song.artist || 'Unknown'}` }
+          : { ok: false, message: `无法播放「${song.name || song.id}」（区域/版权限制）` };
+      });
+      res.json(body);
     } catch (err) {
       res.status(500).json({ error: (err as Error).message });
     }
@@ -562,7 +757,7 @@ export function createPlayerRouter(
         // after natural track end without queue.clear()).
         const insertedAt =
           queue.getCurrentIndex() < 0 ? queue.size() : queue.getCurrentIndex() + 1;
-        queue.addNext(song);
+        queue.addNext({ ...song, requestedBy: requesterName(req) });
 
         if (wasIdle) {
           // Promote the just-added song to current and start it.
@@ -604,7 +799,7 @@ export function createPlayerRouter(
         const queue = bot.getQueueManager();
         const insertedAt =
           queue.getCurrentIndex() < 0 ? queue.size() : queue.getCurrentIndex() + 1;
-        queue.addNext(song);
+        queue.addNext({ ...song, requestedBy: requesterName(req) });
         queue.playAt(insertedAt);
         bot.getPlayer().resetFailures();
         const ok = await bot.resolveAndPlay(queue.current()!);
@@ -636,7 +831,7 @@ export function createPlayerRouter(
       const body = await bot.runExclusive(async () => {
         const queue = bot.getQueueManager();
         const wasIdle = bot.getPlayer().getState() === "idle";
-        queue.add(song);
+        queue.add({ ...song, requestedBy: requesterName(req) });
 
         // If nothing was playing, start this newly-added song immediately.
         if (wasIdle) {
@@ -664,7 +859,7 @@ export function createPlayerRouter(
         return;
       }
       const provider = bot.getProviderFor(
-        platform === "bilibili" || platform === "qq" || platform === "youtube" || platform === "local" || platform === "kugou"
+        platform === "bilibili" || platform === "qq" || platform === "youtube" || platform === "local" || platform === "kugou" || platform === "jellyfin"
           ? platform
           : "netease"
       );
@@ -676,7 +871,7 @@ export function createPlayerRouter(
       }
 
       const queue = bot.getQueueManager();
-      queue.add({ ...song, platform: provider.platform });
+      queue.add({ ...song, platform: provider.platform, requestedBy: requesterName(req) });
 
       // If nothing is playing, start the first song
       if (bot.getPlayer().getState() === "idle") {
@@ -727,6 +922,7 @@ export function createPlayerRouter(
       coverUrl: r.coverUrl,
       platform: r.platform,
       playedAt: r.playedAt,
+      requestedBy: r.requestedBy,
     }));
     res.json({ history });
   });

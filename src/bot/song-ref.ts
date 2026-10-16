@@ -1,3 +1,5 @@
+import axios from "axios";
+
 /**
  * Parsing helpers for picking an EXACT song in a !play / !add / !playnext query,
  * so same-name songs can be disambiguated instead of always getting the single
@@ -19,8 +21,21 @@ export interface SongRef {
 }
 
 /**
+ * Could this token plausibly BE an id on a supported platform?
+ *   - NetEase / Kugou numeric ids      → all digits
+ *   - BiliBili                         → BV + 8-12 alphanumerics
+ *   - QQ mid (14), YouTube (11), Spotify (22), Jellyfin GUID / Kugou hash (32)
+ *                                      → 11+ chars from the id alphabet
+ * Deliberately conservative: anything rejected here just stays an ordinary
+ * search term, which is what it almost certainly was.
+ */
+function looksLikeSongId(token: string): boolean {
+  return /^(?:\d+|BV[0-9A-Za-z]{8,12}|[0-9A-Za-z_-]{11,})$/i.test(token);
+}
+
+/**
  * Detect an explicit song reference in a query. Recognizes:
- *   - `id:<id>`                         → platform from flags/default
+ *   - `id <id>` / `id:<id>`             → platform from flags/default
  *   - NetEase song URL                  → music.163.com/song?id=N (also /#/song?id=N, /song/N)
  *   - QQ song URL                       → y.qq.com/.../songDetail/MID (or ?songmid=MID)
  *   - BiliBili BVID (bare or in a URL)  → bilibili.com/video/BVxxxx, b23.tv, or BVxxxx
@@ -30,11 +45,25 @@ export function parseSongRef(raw: string): SongRef | null {
   const q = (raw ?? "").trim();
   if (!q) return null;
 
-  // Explicit "id:<id>" — platform decided by the command's flags/default.
-  // Strip trailing punctuation that tags along from a chat paste ("id:12345."
-  // / "id:12345)") — no supported id (numeric / BVID / mid) ends in those.
-  const idPrefix = /^id:\s*(\S+)$/i.exec(q);
-  if (idPrefix) return { id: idPrefix[1].replace(/[.,;)\]]+$/, ""), platform: null };
+  // Explicit id — platform decided by the command's flags/default. The
+  // separator is a colon or plain whitespace, so `id <id>` matches the
+  // `!<cmd> <sub> <arg>` shape of every other command (issue #139) while the
+  // older `id:<id>` keeps working. Strip trailing punctuation that tags along
+  // from a chat paste ("id:12345." / "id:12345)") — no supported id
+  // (numeric / BVID / mid) ends in those.
+  //
+  // The colon is an unambiguous sigil, so `id:<anything>` is always an id. A
+  // space is not: "ID 4" and "ID Bruno" are real track titles, and `id <url>`
+  // has to keep resolving as a URL. So the space form only claims tokens that
+  // could actually be an id; anything else falls through to the URL branches
+  // below and ultimately to a plain search.
+  const idPrefix = /^id(:\s*|\s+)(\S+)$/i.exec(q);
+  if (idPrefix) {
+    const id = idPrefix[2].replace(/[.,;)\]]+$/, "");
+    if (idPrefix[1].startsWith(":") || looksLikeSongId(id)) {
+      return { id, platform: null };
+    }
+  }
 
   // BiliBili BV id, bare or inside a bilibili URL (NetEase ids are numeric, so
   // a "BV..." token never collides with them).
@@ -70,4 +99,83 @@ export function parseSelectionIndex(raw: string): number | null {
   if (!m) return null;
   const n = parseInt(m[1], 10);
   return Number.isFinite(n) && n > 0 ? n : null;
+}
+
+export interface PlaylistRef {
+  id: string;
+  platform: "netease" | "qq" | "youtube";
+}
+
+/** Drop the [URL]…[/URL] BBCode the TeamSpeak client wraps around pasted links. */
+function stripUrlBBCode(text: string): string {
+  return text.replace(/\[\/?url(?:=[^\]]*)?\]/gi, " ");
+}
+
+/**
+ * Detect a playlist URL (#160) — a web link, or the full link inside an app's
+ * share text. The platform comes from the URL, so a QQ link works without
+ * `-q`. Returns `null` for anything else (a playlist name or bare id), which
+ * the caller handles as before.
+ */
+export function parsePlaylistRef(raw: string): PlaylistRef | null {
+  const q = stripUrlBBCode(raw ?? "").trim();
+  if (!q) return null;
+
+  if (/music\.163\.com/i.test(q)) {
+    const m = /[?&#/]id=(\d+)/.exec(q) ?? /\/playlist\/(\d+)/.exec(q);
+    if (m) return { id: m[1], platform: "netease" };
+  }
+
+  if (/y\.qq\.com/i.test(q)) {
+    const m = /\/playlist\/(\d+)/.exec(q) ?? /[?&](?:id|disstid)=(\d+)/.exec(q);
+    if (m) return { id: m[1], platform: "qq" };
+  }
+
+  if (/youtube\.com|youtu\.be/i.test(q)) {
+    const m = /[?&]list=([\w-]+)/.exec(q);
+    if (m) return { id: m[1], platform: "youtube" };
+  }
+
+  return null;
+}
+
+/**
+ * Find a NetEase (163cn.tv) or QQ Music (c6.y.qq.com/base/fcgi-bin/u) share
+ * short link — what the phone apps copy. Only these hosts are recognized so
+ * the bot never fetches an arbitrary user-supplied URL.
+ */
+export function findShareShortLink(raw: string): string | null {
+  const q = stripUrlBBCode(raw ?? "");
+  const m =
+    /https?:\/\/163cn\.(?:tv|link)\/[0-9A-Za-z]+/i.exec(q) ??
+    /https?:\/\/c\d*\.y\.qq\.com\/base\/fcgi-bin\/u\?__=[0-9A-Za-z]+/i.exec(q);
+  return m ? m[0] : null;
+}
+
+type RedirectGet = (url: string) => Promise<{ status: number; location: string | undefined }>;
+
+const redirectGet: RedirectGet = async (url) => {
+  const res = await axios.get(url, {
+    maxRedirects: 0,
+    timeout: 5000,
+    validateStatus: () => true,
+    responseType: "stream",
+  });
+  res.data?.destroy?.();
+  const location = res.headers.location;
+  return { status: res.status, location: typeof location === "string" ? location : undefined };
+};
+
+/** Follow a share short link one hop. Returns the target URL, or null. */
+export async function resolveShareLink(
+  url: string,
+  get: RedirectGet = redirectGet,
+): Promise<string | null> {
+  try {
+    const { status, location } = await get(url);
+    if (status < 300 || status >= 400 || !location) return null;
+    return new URL(location, url).toString();
+  } catch {
+    return null;
+  }
 }

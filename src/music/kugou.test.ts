@@ -1,5 +1,5 @@
-import { describe, it, expect } from "vitest";
-import { mapKugouSong, mapKugouSongs, mapKugouAlbums, mapKugouPlaylist, mapKugouPlaylists, krcToLrc } from "./kugou.js";
+import { describe, it, expect, vi } from "vitest";
+import { mapKugouSong, mapKugouSongs, mapKugouAlbums, mapKugouPlaylist, mapKugouPlaylists, krcToLrc, KugouProvider } from "./kugou.js";
 import { parseLyrics } from "./netease.js";
 
 describe("mapKugouSongs", () => {
@@ -191,5 +191,34 @@ describe("mapKugouPlaylists", () => {
     expect(mapKugouPlaylists([{ specialname: "x", specialid: 1154672, listid: 9 }])).toHaveLength(0);
     expect(mapKugouPlaylists([{ name: "no id" }])).toHaveLength(0);
     expect(mapKugouPlaylists(undefined)).toEqual([]);
+  });
+});
+
+describe("KugouProvider.search pagination", () => {
+  function mockProvider() {
+    const p = new KugouProvider();
+    const get = vi.fn().mockResolvedValue({ data: { data: { info: [] } } });
+    (p as any).mobileHttp = { get };
+    return { p, get };
+  }
+
+  function searchParams(get: ReturnType<typeof vi.fn>) {
+    const call = get.mock.calls[0];
+    expect(call, "expected a mobile search call").toBeTruthy();
+    return call[1].params as Record<string, unknown>;
+  }
+
+  it("sets page to offset/limit+1 and keeps pagesize=limit", async () => {
+    const { p, get } = mockProvider();
+    await p.search("hello", 20, 20); // page 2
+    const params = searchParams(get);
+    expect(params.page).toBe(2);
+    expect(params.pagesize).toBe(20);
+  });
+
+  it("defaults offset to 0 → page 1 (backward compatible)", async () => {
+    const { p, get } = mockProvider();
+    await p.search("hello", 20);
+    expect(searchParams(get).page).toBe(1);
   });
 });

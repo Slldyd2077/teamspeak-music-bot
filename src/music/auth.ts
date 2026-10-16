@@ -1,8 +1,10 @@
 import fs from "node:fs";
 import path from "node:path";
 
-/** Cookie-bearing platforms that support per-bot login isolation. */
-export type CookiePlatform = "netease" | "qq" | "bilibili" | "kugou";
+/** Cookie-bearing platforms that support per-bot login isolation.
+ *  For jellyfin the "cookie" is a JSON string carrying the access token /
+ *  userId / deviceId (see jellyfin.ts). */
+export type CookiePlatform = "netease" | "qq" | "bilibili" | "kugou" | "jellyfin";
 
 /**
  * Per-bot platform cookie store. Cookies are keyed by (botId, platform) so each
@@ -15,6 +17,8 @@ export type CookiePlatform = "netease" | "qq" | "bilibili" | "kugou";
 export interface CookieStore {
   save(botId: string, platform: CookiePlatform, cookie: string): void;
   load(botId: string, platform: CookiePlatform): string;
+  /** Remove a bot's saved credential (platform logout). Idempotent. */
+  delete(botId: string, platform: CookiePlatform): void;
 }
 
 export function createCookieStore(cookieDir: string): CookieStore {
@@ -44,6 +48,15 @@ export function createCookieStore(cookieDir: string): CookieStore {
         return data.cookie ?? "";
       } catch {
         return "";
+      }
+    },
+
+    delete(botId, platform) {
+      const filePath = path.join(cookieDir, botId, `${platform}.json`);
+      try {
+        fs.unlinkSync(filePath);
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
       }
     },
   };

@@ -1,4 +1,5 @@
 import type { Request, Response, NextFunction } from "express";
+import { isApiKeyOnlyRequest } from "../auth/api-key-header.js";
 
 const SAFE_METHODS = new Set(["GET", "HEAD", "OPTIONS"]);
 
@@ -10,7 +11,7 @@ const SAFE_METHODS = new Set(["GET", "HEAD", "OPTIONS"]);
  * this header check covers the remaining attack surface.
  */
 export function csrfOriginCheck(req: Request, res: Response, next: NextFunction): void {
-  if (SAFE_METHODS.has(req.method)) {
+  if (SAFE_METHODS.has(req.method) || isApiKeyOnlyRequest(req)) {
     next();
     return;
   }

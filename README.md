@@ -1,3 +1,5 @@
+> **Docker 定制版 v1.12.3（2026-10-16）**：`main` 已整合通用分支、后台逐曲响度分析、5 秒平滑增益与 PCM 语音闪避。默认镜像为 `ghcr.io/slldyd2077/teamspeak-music-bot:latest`；历史生产兼容分支仍保留供旧连接层部署回退。
+
 <p align="center">
   <img src="https://img.shields.io/badge/TeamSpeak-音乐机器人-blue?style=for-the-badge&logo=teamspeak" alt="TSMusicBot" />
 </p>
@@ -5,11 +7,11 @@
 <h1 align="center">TSMusicBot</h1>
 
 <p align="center">
-  <strong>TeamSpeak 音乐机器人</strong> — 网易云音乐 + QQ 音乐 + 酷狗音乐 + 哔哩哔哩 + YouTube（可选），YesPlayMusic 风格 WebUI 控制面板
+  <strong>TeamSpeak 音乐机器人</strong> — 网易云音乐 + QQ 音乐 + 酷狗音乐 + 哔哩哔哩 + YouTube（可选），Jellyfin / Spotify 可选启用，YesPlayMusic 风格 WebUI 控制面板
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/Node.js-20+-339933?logo=nodedotjs&logoColor=white" />
+  <img src="https://img.shields.io/badge/Node.js-20%20%7C%2022%20LTS-339933?logo=nodedotjs&logoColor=white" />
   <img src="https://img.shields.io/badge/TypeScript-5-3178C6?logo=typescript&logoColor=white" />
   <img src="https://img.shields.io/badge/Vue-3-4FC08D?logo=vuedotjs&logoColor=white" />
   <img src="https://img.shields.io/badge/许可证-MIT-green" />
@@ -17,26 +19,49 @@
   <img src="https://img.shields.io/badge/Docker-支持-2496ED?logo=docker&logoColor=white" />
   <img src="https://img.shields.io/badge/酷狗音乐-支持-2ca2f9" />
   <img src="https://img.shields.io/badge/BiliBili-支持-00a1d6?logo=bilibili&logoColor=white" />
+  <img src="https://img.shields.io/badge/Jellyfin-可选-aa5cc3?logo=jellyfin&logoColor=white" />
   <img src="https://img.shields.io/badge/YouTube-可选-FF0000?logo=youtube&logoColor=white" />
+  <img src="https://img.shields.io/badge/Spotify-可选-1DB954?logo=spotify&logoColor=white" />
   <img src="https://img.shields.io/badge/TS3-支持-2580C3?logo=teamspeak&logoColor=white" />
   <img src="https://img.shields.io/badge/TS6-支持-2580C3?logo=teamspeak&logoColor=white" />
 </p>
+
+> v1.10.0 新增**可选**的 [Jellyfin](https://jellyfin.org/) 音源（由 [@ItsEricRao](https://github.com/ItsEricRao) 在 [PR #123](https://github.com/ZHANGTIANYAO1/teamspeak-music-bot/pull/123) 中贡献）：连接自建 Jellyfin 服务器直接播放你自己的音乐库。默认关闭，在 **设置 → Jellyfin 音乐库** 一键开启；原有在线音源保持默认启用，行为不变。
+
+> 🍴 **PowerfulTS 定制分支**：[`main`](https://github.com/Slldyd2077/teamspeak-music-bot/tree/main) 是 [PowerfulTS](https://github.com/Slldyd2077/PowerfulTS) 管理面板配套的音乐与网页语音引擎。本分支持续合并 [原版主干](https://github.com/ZHANGTIANYAO1/teamspeak-music-bot)，并保留 PowerfulTS 所需的 per-bot 音源及平台账号隔离、双向 Opus 中继、网页语音闪避和入场音效接口。**PowerfulTS 需从本分支构建引擎；原版镜像不能直接替换。** 分支名中的 `v1.12` 是历史名称，不表示当前只包含上游 v1.12 的代码。
+
+## 与 PowerfulTS 的关系
+
+[PowerfulTS](https://github.com/Slldyd2077/PowerfulTS) 提供服务器监控、账号与好友、歌单、网页通话和一起看等面板功能；本分支负责音乐搜索与播放，以及浏览器语音在 TeamSpeak 中的接收与发送。两者独立部署，更新面板不会自动更新本引擎。
+
+- PowerfulTS 直接连接 TS3 / TS6 ServerQuery，读取服务器数据；本引擎连接同一虚拟服务器的 UDP 语音端口（通常 9987）。Query 端口不能当作机器人语音端口。
+- `/api/music/*` 和 `/api/auth/*` 的机器人音源与平台账号请求须带 `botId`；每个 bot 的 Cookie 和音质配置独立。新增的艺术家查询与 B 站分 P 查询也遵守该约定。
+- `POST /api/player/:botId/live` 接收网页麦克风及电脑音频流，`/api/voice/downlink/:botId` WebSocket 提供频道 Opus 下行；`POST /api/player/:botId/sound-effect` 提供入场音效叠加。
+- 网页通话 bot 可触发音乐机器人的语音闪避；语音桥自身不闪避。上游 WebUI 用户的个人网易云登录使用独立 provider，不覆盖 bot 的平台 Cookie。
+- 引擎反向拉取音频时，`POWERFUL_TS_ORIGIN` 须设为引擎实际可访问的面板 origin，并与 PowerfulTS 的 `LIVE_AUDIO_PUBLIC_URL` 一致。升级前保留两边的数据卷。
+
+部署版本与接口核对见 [PowerfulTS 安装与适配说明](https://github.com/Slldyd2077/PowerfulTS/blob/main/docs/release-guide.md#上游引擎)。建议记录构建源码提交及实际镜像 ID；健康接口的版本字符串不足以证明运行中的镜像包含定制接口。
+
+本次于 2026-10-09 同步上游主干 `28c128d`（上游更新日志 v1.15.2），并保留本分支的 PowerfulTS 扩展；同时包含昵称 3–30 个 Unicode 字符的连接前检查和 identity 连接前持久化修复。
+
 
 ## 功能特性
 
 - **WebUI 鉴权与细粒度权限（必选）** — 用户名 + 密码登录，多用户、两种角色（管理员 / 成员）；成员可进一步配置**细粒度能力**（播放控制 / 队列管理 / 机器人管理 / 平台登录 / 音质）和**按机器人授权白名单**，所有变更操作由后端逐请求强制校验。bcrypt 加密、HttpOnly 会话 Cookie，CSRF 防护，WebSocket 同样鉴权。首次访问引导创建管理员。从无鉴权旧版本升级时请参阅 [更新升级](#更新升级) 章节
 - **游客模式（免登录点歌，默认关闭）** — 管理员可选择允许访客**无需账号密码**进入 WebUI 点歌，并逐项配置游客权限（8 个开关，默认仅「添加到队列末尾」开启）与可控机器人白名单；游客无法查看 / 修改任何设置、管理机器人或访问用户管理。开启后登录页出现 **「以游客身份进入」**。详见下文 **「游客模式 / Guest mode」** 小节
 - **本地收藏歌单** — 在首页 / 搜索 / 歌单页一键收藏，收藏内容按用户存储，登录后跨设备同步
-- **本地音频上传播放** — 在搜索页拖拽或选择本地音频上传，上传后可直接播放 / 下一首播放 / 加入队列；管理员可在 设置 → 行为设置 开关此功能，播放结束或停止/清空/替换队列时会清理服务端接收的本地文件
+- **保存/加载播放清单 + 重启后自动恢复队列（可选，默认关闭）** — 管理员在 设置 → 行为设置 开启后，可在网页「已存队列」页或聊天命令（`!save` / `!load` / `!queues`）把当前队列保存为清单，随时**替换**加载或**追加**到队列末尾；同时机器人重启后会自动恢复并继续播放上次的队列。网页保存可选「共享」，聊天保存进入共享清单。**说明**：重启只能从当前曲目的开头恢复（不记忆播放进度）；Spotify 自动恢复为尽力而为（依赖 sidecar 可用）。详见 [使用说明](#使用说明)
+- **本地音视频上传播放** — 在搜索页拖拽或选择本地文件上传，音频（mp3 / flac / wav / m4a / ogg / opus 等）和视频（mp4 / mov / avi / mkv / flv / wmv 等）都支持，视频上传后只保留其中的音轨；上传后可直接播放 / 下一首播放 / 加入队列；管理员可在 设置 → 行为设置 开关此功能，播放结束或停止/清空/替换队列时会清理服务端接收的本地文件
 - **专属链接（单机器人锁定）** — 通过 `/bot/<id>` 专属链接打开 WebUI 时锁定到单个机器人，刷新后保持，适合把某台机器人的控制页分享给特定用户
 - **频道无人时自动暂停** — 机器人所在频道没有其他人时自动暂停播放，有人加入后自动恢复（**默认关闭**，可在设置中开启）
-- **多平台音源** — 网易云音乐 + QQ 音乐 + 酷狗音乐 + 哔哩哔哩（默认内置），YouTube 可选启用（通过 yt-dlp），统一搜索，结果标注来源
+- **Jellyfin 音源（可选）** — 连接自建 [Jellyfin](https://jellyfin.org/) 服务器作为额外音源：搜索（歌曲 / 专辑 / 歌单）、懒解析直传播放、同步歌词、收藏 Instant Mix 电台（`!fm -j`）、首页「最近添加 / 播放最多 / 收藏 / 流派」，并把播放进度回报给 Jellyfin（PlayCount / 播放状态）。**默认关闭**，在 设置 → Jellyfin 音乐库 一键开启。详见 [可选：Jellyfin 音源](#可选jellyfin-音源)
+- **多平台音源（enabledProviders 门控）** — 网易云音乐 / QQ 音乐 / 酷狗音乐 / 哔哩哔哩 / YouTube（yt-dlp，需安装）**默认启用**，可在 `config.json` 的 `enabledProviders` 中逐个停用；Jellyfin 为可选音源（见上），**Spotify（实验性）** 由独立开关控制（需 Premium + 自建开发者应用，默认关闭，详见 [Spotify 音源（实验性）](#spotify-音源实验性)）。统一搜索（歌曲 / 歌单 / 专辑均支持翻页「加载更多」），结果标注来源，禁用音源不出现在搜索栏
 - **真实客户端协议 (TS3/TS6 双协议)** — 机器人在 TeamSpeak 中可见（非 ServerQuery 隐身模式），自动检测并适配 TS3 和 TS6 服务器，支持 TS6 HTTP Query API
 - **YesPlayMusic 风格 WebUI** — 精美界面，支持深色/浅色主题切换
 - **完整播放控制** — 播放/暂停/上一首/下一首/进度跳转/音量调节
 - **四种播放模式** — 顺序播放/循环播放/随机播放/随机循环
 - **实时歌词同步** — 歌词滚动显示，支持翻译歌词，服务端帧计数精确同步
-- **歌单管理** — 推荐歌单/我的歌单/每日推荐/私人FM，点击播放全部；私人 FM 支持网易云、**QQ 音乐雷达推荐**（`!fm -q`）与**酷狗私人电台**（`!fm -k`）。网易云、QQ、酷狗均提供登录后的推荐歌单 / 每日推荐 / 我的歌单
+- **歌单管理** — 推荐歌单/我的歌单/每日推荐/私人FM，点击播放全部；私人 FM 支持网易云、**QQ 音乐雷达推荐**（`!fm -q`）与**酷狗私人电台**（`!fm -k`）。网易云、QQ、酷狗均提供登录后的推荐歌单 / 每日推荐 / 我的歌单。多人共用时，每个网页端用户可在 **设置 → 账户** 扫码绑定**自己的网易云账号**，之后他在网页端开启的网易云私人 FM 按他自己的口味推荐（未绑定则用机器人的共享账号；TS 聊天里的 `!fm` 仍用共享账号）
 - **音质选择** — 标准(128k) / 较高(192k) / 极高(320k) / 无损(FLAC) / Hi-Res / 超清母带
 - **B站视频音频提取** — 搜索B站视频，自动提取DASH最高码率音频流播放
 - **B站热门推荐** — 首页展示B站热门视频和个性化推荐（登录后更准确）
@@ -56,25 +81,30 @@
 
 ### 方式一：Windows 一键部署（最简单）
 
-只需电脑有网络连接，其他一切自动安装。
+先装好 Node.js，其余依赖（含内置 FFmpeg）全部自动安装。
 
 ```
-1. 下载或 clone 本项目
-2. 双击 scripts\setup.bat      （首次安装，自动安装 Node.js 和所有依赖）
-3. 双击 scripts\start.bat      （启动机器人）
-4. 浏览器打开 http://localhost:3000
+1. 安装 Node.js 22 LTS（https://nodejs.org/ 或 https://nodejs.cn/）
+2. 下载或 clone 本项目
+3. 双击 scripts\setup.bat      （安装依赖并构建，不含 Node.js 本身）
+4. 双击 scripts\start.bat      （启动机器人）
+5. 浏览器打开 http://localhost:3000
 ```
 
-> `setup.bat` 会自动通过 winget 安装 Node.js（如果未安装），运行 `npm install` 安装所有依赖（包括内置 FFmpeg），最后构建项目。之后每次只需双击 `start.bat` 启动。
+> **先装 Node.js 22 LTS**（[nodejs.org](https://nodejs.org/) / 国内镜像 [nodejs.cn](https://nodejs.cn/)）。`setup.bat` 检测到没装 Node 时会给出下载地址并退出，不会替你安装。
+>
+> 之后 `setup.bat` 会运行 `npm install` 安装所有依赖（包括内置 FFmpeg），按当前 Node 版本准备好原生模块，最后构建项目。之后每次只需双击 `start.bat` 启动。
+>
+> **Node 20 已不再支持**：better-sqlite3 从 12.10.0 起不再发布它那个 ABI（115）的预编译包，装起来必须先备好 Python + C++ 构建工具（[#152](https://github.com/ZHANGTIANYAO1/teamspeak-music-bot/issues/152)）。Node 24 及更新的大版本能用，但 @discordjs/opus 0.10.0 同样没有 Node 24（ABI 137）的预编译包，安装脚本会改用源码编译，需要构建工具且耗时更久——所以推荐 22 LTS。**装好之后不要再换 Node 大版本**：原生模块只能在编译它的那个版本上加载，换版本后必须重新运行 `setup.bat`（脚本会自动检测并重装，见下方常见问题）。
 
 ### 方式二：手动安装（所有系统）
 
-**前置条件：** [Node.js 20+](https://nodejs.org/) 和一个 TeamSpeak 服务器（TS3/TS5/TS6 均可）。
+**前置条件：** [Node.js 22 LTS](https://nodejs.org/)（Node 24 及更新版本也能用，但需要源码编译原生模块；Node 20 已不再支持）和一个 TeamSpeak 服务器（TS3/TS5/TS6 均可）。
 FFmpeg **已自动内置**，无需手动安装。
 
 ```bash
 # 下载项目
-git clone https://github.com/ZHANGTIANYAO1/teamspeak-music-bot.git
+git clone --branch main --single-branch https://github.com/Slldyd2077/teamspeak-music-bot.git
 cd teamspeak-music-bot
 
 # 安装依赖
@@ -95,9 +125,9 @@ npm start
 所有依赖已内置（Node.js、FFmpeg、Opus 编码器），无需安装任何额外软件。
 
 ```bash
-git clone https://github.com/ZHANGTIANYAO1/teamspeak-music-bot.git
+git clone --branch main --single-branch https://github.com/Slldyd2077/teamspeak-music-bot.git
 cd teamspeak-music-bot/scripts/docker
-docker-compose up -d
+docker compose pull && docker compose up -d
 ```
 
 打开浏览器访问 **http://localhost:3000**
@@ -105,7 +135,9 @@ docker-compose up -d
 <details>
 <summary>Docker 详细说明</summary>
 
-- 首次构建需要几分钟（编译原生模块）
+- 默认拉取本 fork 的预构建镜像 `ghcr.io/slldyd2077/teamspeak-music-bot:latest`（amd64 / arm64），无需本地编译
+- 更新时先 `git pull` 获取新的 Compose，再执行 `docker compose pull && docker compose up -d`；只执行 `up -d` 不会拉取新镜像
+- 固定版本可改用 `:1.12.3`；镜像包含 per-bot 账号隔离、网页双向语音、语音闪避、入场音效及后台逐曲响度均衡
 - 默认使用 `host` 网络模式，机器人可直接连接局域网 TS3 服务器
 - 数据持久化在 Docker 命名卷 `tsmusicbot-data` 中（数据库、Cookie、日志）
 - 内置健康检查（`/api/health`），支持 Docker 自动重启
@@ -113,7 +145,7 @@ docker-compose up -d
 ```bash
 docker logs -f tsmusicbot          # 查看日志
 docker-compose down                # 停止
-docker-compose up -d --build       # 代码更新后重新构建
+docker compose pull && docker compose up -d       # 拉取定制镜像并重建容器
 ```
 
 如果 TS3 服务器在其他机器上，编辑 `docker-compose.yml`：
@@ -125,14 +157,35 @@ ports:
 
 </details>
 
-### 方式四：Linux 一键安装
+### 方式四：Linux 安装脚本
+
+Linux 下有两个脚本，按需二选一：
+
+| | `scripts/install.sh`（一键安装 + 系统服务） | `scripts/setup.sh`（只安装构建） |
+|---|---|---|
+| 适合 | 想开箱即用、开机自启的服务器 | 想自己决定怎么常驻（screen / tmux / pm2 / 自写服务）的用户，或 macOS |
+| Node.js | 没有或版本过低时**自动安装 Node 22 LTS**（apt / yum / pacman） | **不会安装**，需先自行装好 Node 22.12+ |
+| 系统依赖 | 自动安装构建工具（和 FFmpeg，作为内置 FFmpeg 的后备） | 不安装，只提示 |
+| 安装位置 | 构建后复制到 `/opt/tsmusicbot`（重装时保留 `data/`） | 就在当前项目目录 |
+| 系统服务 | 自动配置 systemd 服务 `tsmusicbot` 并开机自启 | **不配置服务**，完成后自己 `npm start` |
+| 需要 root | 是（`sudo`） | 否 |
+
+两者共用同一套安装逻辑：`install.sh` 会调用 `setup.sh` 完成依赖安装、国内网络镜像切换、原生模块校验和构建，然后再复制文件、配置服务。
+
+**一键安装 + systemd 服务：**
 
 ```bash
 chmod +x scripts/install.sh
 sudo ./scripts/install.sh
+# 之后：systemctl status|restart|stop tsmusicbot，日志：journalctl -u tsmusicbot -f
 ```
 
-自动安装 Node.js 和依赖，配置 systemd 服务，支持开机自启。
+**只安装构建（不装 Node、不配服务）：**
+
+```bash
+bash scripts/setup.sh
+npm start
+```
 
 ## 更新升级
 
@@ -161,6 +214,16 @@ sudo ./scripts/install.sh
 > - ⚠️ 清空身份后，TS 服务器会把机器人识别为**全新的客户端**。之前手动赋予机器人的**服务器组需要用新 UID 重新授予一次**，之后每次重启都会自动保留
 >
 > **如何判断是否需要迁移**：如果你是全新安装，或者你的机器人数据库中 `identity` 字段已经是空的，则**无需任何操作**。完成上述步骤后，按下面对应的系统升级步骤执行即可。
+
+### 关于 enabledProviders 音源开关（v1.10.0 起）
+
+v1.10.0（[PR #123](https://github.com/ZHANGTIANYAO1/teamspeak-music-bot/pull/123)）引入 `enabledProviders` 音源开关与可选的 Jellyfin 音源。当前默认值为 `["netease", "qq", "bilibili", "youtube", "kugou"]`——**与旧版行为一致**，从更早版本升级**无需任何操作**，在线音源照常可用；Jellyfin 需要手动开启（详见 [可选：Jellyfin 音源](#可选jellyfin-音源)）。
+
+> ⚠️ **仅影响短暂运行过 v1.10.0 初版的用户**：该版本曾把默认音源设为 Jellyfin-only。如果你在那段时间保存过设置，`data/config.json` 中可能被写入了 `"enabledProviders": ["jellyfin"]`，升级后在线音源会保持停用。修复方法：把在线音源加回列表（或直接删除该字段以使用默认值），重启机器人（网易云 / QQ 的内嵌 API 服务需要重启才会启动）：
+>
+> ```json
+> "enabledProviders": ["netease", "qq", "bilibili", "youtube", "kugou", "jellyfin"]
+> ```
 
 ### 从 WebUI 无鉴权版本升级（重要）
 
@@ -263,8 +326,8 @@ cd scripts/docker
 # 拉取最新代码
 git pull
 
-# 重新构建并启动（数据自动保留）
-docker-compose up -d --build
+# 拉取最新定制镜像并启动（数据自动保留）
+docker compose pull && docker compose up -d
 ```
 
 > 数据（数据库、Cookie、日志）保存在 Docker 命名卷 `tsmusicbot-data` 中，更新不会丢失。
@@ -302,18 +365,20 @@ sudo systemctl start tsmusicbot
    - 机器人昵称
    - 可选：服务器密码、默认频道
 3. 在 **设置 → 音乐账号** 扫码登录网易云 / QQ 音乐 / 酷狗音乐 / B 站账号（可选，登录后可播放 VIP 歌曲、获取每日推荐 / 我的歌单等）
-4. 在 **设置 → 用户管理**（仅管理员可见）按需添加成员。成员默认可控制播放但无法管理其他用户；管理员还可为每个成员单独配置**能力**（播放控制 / 队列 / 机器人管理 / 平台登录 / 音质）和**可操作的机器人白名单**，未授权的机器人对该成员不可见、不可控
+4. （可选）在 **设置 → Jellyfin 音乐库** 连接自建 Jellyfin 服务器并打开「启用 Jellyfin 音源」（安装向导第 3 步保存连接时会自动启用；详见 [可选：Jellyfin 音源](#可选jellyfin-音源)）
+5. 在 **设置 → 用户管理**（仅管理员可见）按需添加成员。成员默认可控制播放但无法管理其他用户；管理员还可为每个成员单独配置**能力**（播放控制 / 队列 / 机器人管理 / 平台登录 / 音质）和**可操作的机器人白名单**，未授权的机器人对该成员不可见、不可控
 
 ### WebUI 页面说明
 
 | 页面 | 功能 |
 |------|------|
-| **首页** | 推荐歌单、每日推荐、私人FM（网易云 / QQ 雷达 / 酷狗电台）、我的歌单、收藏的歌单（各源带标签切换） |
-| **搜索** | 四平台统一搜索，结果标注网易云/QQ/酷狗/B站来源，可一键收藏歌单 |
+| **首页** | 推荐歌单、每日推荐、私人FM（网易云 / QQ 雷达 / 酷狗电台）、我的歌单、收藏的歌单（各源带标签切换）；启用 Jellyfin 后另有「Jellyfin 电台 / 最近添加 / 播放最多 / 收藏 / 流派」区块 |
+| **搜索** | 跨音源统一搜索（仅显示已启用的音源；启用 Jellyfin 后其结果排最前），结果标注来源，可一键收藏歌单 |
 | **歌单** | 查看歌单详情，播放全部（根据当前播放模式选择首歌），一键收藏 |
 | **歌词** | 全屏歌词页，实时同步滚动，模糊专辑封面背景 |
 | **历史** | 播放历史记录 |
-| **设置** | 账户（修改自己密码） / 主题切换 / 机器人管理 / 行为设置（空闲超时、频道无人自动暂停） / 多平台账号登录（网易云 / QQ / 酷狗 / B站） / 音质选择 / 命令前缀 / 用户管理（仅管理员，含成员能力与机器人白名单）/ 操作审计（仅管理员） |
+| **已存队列** | 保存当前队列为清单、加载（替换）/ 追加 / 删除已保存清单（仅在管理员开启「保存/加载播放清单」后出现） |
+| **设置** | 账户（修改自己密码） / 主题切换 / 机器人管理 / 行为设置（空闲超时、频道无人自动暂停、保存/加载播放清单、单曲直接播放不清空队列） / 多平台账号登录（网易云 / QQ / 酷狗 / B站） / 音质选择 / 命令前缀 / 用户管理（仅管理员，含成员能力与机器人白名单）/ 操作审计（仅管理员） |
 
 ### TeamSpeak 文字命令
 
@@ -321,15 +386,17 @@ sudo systemctl start tsmusicbot
 
 | 命令 | 说明 |
 |------|------|
-| `!play <歌名>` | 搜索并播放（取最热门的匹配项） |
+| `!play <歌名>` | 搜索并播放（取最热门的匹配项；默认音源为网易云） |
+| `!play -n <歌名>` | 显式从网易云音乐搜索（默认音源即网易云，通常可省略） |
+| `!play -j <歌名>` | 从 Jellyfin 搜索（需先启用 Jellyfin 音源） |
 | `!play -q <歌名>` | 从 QQ 音乐搜索 |
 | `!play -k <歌名>` | 从酷狗音乐搜索 |
 | `!play -b <关键词>` | 从哔哩哔哩搜索视频并播放音频 |
 | `!play -y <关键词>` | 从 YouTube 搜索并播放（需要安装 [yt-dlp](#可选youtube-音源)）|
-| `!search <歌名> [-q\|-k\|-b\|-y]` | 列出前若干个匹配结果（含序号与 id），用于挑选同名歌曲；可加平台标志切换音源 |
+| `!search <歌名> [-j\|-n\|-q\|-k\|-b\|-y]` | 列出前若干个匹配结果（含序号与 id），用于挑选同名歌曲；可加平台标志切换音源 |
 | `!play #<序号>` | 播放上一次 `!search` 结果中的第 N 项（区分同名歌曲） |
-| `!play id:<id>` | 按歌曲 id 播放精确的某首歌（也支持直接粘贴网易云 / QQ / B站 歌曲链接） |
-| `!add <歌名>` | 添加到播放队列（同样支持 `#序号` / `id:<id>` / 链接） |
+| `!play id <id>` | 按歌曲 id 播放精确的某首歌（也支持直接粘贴网易云 / QQ / B站 歌曲链接；Jellyfin 曲目用 GUID ItemId）。旧写法 `!play id:<id>` 仍然可用 |
+| `!add <歌名>` | 添加到播放队列（同样支持 `#序号` / `id <id>` / 链接） |
 | `!pause` / `!resume` | 暂停 / 恢复播放 |
 | `!next` / `!prev` | 下一首 / 上一首 |
 | `!stop` | 停止播放并清空队列 |
@@ -337,20 +404,27 @@ sudo systemctl start tsmusicbot
 | `!queue` | 查看播放队列 |
 | `!remove <位置>` | 从队列中删除指定位置的歌曲（位置从 1 开始，见 `!queue`） |
 | `!mode <seq\|loop\|random\|rloop>` | 切换播放模式 |
-| `!playlist <歌单名或ID>` | 加载歌单（支持名称模糊搜索和 ID） |
+| `!playlist <歌单名或ID>` | 加载歌单（支持名称模糊搜索和 ID；Jellyfin 歌单 GUID 也可直接粘贴） |
 | `!playlist -q <歌单名>` | 从 QQ 音乐搜索并加载歌单 |
-| `!album <ID>` | 加载专辑 |
-| `!artist <歌手名>` | 按歌手循环播放（支持 `-q`/`-k`/`-b`/`-y`） |
-| `!fm` | 私人 FM（网易云，自动续播） |
+| `!playlist <歌单链接>` | 直接粘贴网易云 / QQ 音乐 / YouTube 歌单链接加载，平台由链接自动识别，无需加 `-q` 等标志；也可直接粘贴 App 的分享文案或短链（`163cn.tv`、`c6.y.qq.com`） |
+| `!album <专辑名或ID>` | 加载专辑（支持名称搜索 / 数字 ID / Jellyfin GUID） |
+| `!artist <歌手名>` | 按歌手循环播放（支持 `-j`/`-n`/`-q`/`-k`/`-b`/`-y`） |
+| `!fm` | 私人 FM（默认网易云，自动续播） |
+| `!fm -j` | Jellyfin 电台：从收藏出发的 Instant Mix（需启用 Jellyfin，自动续播） |
 | `!fm -q` | QQ 音乐雷达 / 猜你喜欢 FM（自动续播） |
 | `!fm -k` | 酷狗私人电台 / 个性化推荐 FM（自动续播） |
-| `!lyrics` | 显示当前歌词 |
+| `!lyrics` | 显示当前完整歌词（自动分多条消息发送，不再只显示开头几行） |
 | `!now` | 当前播放信息 |
 | `!vote` | 投票跳过当前歌曲 |
 | `!move <频道名>` | 移动到指定频道 |
+| `!save <名称>` | 保存当前队列为一份已保存清单（需启用「保存/加载播放清单」，聊天保存进入共享清单） |
+| `!load [-a] <名称>` | 加载已保存清单（默认替换当前队列并播放；加 `-a` 追加到队列末尾） |
+| `!queues` | 列出已保存（共享）清单 |
 | `!help` | 显示帮助信息 |
 
 > 命令前缀默认为 `!`，可在设置页面修改。支持别名：`!p` = `!play`，`!s` = `!skip`，`!n` = `!next`
+>
+> `!save` / `!load` / `!queues` 仅在管理员开启「保存/加载播放清单」后可用（默认关闭），未启用时回复「此功能未启用」。
 
 ### TeamSpeak 命令权限（管理类命令限制）
 
@@ -375,6 +449,8 @@ sudo systemctl start tsmusicbot
 
 ### 音质等级
 
+**在线音源（网易云等）**
+
 | 等级 | 码率 | 格式 | 说明 |
 |------|------|------|------|
 | 标准 | 128kbps | MP3 | 免费可用 |
@@ -384,7 +460,74 @@ sudo systemctl start tsmusicbot
 | Hi-Res | ~1500kbps | FLAC | 需要 VIP |
 | 超清母带 | ~4000kbps | FLAC | 需要黑胶 VIP |
 
+**Jellyfin（启用后）**
+
+| 等级 | 说明 |
+|------|------|
+| **原始直传（direct）** | **默认**：原始文件不转码直传（机器人本地统一转 Opus，此档即最高音质） |
+| 320kbps / 192kbps / 128kbps | 由 Jellyfin 服务器转码后传输，适合公网带宽有限的自建服务器 |
+
 在设置页面选择音质，立即生效（影响后续播放的歌曲）。
+
+> **重启后保留（#125）**：音质选择会持久化到 `data/config.json`（每个平台各自记录），重启机器人后自动恢复，无需每次手动重设。
+
+### 重启后保留的播放设置
+
+以下运行时设置在改动时自动落盘，重启机器人后自动恢复，不再回到默认值：
+
+| 设置 | 作用范围 | 存储位置 |
+|------|----------|----------|
+| **播放音量**（`!vol` / WebUI 音量条 / REST `/volume`） | 每个机器人独立 | 数据库 `bot_instances.volume` |
+| **播放模式**（`!mode` / WebUI / REST `/mode`：顺序 / 列表循环 / 随机 / 随机循环） | 每个机器人独立 | 数据库 `bot_instances.play_mode` |
+| **音质**（各平台，WebUI 设置页 / REST `/quality`） | 全局（各平台各自记录） | `data/config.json` 的 `audioQuality` |
+
+聊天命令、WebUI、REST API 三种入口的改动都会被持久化。播放队列、当前歌曲、进度、`!fm` / `!artist` 等临时播放状态仍为一次性状态，重启后不保留（`!fm` / `!artist` 内部临时切换的随机 / 循环也**不会**覆盖你用 `!mode` 显式保存的偏好）。
+
+## REST API（API Key）
+
+除浏览器 session 登录外，REST API 还支持用 **API Key** 调用，便于脚本、Home Assistant 等外部集成。
+
+### 创建 Key
+
+登录 WebUI → 设置页 → 「API 密钥」→ 输入名称 → 生成。明文**只在创建时显示一次**（形如 `tsmb_xxxxx…`），之后只能看到前缀；可随时在设置页吊销。Key 的权限与所属账户一致：管理员拥有全部权限，成员只能操作被授权的机器人、使用被授予的能力（播放控制 / 队列管理等）。每位用户最多创建 20 个 Key。
+
+### 调用方式
+
+两种请求头任选其一：
+
+```
+Authorization: Bearer tsmb_xxxxxxxxxxxx
+X-API-Key: tsmb_xxxxxxxxxxxx
+```
+
+> 修改类请求（POST/PUT/DELETE）无需 CSRF Origin 头；WebSocket 推送（`/ws`）暂不支持 API Key，仅限浏览器 session。
+
+### 常用端点示例
+
+```bash
+# 机器人列表（拿到 botId）
+curl -H "Authorization: Bearer $KEY" http://127.0.0.1:3000/api/bot
+
+# 当前队列 + 播放状态
+curl -H "Authorization: Bearer $KEY" http://127.0.0.1:3000/api/player/<botId>/queue
+
+# 点歌（搜索文本 + 平台：netease/qq/bilibili/youtube/kugou/jellyfin/local）
+curl -X POST -H "Authorization: Bearer $KEY" -H "Content-Type: application/json" \
+  -d '{"query":"周杰伦 晴天","platform":"netease"}' \
+  http://127.0.0.1:3000/api/player/<botId>/play
+
+# 搜索歌曲（拿 song id / song 对象）
+curl -H "Authorization: Bearer $KEY" \
+  "http://127.0.0.1:3000/api/music/search?q=晴天&platform=netease"
+
+# 播放控制
+curl -X POST -H "X-API-Key: $KEY" http://127.0.0.1:3000/api/player/<botId>/pause
+curl -X POST -H "X-API-Key: $KEY" http://127.0.0.1:3000/api/player/<botId>/next
+curl -X POST -H "X-API-Key: $KEY" -H "Content-Type: application/json" \
+  -d '{"volume":50}' http://127.0.0.1:3000/api/player/<botId>/volume
+```
+
+全部端点、参数与返回值见 **[docs/API.md](docs/API.md)**。认证失败返回 `401 {"error":"invalid api key"}`，越权返回 `403`。
 
 ## 项目架构
 
@@ -407,6 +550,7 @@ teamspeak-music-bot/
 │   │   └── database.ts         # SQLite 数据库（播放历史、实例、收藏、权限持久化）
 │   ├── music/                  # 音源服务
 │   │   ├── provider.ts         # 统一 MusicProvider 接口
+│   │   ├── jellyfin.ts         # Jellyfin 适配器（可选音源，直连 REST API）
 │   │   ├── netease.ts          # 网易云音乐适配器
 │   │   ├── qq.ts               # QQ 音乐适配器
 │   │   ├── bilibili.ts         # 哔哩哔哩适配器（视频音频提取）
@@ -440,6 +584,7 @@ teamspeak-music-bot/
 ├── scripts/                    # 部署脚本
 │   ├── setup.bat               # Windows 首次安装
 │   ├── start.bat               # Windows 启动脚本
+│   ├── setup.sh                # Linux/macOS 首次安装（只安装构建）
 │   ├── install.sh              # Linux 一键安装 + systemd 服务
 │   └── docker/                 # Docker 部署文件
 │       ├── Dockerfile
@@ -455,11 +600,12 @@ teamspeak-music-bot/
 
 | 层级 | 技术 |
 |------|------|
-| **运行时** | Node.js 20+, TypeScript 5 |
+| **运行时** | Node.js 22 LTS（推荐）, TypeScript 5 |
 | **后端框架** | Express 4, WebSocket (ws) |
 | **数据库** | better-sqlite3 (SQLite) |
 | **音频处理** | FFmpeg (ffmpeg-static 内置), @discordjs/opus |
 | **TS 协议** | @honeybbq/teamspeak-client（完整客户端协议）+ 自研 TS6 协议适配层 |
+| **Jellyfin** | Jellyfin REST API（可选音源，直连，无额外 npm 依赖） |
 | **网易云 API** | NeteaseCloudMusicApi |
 | **QQ 音乐 API** | @sansenjian/qq-music-api（锁定 `~2.4.0`，需 Node ≥ 20.17） |
 | **哔哩哔哩** | BiliBili Web API（搜索、DASH 音频流、QR 登录） |
@@ -468,6 +614,64 @@ teamspeak-music-bot/
 | **界面样式** | SCSS（YesPlayMusic 设计风格） |
 | **图标** | @iconify/vue |
 | **日志** | pino |
+
+## 可选：Jellyfin 音源
+
+本项目可将自建 [Jellyfin](https://jellyfin.org/) 媒体服务器作为**额外音源**：机器人直接播放你自己音乐库里的文件，不依赖任何在线平台的可用性 / 版权 / 登录状态。该音源**默认关闭**，需要手动启用。
+
+### 启用与连接配置
+
+三种方式任选：
+
+1. **首次安装向导** — 第 3 步即 Jellyfin 连接卡（可跳过，稍后配置）；填写并「保存并继续」会**自动启用**该音源。
+2. **WebUI** — 设置 → Jellyfin 音乐库（可选）：打开「**启用 Jellyfin 音源**」开关，填写服务器地址、选择认证方式、「测试连接」验证后保存，**保存即时生效，无需重启**。
+3. **config.json** — 手动编辑 `jellyfin` 配置块，并把 `"jellyfin"` 加入 `enabledProviders`，然后重启。
+
+两种认证方式：
+
+| 模式 | 填写内容 | 说明 |
+|------|---------|------|
+| **账号密码**（默认） | `username` + `password` | 以该用户身份登录（`AuthenticateByName`），token 自动持久化、失效自动重登 |
+| **API Key** | `apiKey` + `userId` | 使用管理后台生成的 API Key；`userId` 决定使用谁的音乐库 / 收藏 / 歌单 |
+
+```jsonc
+// config.json 片段
+{
+  "jellyfin": {
+    "serverUrl": "https://jellyfin.example.com",
+    "authMode": "userpass",     // 或 "apikey"
+    "username": "music",
+    "password": "······",
+    "apiKey": "",               // apikey 模式填写
+    "userId": ""                // apikey 模式填写
+  },
+  "enabledProviders": ["netease", "qq", "bilibili", "youtube", "kugou", "jellyfin"]
+}
+```
+
+> 密码 / API Key 在 WebUI 中**只写不回显**；表单留空表示保持已保存的值不变。
+
+### 功能
+
+- **搜索** — 歌曲 / 专辑 / 歌单，支持翻页「加载更多」；WebUI 统一搜索中 Jellyfin 结果排最前
+- **播放** — 懒解析播放地址；默认**原始直传**（不经 Jellyfin 转码），也可选 320/192/128kbps 服务器转码档（设置 → 音质设置）
+- **歌词** — 读取 Jellyfin 的歌词接口（内嵌或 .lrc），时间轴同步滚动，`!lyrics` 可用
+- **电台 / FM**（`!fm -j` 或首页「Jellyfin 电台」卡片）— 随机取一首**收藏**做种子生成 Instant Mix 歌曲流；没有收藏则回退到最近播放、再回退随机曲目
+- **首页区块** — 最近添加（专辑）/ 播放最多 / Jellyfin 收藏 / 我的歌单 / 流派（点流派芯片即播放该流派）
+- **播放上报** — 播放开始 / 进度（约 10s 一次）/ 停止会回报给 Jellyfin（`Sessions/Playing` 系列接口），你的 Jellyfin 播放统计（PlayCount、最近播放）保持准确；上报失败不影响播放
+- **聊天命令** — 启用后用 `-j` 标志：`!play -j <歌名>`、`!fm -j`、`!artist -j <歌手>`；`!playlist` / `!album` / `!play id <id>` 可直接粘贴 Jellyfin GUID。若把在线音源全部停用、只保留 Jellyfin，不带标志的命令会自动以 Jellyfin 为默认音源
+
+### enabledProviders：音源开关
+
+`config.json` 的 `enabledProviders` 数组决定哪些音源可用（默认 `["netease", "qq", "bilibili", "youtube", "kugou"]`，即在线音源全开、Jellyfin 关闭）：
+
+- 可选值：`jellyfin`、`netease`、`qq`、`bilibili`、`youtube`、`kugou`（`local` 由 `localAudioEnabled` 控制，`spotify` 由 `spotify.enabled` 控制）
+- 未列出的音源：聊天命令返回「音源未启用」、REST 返回 400、WebUI 搜索栏 / 登录卡 / FM 卡片自动隐藏
+- 不带平台标志的命令默认走**固定优先级中第一个已启用的音源**：网易云 → QQ → 酷狗 → Jellyfin → B站 → YouTube（默认配置下即网易云）
+- **自定义默认音源（`defaultPlatform`）** — 想让不带标志的 `!play 歌名` 直接用某个音源（例如常听哔哩哔哩，免去每次加 `-b`），可在 设置 → 默认音源 里选择，或在 `config.json` 中设置 `"defaultPlatform": "bilibili"`。取值须是 `enabledProviders` 里已启用的音源，否则被忽略（回退到上面的固定优先级）；留空 / `null` / 删除该字段即恢复固定优先级。WebUI 保存后即时生效，无需重启
+- 网易云 / QQ 停用时，其内嵌 API 服务（端口 3001 / 3200）**不会启动**
+- 示例（Jellyfin 为主、只留网易云备用）：`"enabledProviders": ["jellyfin", "netease"]`（默认音源仍为网易云，点歌用 `-j`、停用网易云，或直接把 `defaultPlatform` 设为 `"jellyfin"`）；示例（纯 Jellyfin）：`"enabledProviders": ["jellyfin"]`
+- 注意：重新启用网易云 / QQ 的内嵌 API 服务需要重启机器人；其余音源改动即时生效（WebUI 的 Jellyfin 开关即改此列表）
 
 ## 可选：YouTube 音源
 
@@ -518,6 +722,131 @@ pip install -U yt-dlp
 - 受 YouTube 风控/地域限制，部分视频可能无法播放
 - `yt-dlp` 更新较频繁，如果播放失败，先尝试升级 `yt-dlp` 到最新版本
 
+## Spotify 音源（实验性）
+
+> **⚠️ 实验性功能，启用前请务必读完本节**
+>
+> - **需要 Spotify Premium 账号。** 免费账号无法通过 Spotify Connect 输出音频，无法使用本功能。
+> - **使用你自己在 Spotify Developer Dashboard 注册的应用（Client ID）。** 本项目**不内置任何共享凭据**，也不会替你代管账号。
+> - Spotify 官方并未开放第三方播放的公开授权，本功能处于 **Spotify 服务条款的灰色地带**，是否使用请自行评估，**风险自负**。
+> - 该音源**默认关闭**（`spotify.enabled = false`），需要手动开启并完成授权。
+> - 这**不是** YouTube 那样的「免登录回退音源」，而是**真正的 Spotify 音频**，必须有 Premium 才能出声；音频链路依赖第三方开源解码器（librespot / go-librespot），本项目仅在本地作为独立子进程调用，**播放效果不做保证**，也未在本仓库端到端测试。
+
+### 工作原理（简述）
+
+1. `librespot`（Rust）或 `go-librespot`（Linux）作为**独立子进程**登录 Spotify Connect 并解码音频，输出原始 **PCM**。
+2. 本项目用内置 **ffmpeg** 把 PCM 重采样到 **48kHz**。
+3. 重采样后的音频接入**现有的 Opus 编码 / 发送管线**（与其它音源共用），推送到 TeamSpeak。
+4. 歌名、歌手、封面等**元数据来自 Spotify Web API**。
+
+### 平台矩阵
+
+后端由配置项 `spotify.backend` 决定，可选 `auto`（默认）/ `go-librespot` / `librespot`：
+
+| 平台 | 默认后端（`auto`） | 说明 |
+|------|------|------|
+| Windows | `librespot`（Rust） | 不支持 go-librespot（FIFO 仅限 POSIX，且官方无 Windows 资产） |
+| Linux / Docker | `go-librespot`（可回退 `librespot`） | `auto` 优先 go-librespot，未检测到时自动改用 librespot |
+| macOS | `librespot`（Rust） | 与 Windows 同，仅支持 Rust 版 |
+
+> `auto` 会按平台与二进制可用性自动选择：优先 `go-librespot`（若可用），否则 `librespot`。若显式指定 `go-librespot` 或 `librespot` 但对应二进制不存在，则该音源保持不可用。
+
+### 获取二进制
+
+程序会先在项目根目录的 `bin/` 中查找，找不到再回退到系统 `PATH`。`bin/` 已被 `.gitignore` 忽略，不影响代码更新。
+
+**Rust librespot（librespot-org，全平台）** — 官方**没有预编译发布包**，需自行获取（任选其一）：
+
+```bash
+# 方式 1：用 Cargo 编译安装（需要 Rust 工具链）
+cargo install librespot
+
+# 方式 2（Windows）：scoop / choco
+scoop install librespot        # 或：choco install librespot
+
+# 方式 3：把可执行文件放到项目 bin/ 目录
+#   Windows:      bin/librespot.exe
+#   Linux/macOS:  bin/librespot
+```
+
+或直接把 `librespot` 加入系统 `PATH`。
+
+**go-librespot（仅 Linux）** — 官方仅提供 **Linux** 预编译资产：
+
+```bash
+# 从 Release 页下载对应架构的二进制：
+#   https://github.com/devgianlu/go-librespot/releases
+# 放到项目 bin/ 目录（或加入系统 PATH）：
+#   bin/go-librespot
+```
+
+> **Windows 不支持 go-librespot**：它依赖 POSIX FIFO（`mkfifo`），官方也只发布 Linux 资产。Windows / macOS 请使用 Rust `librespot`。
+
+### 注册 Spotify 开发者应用 + 回调地址
+
+1. 打开 [Spotify Developer Dashboard](https://developer.spotify.com/dashboard)，新建一个应用，记下 **Client ID**。
+2. 在应用设置里添加 **Redirect URI（回调地址）**，精确填写：
+
+   ```
+   http://127.0.0.1:<webPort>/api/spotify/callback
+   ```
+
+   其中 `<webPort>` 与本项目设置里的 Web 端口一致（默认 `3000`，即 `http://127.0.0.1:3000/api/spotify/callback`）。回调路径必须精确为 `/api/spotify/callback`。
+3. 本项目使用 **Authorization Code + PKCE** 流程，**不需要 Client Secret**（配置里的 `clientSecret` 可留空）。
+4. 授权时请求的权限范围（scope）：
+
+   ```
+   streaming user-read-playback-state user-modify-playback-state user-read-currently-playing playlist-read-private
+   ```
+
+### 启用步骤
+
+1. 进入**设置页**的「连接 Spotify」卡片。
+2. 填入 **Client ID**、选择**后端**（`auto` / `go-librespot` / `librespot`）、打开**开关**。
+3. 点击**保存**。
+4. 点击「**连接 Spotify**」，在弹出的 Spotify 页面完成 **OAuth 授权**。
+
+> 仅当 **`enabled = true`** + **已完成 OAuth 授权** + **检测到可用的后端二进制** 三者同时满足时，Spotify 音源才可播放。任一条件不满足，该音源保持**不可用**（点播会被跳过，播放队列照常前进，不影响其它音源）。
+
+对应的配置块（`data/config.json`）：
+
+```json
+{
+  "spotify": {
+    "enabled": false,
+    "backend": "auto",
+    "clientId": "",
+    "clientSecret": "",
+    "deviceName": "TSMusicBot",
+    "bitrate": 320
+  }
+}
+```
+
+OAuth 相关端点：`/api/spotify/login`、`/api/spotify/callback`、`/api/spotify/status`。
+
+### 许可与来源
+
+- **go-librespot** 采用 **GPL-3.0** 许可。本项目**仅将其作为独立子进程调用**（mere aggregation / 独立聚合），**不链接、不打包**其代码，因此**不影响本项目自身的 MIT 许可**。
+  - 源码与许可：<https://github.com/devgianlu/go-librespot>（GPL-3.0；如需其对应源码请前往该仓库获取 —— source offer）。
+- **Rust librespot** 采用 **MIT** 许可：<https://github.com/librespot-org/librespot>。
+
+### 故障排查
+
+| 现象 | 处理 |
+|------|------|
+| 提示「未检测到 librespot / go-librespot」 | 检查项目 `bin/` 目录里是否放了可执行文件，或该命令是否在系统 `PATH` 中；Rust 版可用 `cargo install librespot` 安装 |
+| 提示「未授权 / 需要连接 Spotify」 | 在设置页「连接 Spotify」卡片点击「连接 Spotify」完成 OAuth 授权 |
+| Windows 上无法使用 go-librespot | 属预期行为（FIFO 仅限 POSIX，官方无 Windows 资产）；请把 `backend` 设为 `librespot` 或 `auto` |
+| 完全没有声音 | 确认账号为 **Spotify Premium**；免费账号无法通过 Spotify Connect 输出音频 |
+
+### 已知限制
+
+- 在多租户/共享主机上，librespot 通过命令行参数接收访问令牌，同机其他本地进程理论上可读取（令牌约 1 小时有效，需本地访问权限）。
+- Spotify 连续播放（gapless spotify→spotify）时，网页进度条的"已播放时间"可能不准确（以后端上报的播放进度为准）。
+- 运行多个启用 Spotify 的 bot 时，若两个 bot 的 id 端口哈希发生冲突（同一 % 1000 桶），第二个 go-librespot 边车会因端口占用而启动失败、该 bot 的 Spotify 不可用（后续将改为按需分配空闲端口）。
+- **一个 Spotify Premium 账号只支持「一路」正在播放的音频流**。因此若要同时运行**多个**启用 Spotify 的 bot 并让它们各自独立播放，必须为**每个 bot 配置独立的 Spotify 账号**。在 Rust（librespot）后端上，本机制已把播放控制（暂停/继续/跳转）限定到 bot 自己的设备，并在读取播放状态时忽略其它设备的状态，以避免多 bot 之间互相抢占、来回抖动（cross-control/thrash）；但受 Spotify 平台限制，**共用同一账号无法实现多路同时播放**（第二个 bot 开始播放会夺走该账号唯一的活跃会话）。go-librespot 后端为每个边车独立的本地 REST API，不受此账号级抢占影响。
+
 ## 配置文件
 
 配置文件位于 **`data/config.json`**（与数据库、Cookie、日志同在持久化的 `data/` 目录，Docker 部署对应挂载卷），首次运行时自动生成，可手动编辑：
@@ -541,6 +870,16 @@ pip install -U yt-dlp
 }
 ```
 
+PowerfulTS 的自定义入场音效会让本进程主动拉取短期音频链接。启用该功能时，必须为
+TSMusicBot 进程设置 `POWERFUL_TS_ORIGIN`，并与 PowerfulTS 的
+`LIVE_AUDIO_PUBLIC_URL` 保持完全一致（只填 `scheme://host[:port]`，不带路径），例如：
+
+```bash
+POWERFUL_TS_ORIGIN=http://host.docker.internal:8001
+```
+
+未配置时，短音效接口会返回 503；来源不匹配时会拒绝请求，以避免服务端请求伪造。
+
 > **配置文件位置变更**：旧版本把 `config.json` 写在项目根目录（不在 Docker 挂载卷内，导致重启丢失、手动编辑不生效）。现在统一放在 `data/config.json`。升级时若检测到根目录存在旧的 `config.json`，会在首次启动时自动迁移到 `data/` 并保留你的设置，无需手动操作。
 
 > **关于 `adminPassword` 和 `adminGroups`**：`adminGroups` 现已启用，用于限制管理类聊天命令只能由指定 TeamSpeak 服务器组运行（为空 = 不限制），详见 [TeamSpeak 命令权限](#teamspeak-命令权限管理类命令限制)。`adminPassword` 仍为旧版预留字段、当前版本未使用——WebUI 鉴权改为基于数据库的用户账号系统（见 [首次配置](#首次配置)），无需在 `config.json` 中设置密码。
@@ -563,11 +902,14 @@ A：支持。本项目内置 TS3/TS6 双协议支持，连接时会自动检测�
 **Q：机器人连接了但 TeamSpeak 中听不到音乐？**
 A：确保机器人和你在同一个频道。检查音量（`!vol 75`）。部分 VIP 歌曲需要先登录账号。
 
+**Q：启动报 `NODE_MODULE_VERSION 137 ... requires 127`，或提示找不到 `opus.node`？**
+A：换过 Node 大版本了。原生模块（`@discordjs/opus`、`better-sqlite3`）编译时绑定了一个 Node ABI（Node 20 = 115、22 = 127、24 = 137），换版本后旧的 `.node` 就再也加载不了。**重新运行一次 `scripts\setup.bat`（Linux/macOS 是 `bash scripts/setup.sh`）即可**——安装脚本会实际加载一遍每个原生模块，发现和当前 Node 不匹配就自动重新下载/编译，替换过程中失败也会把原来的文件还原回去。`start.bat` 和 `npm start` 在启动前也会先做这个检查，直接告诉你哪个模块对不上、分别是哪个 ABI，而不是抛一串看不懂的堆栈。想彻底重来就删掉 `node_modules` 和 `web\node_modules` 再跑一次 `setup.bat`。
+
 **Q：提示"无法获取播放链接"？**
 A：在设置页面扫码登录音乐账号。许多歌曲需要登录后才能播放。
 
 **Q：同名歌曲 `!play` 只能播到最热门的那首，怎么播放指定的版本？**
-A：`!play <歌名>` 默认取最热门的匹配项。要播放同名的另一首，有三种方式：(1) 先 `!search <歌名>` 列出带序号的结果，再 `!play #序号` 选择；(2) `!play id:<歌曲id>` 按 id 精确播放；(3) 直接粘贴歌曲链接，如 `!play https://music.163.com/song?id=442867526`（也支持 QQ / B站 链接）。在 WebUI 中则可直接在搜索结果列表里点选任意同名歌曲。
+A：`!play <歌名>` 默认取最热门的匹配项。要播放同名的另一首，有三种方式：(1) 先 `!search <歌名>` 列出带序号的结果，再 `!play #序号` 选择；(2) `!play id <歌曲id>` 按 id 精确播放（`!search` 结果里每行末尾的 `[id:...]` 就是它）；(3) 直接粘贴歌曲链接，如 `!play https://music.163.com/song?id=442867526`（也支持 QQ / B站 链接）。在 WebUI 中则可直接在搜索结果列表里点选任意同名歌曲。
 
 **Q：如何更换机器人所在频道？**
 A：使用 `!move <频道名>` 命令，或在设置页面创建机器人时指定默认频道。
@@ -576,10 +918,13 @@ A：使用 `!move <频道名>` 命令，或在设置页面创建机器人时指�
 A：可以。在设置页面创建多个实例，分别连接不同的 TS 服务器或频道。
 
 **Q：端口 3200 被占用？**
-A：QQ 音乐 API 启动时自动监听 3200 端口。如果之前的进程还在运行，程序会自动复用。如需重启可手动结束 `node` 进程。
+A：QQ 音乐 API 启动时会监听 `config.json` 里的 `qqMusicApiPort`（默认 **3200**），客户端也用同一个端口发请求，二者始终一致。如果之前的进程还在运行，程序会自动复用。如需改端口，改 `qqMusicApiPort` 后重启即可；如需重启可手动结束 `node` 进程。
+
+**Q：日志里 `baseURL` 是 3200，但 QQ API 实际监听在 3300？（二维码不弹）**
+A：这是**旧版本**（或过期的 `latest` Docker 镜像）才有的问题：早期实现用的上游包默认端口是 3300，而客户端 `baseURL` 已经是 3200，两边对不上，取二维码时就 `ECONNREFUSED 127.0.0.1:3200`。当前版本已把内嵌 QQ 音乐 API **强制绑定到 `qqMusicApiPort`（默认 3200）**，并在启动前把上游包读取的 `PORT` 环境变量对齐到该端口，二者不可能再错位。修复方法：**拉取最新镜像并重启**（`docker compose pull && docker compose up -d`），或用 `npm ci && npm run build` 更新到最新代码。启动后可在日志里确认那行 `QQ Music API started`，其 `port` 字段就是实际监听端口。
 
 **Q：QQ 音乐二维码不弹 / 扫码登录失败 / cookie 无法使用？**
-A：通常是内置的 QQ 音乐 API 服务没起来——它一旦没监听 3200 端口，机器人去取二维码就会拿到 `ECONNREFUSED 127.0.0.1:3200`，于是二维码不显示，登录和 cookie 也全失效。先看日志里 QQ API 的启动报错：
+A：通常是内置的 QQ 音乐 API 服务没起来——它一旦没监听 `qqMusicApiPort`（默认 3200）端口，机器人去取二维码就会拿到 `ECONNREFUSED 127.0.0.1:3200`，于是二维码不显示，登录和 cookie 也全失效。先看日志里 QQ API 的启动报错：
 - 报 `ERR_REQUIRE_ESM`：装到了不兼容的 `@sansenjian/qq-music-api` 版本。本项目把它锁在 **`~2.4.0`**（需要 **Node ≥ 20.17 / 22.9**）；务必用 `npm ci` 或 `npm install` 让版本与锁文件一致，**不要**手动 `npm update` 把它升级或降级到不兼容的中间版本（2.3.0/2.3.1 是纯 ESM、会触发此错）。
 - 报 Node 版本不满足：升级 Node 到 ≥ 20.17，或将该依赖降到 `~2.2.10`（无此 Node 要求）后重装。
 修好版本后重新 `npm install && npm run build` 并重启即可。
@@ -601,7 +946,7 @@ A：B站搜索需要 buvid3 匿名 Cookie（程序启动时自动获取）。如
 A：YouTube 是可选音源，需要手动安装 `yt-dlp`。详见 [可选：YouTube 音源](#可选youtube-音源) 章节。快速验证：在项目根目录执行 `bin/yt-dlp --version`（或系统 `yt-dlp --version`），能打印版本号即可。若 yt-dlp 已安装但仍搜索失败，通常是网络/地域问题或 yt-dlp 版本过旧（执行 `yt-dlp -U` 升级）。
 
 **Q：如何更新到新版本？**
-A：`git pull` 拉取最新代码，然后 `npm install && npm run build && npm start` 重新构建启动。Docker 用户执行 `docker-compose up -d --build`。
+A：`git pull` 拉取最新代码，然后 `npm install && npm run build && npm start` 重新构建启动。Docker 用户执行 `docker compose pull && docker compose up -d`。
 
 **Q：忘记管理员密码怎么办？**
 A：直接操作 SQLite 数据库。最简单的办法是清空 `users` 表然后重新进入 first-run 流程：`sqlite3 data/tsmusicbot.db "DELETE FROM users; DELETE FROM sessions;"`，重启后浏览器会自动跳转 `/first-run` 让你重新创建管理员。详细方法见 [从 WebUI 无鉴权版本升级](#从-webui-无鉴权版本升级重要)。
@@ -639,9 +984,184 @@ A：本项目内置 `/login` 限流（每 IP 每分钟 5 次），但生产部�
 
 > 完整历史请查看 [git log](https://github.com/ZHANGTIANYAO1/teamspeak-music-bot/commits/main) 或 [Releases](https://github.com/ZHANGTIANYAO1/teamspeak-music-bot/releases)。这里只列出重要变更和面向用户的破坏性改动。
 
-### 最新版本
+### 最新版本 — v1.15.2：长视频续播与语音发送故障处理
 
-**功能增强：细粒度权限 / 本地收藏 / 本地音频上传 / 专属链接 / 自动暂停 / QQ 雷达 FM**
+- 修复播放停滞的误判：一帧音频成功发送后，即使缓冲恰好被读空，也会重置断流计数。真实断流仍保留超时检测。
+- B站 CDN 按实际域名识别，补齐 `szbdyd.com` 等回退节点的请求头和断点定位，避免续播时从头下载、解码长视频。
+- B站提前结束后，获取新播放地址失败会在 1 秒、2 秒后重试，单次恢复最多查询 3 次；期间的切歌、停止、暂停和断开连接均会保留用户意图。诊断日志不记录原始地址或凭据。
+- 语音发送异常不再被静默忽略：短暂失败后可继续发送；连续失败 2 秒后暂停，保留曲目与进度。处理网络或连接问题后可手动继续播放，持续故障日志有输出上限。
+- 开启“频道无人时自动暂停”后，过期的频道人数查询和旧连接的空闲定时器不会再错误暂停或断开当前播放。
+- 修复重连期间旧频道查询和 DNS 结果覆盖新连接的竞态，避免已经连接的机器人被旧请求移回频道或记录错误的服务器地址。
+
+无配置或数据库迁移。此版本修复了已复现的故障路径；[#161](https://github.com/ZHANGTIANYAO1/teamspeak-music-bot/issues/161) 中新分支“67 分钟视频播到 37 分钟停止”的现场原因仍缺少停止时日志，尚未确认。
+
+### v1.15.1：长视频播放阻塞与音乐 API 日志隐私修复
+
+- 持续读取 FFmpeg 的 stderr，并关闭周期性进度输出，避免错误输出管道写满后卡住音频解码。直接 URL 播放和 Windows 临时文件播放均已处理。
+- FFmpeg 异常退出和播放停滞日志增加限长、脱敏的诊断摘要；移除 URL 查询参数、用户凭据和认证头，PowerShell 下载失败日志采用同样的处理。
+- 内置网易云 / QQ 音乐 API 在独立子进程运行，隔离依赖直接输出的原始请求和响应日志，避免其中的 Cookie 等凭据进入机器人控制台日志。仍保留服务启动和退出的安全诊断；独立部署或已占用端口的外部 API 需自行管理日志。
+
+无配置或数据库迁移。此补丁修复了已复现的管道阻塞；[#161](https://github.com/ZHANGTIANYAO1/teamspeak-music-bot/issues/161) 中“67 分钟视频播到 37 分钟停止”的现场原因仍缺少停止时日志，尚未确认。
+
+### v1.15.0：歌手页面 / REST API / TS6 Profile 与 B站续播修复
+
+**歌手搜索与页面（[PR #175](https://github.com/ZHANGTIANYAO1/teamspeak-music-bot/pull/175)，感谢 [@zzstar101](https://github.com/zzstar101)）**
+
+- 网易云 / QQ 音乐支持搜索歌手、查看歌手介绍、热门歌曲和专辑，并播放或随机播放歌手曲目（最多 500 首）。搜索历史按音源保存在当前浏览器。
+- 歌手播放与单曲播放共用播放锁，避免同时点播时实际歌曲与队列不一致。QQ 曲目目录在上游查询失败时不缓存降级结果，不再因 50 张专辑的限制提前截断歌曲。
+- 歌手页面的迟到请求不会覆盖新页面；访客的随机播放按钮同时遵守歌手播放与模式切换权限。
+
+**REST API（[PR #173](https://github.com/ZHANGTIANYAO1/teamspeak-music-bot/pull/173)，感谢 [@senlinjun](https://github.com/senlinjun)）**
+
+- 在设置页创建、查看和撤销 API Key；脚本可用 Bearer 或 X-API-Key 调用已有 REST 端点，权限和可控机器人范围继承所属用户。完整说明见 [REST API 文档](docs/API.md)。
+- 修复管理员撤销他人 Key 时的审计对象。修改或重置密码会撤销该用户的全部 API Key，外部集成需要重新生成凭据。
+
+**TS6 Profile（[PR #174](https://github.com/ZHANGTIANYAO1/teamspeak-music-bot/pull/174)，感谢 [@razaxq](https://github.com/razaxq)）**
+
+- 昵称和 Away 状态通过真实音乐客户端更新，描述通过明确的客户端 ID 更新，避免修改 HTTP ServerQuery 客户端。
+- 频道描述写入和移动后的清理使用相同权限路径；重连后丢弃旧会话请求，权限不足时可靠降级。
+
+**B站长视频续播（[#161](https://github.com/ZHANGTIANYAO1/teamspeak-music-bot/issues/161)，[PR #170](https://github.com/ZHANGTIANYAO1/teamspeak-music-bot/pull/170)）**
+
+- 优先使用稳定 CDN 镜像；流提前结束时重新解析地址并从当前进度续播，连续无进展重试有次数限制。
+- 播放结束和恢复请求按播放会话校验，旧请求不会跳过新曲，也不会覆盖同一曲目的新一轮播放。
+- 恢复地址查询期间暂停会保留暂停状态；恢复播放不会重复发起查询，查询失败后仍可按重试上限继续恢复。
+
+数据库自动新增 API Key 表，保留已有用户和设置。自动化测试只收集源码，排除旧的编译测试副本。
+
+### v1.14.0：歌单链接直接播放 / 每人绑定自己的网易云私人FM / B站分P
+
+处理了 5 个社区反馈的 issue。**没有配置变化，升级无需任何操作**；数据库会自动新增一张表（存放用户自己绑定的网易云账号），原有数据不受影响。
+
+**`!playlist` 直接粘贴歌单链接（[#160](https://github.com/ZHANGTIANYAO1/teamspeak-music-bot/issues/160)，[PR #169](https://github.com/ZHANGTIANYAO1/teamspeak-music-bot/pull/169)，感谢 [@JiaxiangACE](https://github.com/JiaxiangACE)）**
+
+- `!playlist <歌单链接>` 支持网易云 / QQ 音乐 / YouTube 歌单链接，**平台由链接自动识别**：以前 QQ 链接不加 `-q` 会被拿去网易云查，YouTube 的 `?list=` 链接会被当成歌单名去搜索，现在都能直接用。
+- App 里「分享」复制出来的整段文案、以及短链（`163cn.tv`、`c6.y.qq.com`）也能直接粘贴。短链只会访问这两个域名，不会去请求任意用户给的地址。
+- 歌单名和纯数字 ID 的用法不变。
+
+**每个网页端用户绑定自己的网易云账号听私人FM（[#164](https://github.com/ZHANGTIANYAO1/teamspeak-music-bot/issues/164)，[PR #171](https://github.com/ZHANGTIANYAO1/teamspeak-music-bot/pull/171)，感谢 [@xxmod](https://github.com/xxmod)）**
+
+- 多人共用一个机器人时，私人FM以前永远按机器人登录的那一个账号推荐。现在每个成员可以在 **设置 → 账户** 扫码绑定自己的网易云账号，之后他在网页端开启的网易云私人FM按他自己的口味推荐；未绑定的人照旧使用共享账号。
+- 绑定的登录只保存在服务器上，从不回传给浏览器，也**不会**顶掉机器人的共享登录；删除用户时一并清除。游客不能绑定。
+- TS 聊天里的 `!fm` 仍使用共享账号（聊天里的 TS 用户和网页账号没有对应关系）。
+
+**机器人被移动后，原频道描述不再残留（[#159](https://github.com/ZHANGTIANYAO1/teamspeak-music-bot/issues/159)，[PR #168](https://github.com/ZHANGTIANYAO1/teamspeak-music-bot/pull/168)，感谢 [@Almighty-ap](https://github.com/Almighty-ap)）**
+
+- 开启「更新频道描述」时，把机器人拖到别的频道后，原频道会一直停留在当时的歌曲信息。现在机器人被移动时会清空原频道描述，并把正在播放的信息写到新频道。
+
+**Linux 安装脚本（[#165](https://github.com/ZHANGTIANYAO1/teamspeak-music-bot/issues/165)，[PR #172](https://github.com/ZHANGTIANYAO1/teamspeak-music-bot/pull/172)，感谢 [@XuVIIJay](https://github.com/XuVIIJay)）**
+
+- `scripts/install.sh` 以前仍在安装已不再支持的 Node 20，现在按发行版（apt / yum / pacman）安装 Node 22 LTS，并复用 `setup.sh` 完成依赖安装、国内镜像切换、原生模块校验和构建。重复运行（升级）时会先停服务、替换构建产物，**保留 `data/`**。
+- README 的「Linux 安装脚本」一节说明了 `install.sh`（一键安装 + systemd 开机自启）和 `setup.sh`（只安装构建、不装 Node、不配服务）的区别和适用场景。
+
+**B站分P视频（[PR #166](https://github.com/ZHANGTIANYAO1/teamspeak-music-bot/pull/166)，感谢 [@xxmod](https://github.com/xxmod)）**
+
+- 分P视频以前只能播放第一P，且时长显示为整个视频的总时长。现在网页端播放多P视频时会弹出选择框选P；TS 里 `!play` 播放第一P。
+
+### v1.13.0：本地视频上传播放 / 头像上传时机
+
+处理了 2 个社区反馈的 issue。**没有配置变化，升级无需任何操作**；原有的本地音频上传行为完全不变。
+
+**本地视频上传播放（[#149](https://github.com/ZHANGTIANYAO1/teamspeak-music-bot/issues/149)，[PR #151](https://github.com/ZHANGTIANYAO1/teamspeak-music-bot/pull/151)，感谢 [@LadenceE](https://github.com/LadenceE)）**
+
+- 搜索页的本地上传现在也收**视频文件**：mp4 / mov / avi / mkv / flv / wmv / m4v / mpg / mpeg / 3gp / ts / m2ts / ogv。上传后当普通歌曲用——直接播放、下一首播放、加入队列都一样。
+- 视频**只保留音轨**：上传后立刻把音频流原样搬进一个音频容器（不重编码、无损），再删掉原视频。720p 素材实测落盘只剩原文件的 14%，不然十几个视频就把 5 GiB 的上传目录配额占满了。
+- 没有音轨的视频会在**上传时**就被拒绝并说明原因，而不是排进队列后静默跳过。
+- 单文件上限从 200 MB 提到 **500 MB**；超限时的报错从 Express 默认的 HTML 错误页（带堆栈和服务器绝对路径）换成正常的中文提示，浏览器端也会在开传前就拦下超大文件。
+- 上传进度按文件显示百分比，传完切到「服务端处理中」——视频比音频大得多，原先那句静止的「正在上传」看着像卡死。
+- 说明：这里做的是「把你本地磁盘上的文件传上来播放」。让机器人直接读取**服务器**磁盘上任意路径的文件没有做——那等于开一个全盘任意文件读取的口子，而「播放服务器上已有的媒体库」用 Jellyfin 音源即可。
+
+**初始化阶段不再发起注定失败的头像上传（[#148](https://github.com/ZHANGTIANYAO1/teamspeak-music-bot/issues/148)，[PR #150](https://github.com/ZHANGTIANYAO1/teamspeak-music-bot/pull/150)，感谢 [@shenmu-rua](https://github.com/shenmu-rua)）**
+
+- 机器人构造阶段读出已保存的自定义头像后会立刻发起文件传输，但那时 TeamSpeak 还没连上，这次传输必定失败。现在构造阶段只把头像数据装入内存，实际上传交给连接成功后的 `onConnect()`。
+- **影响范围说明**：头像本身一直是能正常显示的（连接成功后本来就会重新应用一次），所以这不是「头像丢了」。真正的代价是每次启动 / 重启都会多一次注定失败的请求和一条 `Profile update failed` 警告日志——现在没有了。
+- 顺带修掉一个边角：头像文件写到一半崩溃会留下 0 字节文件，原先这会再触发两个同样注定失败的请求。
+
+### v1.12.1：语音闪避支持网页通话触发（PowerfulTS 专用分支）
+
+- **语音桥 bot 可触发闪避**：本地管理客户端注册表新增 `music` / `voice-bridge` 类型标记。网页通话用户的语音 bot 承载的是真人麦克风，现在其说话会像原生客户端一样触发音乐 bot 的语音闪避——放歌不再盖住人说话，说话结束音乐渐升恢复。
+- **语音桥 bot 自身永不闪避**：修复原生客户端说话时会连带压低网页通话用户麦克风直播音量的问题（闪避增益同样作用于 playLive 路径）；bot 断连宽限期内类型回退为 music，保持原有的防串音保证。
+- 配套：PowerfulTS 面板「机器人行为 → 语音闪避」新增开关与「说话时音乐音量」滑杆（0-100%），需搭配 PowerfulTS v0.12.6+。
+
+### v1.12.0：网站图标 / 移动端交互 / 安装脚本按 ABI 自愈
+
+一次性处理了 6 个社区反馈的 issue。**没有配置变化，升级无需任何操作**；`!play id:<id>` 等旧写法全部继续可用。
+
+**安装脚本按 Node ABI 校验并自动修复（[#140](https://github.com/ZHANGTIANYAO1/teamspeak-music-bot/issues/140)，[PR #147](https://github.com/ZHANGTIANYAO1/teamspeak-music-bot/pull/147)，感谢 [@zbn297427669](https://github.com/zbn297427669)）**
+
+- 换过 Node 大版本后启动报 `NODE_MODULE_VERSION 137 ... requires 127`、或提示找不到 `opus.node` 的问题已修复。原生模块只能在编译它的 Node ABI 上加载，而旧脚本只检查「文件存在且够大」，会把给另一个 Node 版本编译的二进制原样留下。
+- 现在安装脚本会在子进程里真的加载一遍每个原生模块，不匹配就按当前 ABI 重新安装；替换过程先备份再原子替换，任何一步失败都会把原文件逐字节还原，不会让环境变得更糟。被中断留下的备份，下次运行自动认领回来。
+- 必需模块失败会**中止安装并返回非零**，不再出现「setup 显示成功、start 才爆炸」；下载进度实时显示在控制台，不再让人以为卡死。
+- `start.bat` 和 `npm start` 启动前会预检，直接说清楚哪个模块对不上、分别是哪个 ABI、怎么修。
+- 顺带修掉一个会**静默丢掉 ffmpeg** 的问题：源码编译会阻塞事件循环，把同时进行的 80MB ffmpeg 下载误判为超时，而 ffmpeg 是可选模块，于是安装照样报告成功、用户却放不出任何声音。三个模块改为串行处理。
+- Node 版本要求按依赖真实下限判断（20.19+ / 22.12+），推荐 20 或 22 LTS；更新的大版本不阻止，只提示可能需要源码编译。
+
+**随机模式下 `!pn` 真正下一首播放（[#141](https://github.com/ZHANGTIANYAO1/teamspeak-music-bot/issues/141)，[PR #144](https://github.com/ZHANGTIANYAO1/teamspeak-music-bot/pull/144)，感谢 [@XuVIIJay](https://github.com/XuVIIJay)）**
+
+- 随机 / 随机循环下 `!pn`（以及 WebUI 的「下一首播放」）插入的歌只是和其他歌一样等着被随机抽中，机器人却回复「Up next」。现在会真的下一首播放，连续插入多首时的顺序与队列里显示的一致。
+- 同时修掉两个相关问题：插入或删除队列中的歌之后，待播位置可能指向另一首歌；删得多了甚至会让播放**静默停止**。
+
+**WebUI 站点图标与移动端交互（[#142](https://github.com/ZHANGTIANYAO1/teamspeak-music-bot/issues/142) / [#143](https://github.com/ZHANGTIANYAO1/teamspeak-music-bot/issues/143) / [#138](https://github.com/ZHANGTIANYAO1/teamspeak-music-bot/issues/138)，[PR #146](https://github.com/ZHANGTIANYAO1/teamspeak-music-bot/pull/146)，感谢 [@XuVIIJay](https://github.com/XuVIIJay) 与 [@hak5ya](https://github.com/hak5ya)）**
+
+- 新增站点图标：收藏网页、移动端添加到主屏幕都会显示图标（含 iOS 与 Android 适配）。
+- 移动端迷你播放器的进度条现在**可以点按和拖动调节进度**，触摸区域也放大到可用尺寸，拖动时不会被自动跳转到歌词页。
+- 移动端**单击歌曲行即可播放**（桌面端双击行为不变）；队列抽屉里的歌曲行同样支持，其移除按钮在触屏下不再是「看不见但点得到」。
+- QQ 扫码登录的提示改为「请使用手机QQ扫码」——那是 QQ 账号二维码，用 QQ音乐 APP 扫不出来。
+
+**`!play id <id>` 与其他命令语法统一（[#139](https://github.com/ZHANGTIANYAO1/teamspeak-music-bot/issues/139)，[PR #145](https://github.com/ZHANGTIANYAO1/teamspeak-music-bot/pull/145)，感谢 [@hak5ya](https://github.com/hak5ya)）**
+
+- 按 id 播放现在可以写成 `!play id <id>`，和其他命令的 `<命令> <子命令> <参数>` 形式一致；`!add` / `!playnext` 同样适用。
+- **旧写法 `!play id:<id>` 继续支持**。空格写法只在参数确实像 id 时生效，普通搜索和粘贴链接的行为不受影响。
+
+### v1.11.2 — 可配置语音闪避
+
+- 检测频道内其他人说话时平滑降低音乐音量，停止后平滑恢复；默认关闭，可在设置页启用并调节说话时保留的音量比例（[#136](https://github.com/ZHANGTIANYAO1/teamspeak-music-bot/issues/136)，[PR #137](https://github.com/ZHANGTIANYAO1/teamspeak-music-bot/pull/137)）。
+
+### v1.11.1：修复 `!help` 触发机器人自动点歌
+
+**丢弃自回显消息（[PR #135](https://github.com/ZHANGTIANYAO1/teamspeak-music-bot/pull/135)，感谢 [@EvolvedGhost](https://github.com/EvolvedGhost)）**
+
+- 修复输入 `!help` 后机器人会自己点一首歌开始播放的问题：帮助文本超过 TeamSpeak 单条消息上限被分段发送，而 TeamSpeak 会把 bot 自己发到频道的消息回推给它自己，第二段恰好以 `!artist ...` 开头，被误当作新命令解析执行。
+- 现在在协议层丢弃发送者为机器人自身的消息，机器人不再响应任何自己发出的文本，所有超长分段输出均安全。无配置变化，升级无需任何操作。
+
+### v1.11.0 — 播放清单持久化 / 设置保留 / 自定义默认音源
+
+**保存/加载播放清单 + 队列持久化（[#119](https://github.com/ZHANGTIANYAO1/teamspeak-music-bot/issues/119)）——三项开关均默认关闭，升级无行为变化**
+
+- **保存/加载播放清单（`savedQueuesEnabled`，默认关闭，管理员开关）**：开启后，可在网页「已存队列」页或聊天命令保存当前队列为清单、随时**替换**加载或**追加**到队列末尾。网页保存可选「共享」（否则私有到当前用户）；聊天命令始终进入共享清单。新增聊天命令 `!save <名称>` / `!load [-a] <名称>` / `!queues`（未启用时回复「此功能未启用」）。上限：每个所有者 ≤ 50 份清单，每份 ≤ 1000 首。
+- **重启后自动恢复并继续播放队列**（同由 `savedQueuesEnabled` 门控）：机器人连接后会恢复上次的队列并继续播放。**说明**：只能从当前曲目的**开头**恢复（不记忆播放进度，链接重新解析）；**Spotify 恢复为尽力而为**（依赖 sidecar 重新可用），其他音源可靠。
+- **单曲直接播放不清空队列（`playKeepsQueue`，默认关闭，独立开关）**：开启后，直接播放单曲会插入到当前歌曲之后并立即播放、播完继续原队列，而不是清空整个队列。仅影响单曲的「直接播放」；歌单 / 专辑 / 电台仍会替换队列。
+- 三项均在 设置 → 行为设置 中开关，保存即时生效，无需重启。
+
+**重启后保留播放设置（[#125](https://github.com/ZHANGTIANYAO1/teamspeak-music-bot/issues/125)）**
+
+- **音量与播放模式**现按机器人持久化到数据库（`bot_instances` 表新增 `volume` / `play_mode` 列，自动迁移），**各平台音质**持久化到 `config.json` 的 `audioQuality` 字段；重启后自动恢复，不再需要每次手动重调。
+- 聊天命令、WebUI、REST 三种入口的改动都会落盘；`!fm` / `!artist` 的临时随机 / 循环切换**不会**覆盖你用 `!mode` 显式保存的偏好。播放队列、当前歌曲与播放进度仍不持久化（队列恢复见上方 `savedQueuesEnabled`）。
+
+**自定义默认音源（[#126](https://github.com/ZHANGTIANYAO1/teamspeak-music-bot/issues/126)）**
+
+- `config.json` 新增可选字段 `defaultPlatform`，或在 **设置 → 默认音源** 下拉选择：设定后，不带平台标志的 `!play` / `!search` / `!fm` 走你指定的音源（例如设为 `bilibili` 后点播 B 站视频音乐无需每次加 `-b`）。
+- 留空 / `null` 恢复原有固定优先级（网易云 → QQ → 酷狗 → Jellyfin → B 站 → YouTube）；若指定音源未启用或值非法，自动回退到优先级，保存即时生效、无需重启。
+
+**修复与加固**
+
+- **QQ 音乐 API 端口对齐（[#122](https://github.com/ZHANGTIANYAO1/teamspeak-music-bot/issues/122)）**：内嵌 QQ 音乐 API sidecar 现在保证绑定到 `qqMusicApiPort`（与客户端请求端口一致），启动日志改为打印**实际绑定端口**便于排查。若你在旧 `latest` 镜像上遇到「日志里 baseURL 是 3200、服务却在 3300」导致二维码不显示，请 `docker compose pull` 重新拉取镜像。
+- **WebUI 不再被搜索引擎收录（[#128](https://github.com/ZHANGTIANYAO1/teamspeak-music-bot/issues/128)）**：所有响应加 `X-Robots-Tag: noindex, nofollow`、新增 `/robots.txt`（Disallow 全站）、页面加 `robots` meta 标签。⚠️ 这只是阻止**收录**，不是访问控制——公网部署请务必依赖登录鉴权与反向代理，并且不要把自己的 WebUI 链接发到公开网页。
+- **`.gitignore` 补充 `.claude/`（[#127](https://github.com/ZHANGTIANYAO1/teamspeak-music-bot/issues/127)，感谢 [@ItsEricRao](https://github.com/ItsEricRao)）**：本地 Claude Code 配置不再被误提交（已从版本库取消跟踪，本地文件不受影响）。
+
+### v1.10.1 — Jellyfin 可选音源
+
+**Jellyfin 集成（[PR #123](https://github.com/ZHANGTIANYAO1/teamspeak-music-bot/pull/123)，由 [@ItsEricRao](https://github.com/ItsEricRao) 贡献；随后调整为可选音源）**
+
+- **Jellyfin 音源（可选，默认关闭）**：连接自建 [Jellyfin](https://jellyfin.org/) 服务器作为额外音源——搜索（歌曲 / 专辑 / 歌单，支持翻页）、懒解析直传播放、同步歌词、收藏 Instant Mix 电台（`!fm -j`）、首页「最近添加 / 播放最多 / 收藏 / 流派」区块、播放进度回报（PlayCount / 播放状态）。账号密码或 API Key 两种认证，在 设置 → Jellyfin 音乐库 打开「启用 Jellyfin 音源」即可，保存即时生效。详见 [可选：Jellyfin 音源](#可选jellyfin-音源)。
+- **enabledProviders 音源开关**：`config.json` 新增 `enabledProviders` 字段，默认 `["netease", "qq", "bilibili", "youtube", "kugou"]`——在线音源保持默认启用，**从旧版本升级无行为变化**；列表外的音源在聊天命令 / REST / WebUI 中一律不可用，网易云 / QQ 停用时其内嵌 API 服务（端口 3001 / 3200）不再启动。
+- **新增 `-j`（Jellyfin）与 `-n`（网易云）平台标志**；不带标志的 `!play` / `!search` / `!fm` 等走固定优先级中第一个已启用的音源（默认配置下即网易云，行为与旧版一致）。
+- ⚠️ **v1.10.0 初版曾短暂把默认音源设为 Jellyfin-only，现已回退**。若你在该版本保存过设置导致 `config.json` 中为 `"enabledProviders": ["jellyfin"]`，请手动把在线音源加回（详见 [更新升级](#关于-enabledproviders-音源开关v1100-起)）。
+- **QQ 按 ID 播放空歌名修复**（[PR #124](https://github.com/ZHANGTIANYAO1/teamspeak-music-bot/pull/124)，感谢 [@Slldyd2077](https://github.com/Slldyd2077)）：按 ID 播放 QQ 歌曲时回填歌曲元数据，TS 端不再显示空歌名。
+
+### v1.9.0 及更早
+
+**功能增强：Spotify 音源（实验性）/ 搜索结果翻页 / 细粒度权限 / 本地收藏 / 本地音频上传 / 专属链接 / 自动暂停 / QQ 雷达 FM**
 
 - **细粒度账号权限**（叠加在 admin / member 之上）：管理员可为每个成员勾选 5 项能力（`player.control` / `player.queue` / `bot.manage` / `platform.auth` / `quality`）和按机器人授权白名单；所有变更路由由后端 `requirePermission` / `requireBotAccess` 中间件逐请求强制校验，未授权返回 403，未授权的机器人对成员不可见（列表过滤，无 403-vs-404 枚举泄漏）。已有成员经一次性迁移获得全部能力，新成员默认基础能力。
 - **本地收藏歌单**：按用户存储的收藏（`favorite_playlists` 表 + `/api/favorites`），首页 / 搜索 / 歌单页一键收藏，跨设备同步。
@@ -649,9 +1169,12 @@ A：本项目内置 `/login` 限流（每 IP 每分钟 5 次），但生产部�
 - **专属链接（单机器人锁定）**：`/bot/<id>` 打开时锁定到单台机器人，`?bot=<id>` 随刷新保持；与权限白名单组合，机器人下拉只显示"作用域 ∩ 可控"的机器人。
 - **频道无人时自动暂停**：机器人所在频道清空时暂停、有人加入时恢复（区分用户手动暂停，不会误恢复）；可在 设置 → 行为设置 开关（默认关闭）。占用检测在 `clientlist` 查询失败时按"未知"处理而非"无人"，避免有人在听时被误暂停。
 - **QQ 音乐雷达 / 私人 FM**：`!fm -q` 或 WebUI 启动 QQ 雷达推荐流（失败回退"猜你喜欢"），FM 自动续播现支持任意平台。
+- **#112 Spotify 音源（实验性）**：新增 Spotify 作为可选音源，默认关闭、需 Premium + 自建开发者应用（PKCE，无需 Client Secret）。采用混合 librespot 后端（Linux/Docker 用 go-librespot，Windows 用 Rust librespot），元数据走 Spotify Web API，可与现有音源混排入队。为 ToS 灰色地带的实验特性，详见 [Spotify 音源（实验性）](#spotify-音源实验性)。
+- **#115 搜索结果翻页**：WebUI 搜索现按来源、按分类（歌曲 / 歌单 / 专辑）提供「加载更多」，服务端新增 `offset` 分页，不再固定只返回首页 20 首 / 10 个歌单 / 10 张专辑。
 
 **Bug 修复**
 
+- **#116 `!lyrics` 只显示开头几行**：聊天命令曾把歌词截断为前 10 行，且长消息未分片会触及 TeamSpeak 单条约 1 KB 上限。现发送完整歌词，并按 UTF-8 字节安全地分割成多条消息（长回复通用分片，不再截断）。
 - **#86 config.json 未在首次运行生成**：配置文件改放到持久化的 `data/config.json`（旧版写在项目根目录，不在 Docker 卷内，导致重启丢失、手动编辑不生效）；升级时自动把根目录旧配置迁移到 `data/` 并保留你的设置。
 - **#89 B站长音频约 16 分钟被暂停且无法继续**：ffmpeg 增加 `-reconnect_at_eof`（B站 CDN 会在 token/会话到期时提前关闭连接造成 EOF），并新增"远离结尾的卡死看门狗"——彻底卡死的流会自动推进到下一首而不是永久静音。
 - **#84 音量曲线不顺滑**：0–100 改为连续单调曲线 `0.2x + 0.8x^8`（消除 80–99 的"死区"与 100 处的突跳，满响度仍保留在 100）。
@@ -666,6 +1189,7 @@ A：本项目内置 `/login` 限流（每 IP 每分钟 5 次），但生产部�
 - **会话存储**：服务端 SQLite 表 `sessions`，存储 sha256(token)；浏览器只持有原始 token cookie。7 天 TTL，每小时滚动续期。同账号最多 10 个并发会话（超出剔除最旧）。
 - **登录限流**：每 IP 每分钟 5 次 `/login` + 3 次 `/setup`，命中返回 429 + `Retry-After`。
 - **CSRF & 安全头**：所有 mutating 请求强制 `Origin`/`Referer` 同源；响应携带 `X-Frame-Options: DENY` 和 `Content-Security-Policy: frame-ancestors 'none'`（防点击劫持）。
+- **搜索引擎隐身（防止实例被收录，issue #128）**：为避免部署实例的 WebUI 被搜索引擎收录、被陌生人搜到控制页，采用纵深防御——所有响应携带 `X-Robots-Tag: noindex, nofollow`，`/robots.txt` 返回 `User-agent: * / Disallow: /`，`index.html` 内置 `<meta name="robots" content="noindex, nofollow">`（专属链接 `/bot/<id>` 等所有页面同样覆盖）。这些只阻止「被索引」，不是访问控制——**请不要把自己的 WebUI 链接发到公开网页 / 论坛 / 聊天群**，真正的防护来自登录鉴权与反向代理。
 - **配置变更**：反向代理部署务必 `"trustProxy": true`（详见 [反向代理部署注意事项](#反向代理部署注意事项)）。`config.adminGroups` 现已启用，用于限制管理类聊天命令只能由指定 TeamSpeak 服务器组运行（为空 = 不限制，详见 [TeamSpeak 命令权限](#teamspeak-命令权限管理类命令限制)）；`config.adminPassword` 仍为旧版预留字段，保留以兼容旧 `config.json`，当前未使用。
 
 ### v0.x — Bot Profile 自动更新与协议层升级
@@ -747,6 +1271,8 @@ A：本项目内置 `/login` 限流（每 IP 每分钟 5 次），但生产部�
 
 | 项目 | 说明 |
 |------|------|
+| [Jellyfin](https://github.com/jellyfin/jellyfin) | 自由软件媒体服务器（本项目的可选自建音源） |
+| [ItsEricRao](https://github.com/ItsEricRao) | Jellyfin 音源集成贡献者（[PR #123](https://github.com/ZHANGTIANYAO1/teamspeak-music-bot/pull/123)） |
 | [yichen11818/NeteaseTSBot](https://github.com/yichen11818/NeteaseTSBot) | TS6 协议兼容参考（vendored tsproto 补丁） |
 | [Splamy/TS3AudioBot](https://github.com/Splamy/TS3AudioBot) | 优秀的 TeamSpeak 音频机器人框架 |
 | [TS3AudioBot-BiliBiliPlugin](https://github.com/xxmod/TS3AudioBot-BiliBiliPlugin) | 提供插件开发参考 |

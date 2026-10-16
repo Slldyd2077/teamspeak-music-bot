@@ -10,6 +10,9 @@ import type {
   QrCodeResult,
   AuthStatus,
   Album,
+  Artist,
+  ArtistDetail,
+  ArtistSongPage,
 } from "./provider.js";
 
 export function parseLyrics(lrc: string, tlyric?: string): LyricLine[] {
@@ -69,6 +72,21 @@ export function mapNeteaseAlbums(raw: any[] | null | undefined): Album[] {
   }));
 }
 
+export function mapNeteaseArtists(raw: any[] | null | undefined): Artist[] {
+  if (!Array.isArray(raw)) return [];
+  return raw.map((a: any) => ({
+    id: String(a.id),
+    name: a.name ?? "",
+    avatarUrl: a.picUrl ?? a.img1v1Url ?? "",
+    aliases: (a.alias ?? a.alia ?? []).filter(
+      (x: unknown): x is string => typeof x === "string" && x.length > 0
+    ),
+    songCount: a.musicSize ?? undefined,
+    albumCount: a.albumSize ?? undefined,
+    platform: "netease",
+  }));
+}
+
 export function mapNeteaseSongs(raw: any[] | null | undefined): Song[] {
   if (!Array.isArray(raw)) return [];
   return raw.map((s: any) => ({
@@ -111,8 +129,10 @@ export class NeteaseProvider implements MusicProvider {
   private api: AxiosInstance;
   private cookie = "";
   private quality = "exhigh";
+  private readonly baseUrl: string;
 
   constructor(baseUrl: string) {
+    this.baseUrl = baseUrl;
     this.api = axios.create({
       baseURL: baseUrl,
       timeout: 10000,
@@ -131,21 +151,28 @@ export class NeteaseProvider implements MusicProvider {
     return this.cookie ? { cookie: this.cookie } : {};
   }
 
-  async search(query: string, limit = 20): Promise<SearchResult> {
-    const [songRes, playlistRes, albumRes] = await Promise.all([
+  async search(query: string, limit = 20, offset = 0): Promise<SearchResult> {
+    // /cloudsearch supports offset for every type. Songs, playlists (type 1000)
+    // and albums (type 10) are all limit/offset-driven so the web can page past
+    // the first page (playlists/albums were previously hardcoded to limit: 10).
+    const [songRes, playlistRes, albumRes, artistRes] = await Promise.all([
       this.api.get("/cloudsearch", {
-        params: { keywords: query, type: 1, limit, ...this.cookieParams },
+        params: { keywords: query, type: 1, limit, offset, ...this.cookieParams },
       }),
       this.api.get("/cloudsearch", {
         params: {
           keywords: query,
           type: 1000,
-          limit: 10,
+          limit,
+          offset,
           ...this.cookieParams,
         },
       }),
       this.api.get("/cloudsearch", {
-        params: { keywords: query, type: 10, limit: 10, ...this.cookieParams },
+        params: { keywords: query, type: 10, limit, offset, ...this.cookieParams },
+      }),
+      this.api.get("/cloudsearch", {
+        params: { keywords: query, type: 100, limit, offset, ...this.cookieParams },
       }),
     ]);
 
@@ -163,7 +190,9 @@ export class NeteaseProvider implements MusicProvider {
 
     const albums = mapNeteaseAlbums(albumRes.data?.result?.albums);
 
-    return { songs, playlists, albums };
+    const artists = mapNeteaseArtists(artistRes.data?.result?.artists);
+
+    return { songs, playlists, albums, artists };
   }
 
   async getSongUrl(songId: string, quality?: string): Promise<SongUrlResult | null> {
@@ -211,6 +240,69 @@ export class NeteaseProvider implements MusicProvider {
     return mapNeteaseSongs(res.data?.songs);
   }
 
+  async getArtistDetail(artistId: string): Promise<ArtistDetail | null> {
+    // /artists returns { artist, hotSongs }; the hot songs are fetched
+    // separately via /artist/songs (order=hot) so the artist page's three
+    // upstream calls stay independent of each other.
+    const res = await this.api.get("/artists", {
+      params: { id: artistId, ...this.cookieParams },
+    });
+    const a = res.data?.artist;
+    if (!a) return null;
+    return {
+      ...mapNeteaseArtists([a])[0],
+      description: a.briefDesc ?? "",
+    };
+  }
+
+  async getArtistSongs(artistId: string, limit = 50): Promise<Song[]> {
+    const res = await this.api.get("/artist/songs", {
+      params: {
+        id: artistId,
+        limit,
+        offset: 0,
+        order: "hot",
+        ...this.cookieParams,
+      },
+    });
+    return mapNeteaseSongs(res.data?.songs);
+  }
+
+  async getArtistAlbums(artistId: string, limit = 20): Promise<Album[]> {
+    const res = await this.api.get("/artist/album", {
+      params: { id: artistId, limit, offset: 0, ...this.cookieParams },
+    });
+    return mapNeteaseAlbums(res.data?.hotAlbums);
+  }
+
+  /**
+   * Full catalogue page for the artist page's "全部歌曲" list: /artist/songs
+   * supports real offset paging (Adele reports total 345 with more=true, and
+   * offset=50/100/150 each return a fresh slice of 50). order=hot keeps the page
+   * ordering identical to getArtistSongs so the hot preview and the full list
+   * are one continuous ranking.
+   */
+  async getArtistAllSongs(artistId: string, offset = 0, limit = 50): Promise<ArtistSongPage> {
+    const safeOffset = Math.max(0, Math.trunc(offset) || 0);
+    const safeLimit = Math.max(1, Math.min(Math.trunc(limit) || 50, 100));
+    const res = await this.api.get("/artist/songs", {
+      params: {
+        id: artistId,
+        limit: safeLimit,
+        offset: safeOffset,
+        order: "hot",
+        ...this.cookieParams,
+      },
+    });
+    const songs = mapNeteaseSongs(res.data?.songs);
+    const reported = Number(res.data?.total);
+    const total = Number.isFinite(reported) && reported > 0 ? reported : safeOffset + songs.length;
+    const more = res.data?.more;
+    const hasMore =
+      typeof more === "boolean" ? more : safeOffset + songs.length < total;
+    return { songs, total, hasMore };
+  }
+
   async getLyrics(songId: string): Promise<LyricLine[]> {
     const res = await this.api.get("/lyric", {
       params: { id: songId, ...this.cookieParams },
@@ -239,23 +331,45 @@ export class NeteaseProvider implements MusicProvider {
   async checkQrCodeStatus(
     key: string
   ): Promise<"waiting" | "scanned" | "confirmed" | "expired"> {
+    const { status, cookie } = await this.pollQrLogin(key);
+    if (cookie) this.cookie = cookie;
+    return status;
+  }
+
+  /**
+   * Poll a QR login and hand back the resulting cookie WITHOUT storing it on
+   * this provider — for a web user linking their own account (#164), which
+   * must never replace the bot's shared login.
+   */
+  async pollQrLogin(
+    key: string
+  ): Promise<{ status: "waiting" | "scanned" | "confirmed" | "expired"; cookie?: string }> {
     const res = await this.api.get("/login/qr/check", {
       params: { key, timestamp: Date.now() },
     });
-    const code = res.data?.code;
-    switch (code) {
+    switch (res.data?.code) {
       case 801:
-        return "waiting";
+        return { status: "waiting" };
       case 802:
-        return "scanned";
+        return { status: "scanned" };
       case 803:
-        if (res.data?.cookie) {
-          this.cookie = res.data.cookie;
-        }
-        return "confirmed";
+        return res.data?.cookie
+          ? { status: "confirmed", cookie: res.data.cookie }
+          : { status: "confirmed" };
       default:
-        return "expired";
+        return { status: "expired" };
     }
+  }
+
+  /**
+   * A provider for the same API server logged in as another account (#164):
+   * a web user's personal FM uses their own taste instead of the shared login.
+   */
+  withCookie(cookie: string): NeteaseProvider {
+    const view = new NeteaseProvider(this.baseUrl);
+    view.setQuality(this.quality);
+    view.setCookie(cookie);
+    return view;
   }
 
   async sendSmsCode(phone: string): Promise<boolean> {
