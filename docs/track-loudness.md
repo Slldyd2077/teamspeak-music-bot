@@ -2,7 +2,7 @@
 
 PowerfulTS 的音乐输出可按完整歌曲的综合响度统一音量。先开始播放，后台用 FFmpeg `ebur128` 分析整首 LUFS / 真峰值，分析完成后用 5 秒平滑过渡到 `min(targetLufs - input_i, -1 - input_tp, 12)` dB 的**常量 volume**播放。默认配置关闭，目标 −18 LUFS（范围 −24 至 −14）；线上已开启。整首固定增益，暂停、跳转保持增益，修改设置在下一首生效。不会按片段自动调节音量，也不使用动态压缩。
 
-`GET/POST /api/bot/settings` 的 `loudnessNormalization` 持久化设置并更新所有机器人；播放状态返回分析/已应用/失败及固定增益。实时麦克风、外部连续 PCM / Spotify FIFO 不处理。完整音源分析最多 300 秒，失败保持原始增益；停止/切歌取消分析，相同 URL 的测量缓存 15 分钟、最多 64 项。HTTP 预分析移除 `reconnect_at_eof`，确保 EOF 返回统计结果；播放网络恢复参数保留。
+`GET/POST /api/bot/settings` 的 `loudnessNormalization` 持久化设置并更新所有机器人；播放状态返回分析/已应用/失败及固定增益。实时麦克风、外部连续 PCM / Spotify FIFO 不处理。完整音源分析最多 60 秒，失败保持原始增益；停止/切歌取消分析，相同 URL 的测量缓存 15 分钟、最多 64 项。HTTP 预分析移除 `reconnect_at_eof`，确保 EOF 返回统计结果；播放网络恢复参数保留。
 
 ## 发布与维护分支
 
